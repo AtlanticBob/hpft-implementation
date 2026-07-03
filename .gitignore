@@ -2,3 +2,4 @@ results/*/raw/
 *.o
 *.dpa.o
 build/
+pcc/build-host/
