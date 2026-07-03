@@ -1,0 +1,15 @@
+/home/ubuntu/:
+bzx
+hxy
+temp.log
+zhaoxiang@192.168.102.1
+
+/home/ubuntu/bzx:
+flexio-samples
+hpft-exp-dpu
+jakiro_dhtb
+ovs_backup.txt
+ovs_setup.sh
+pcc_fixed_rate_10g
+pcc_template
+spec.md

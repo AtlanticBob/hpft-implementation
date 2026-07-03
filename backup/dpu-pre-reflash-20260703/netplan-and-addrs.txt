@@ -1,0 +1,63 @@
+# This file is generated from information provided by the datasource.  Changes
+# to it will not persist across an instance reboot.  To disable cloud-init's
+# network configuration capabilities, write a file
+# /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg with the following:
+# network: {config: disabled}
+network:
+    ethernets:
+        oob_net0:
+            dhcp4: true
+        tmfifo_net0:
+            addresses:
+            - 192.168.102.2/30
+            dhcp4: false
+            nameservers:
+                addresses: [143.89.40.46, 143.89.40.1]
+            routes:
+            -   metric: 1025
+                to: 0.0.0.0/0
+                via: 192.168.102.1
+        enp3s0f0s0:
+            addresses:
+            - 10.0.4.202/24
+            match:
+              macaddress: 02:cb:f1:02:0e:fc
+            mtu: 8192
+            set-name: bf-rdma0
+        enp3s0f1s0:
+            addresses:
+            - 10.0.5.202/24
+            match:
+              macaddress: 02:58:04:d8:a8:7a
+            mtu: 8192
+            set-name: bf-rdma1
+    renderer: NetworkManager
+    version: 2
+network:
+  ethernets:
+    enp3s0f0s0:
+      renderer: networkd
+      dhcp4: 'true'
+    enp3s0f1s0:
+      renderer: networkd
+      dhcp4: 'true'
+  version: 2
+---
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+oob_net0         UP             
+tmfifo_net0      UP             192.168.102.2/30 fe80::21a:caff:feff:ff01/64 
+p0               UP             fe80::a288:c2ff:febf:9b20/64 
+p1               UP             fe80::a288:c2ff:febf:9b21/64 
+ovs-system       UNKNOWN        fe80::c045:b9ff:fe98:64f5/64 
+underlay-p1      UNKNOWN        fe80::a288:c2ff:febf:9b21/64 
+underlay-p0      UNKNOWN        fe80::a288:c2ff:febf:9b20/64 
+pf0hpf           UP             fe80::5c5d:4dff:fee7:7da0/64 
+pf1hpf           UP             fe80::1446:d4ff:fee9:82d1/64 
+en3f0pf0sf0      UP             
+bf-rdma0         UP             10.0.4.202/24 fe80::cb:f1ff:fe02:efc/64 
+en3f1pf1sf0      UP             
+bf-rdma1         UP             10.0.5.202/24 fe80::58:4ff:fed8:a87a/64 
+pf1vf0           UP             fe80::4887:12ff:feab:53e7/64 
+pf1vf1           UP             fe80::a0b6:f8ff:feeb:1f43/64 
+pf1vf2           UP             fe80::10ef:97ff:fe56:3552/64 
+pf1vf3           UP             fe80::5061:fbff:fe49:cbef/64 
