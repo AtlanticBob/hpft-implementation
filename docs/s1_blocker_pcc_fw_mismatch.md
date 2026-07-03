@@ -31,6 +31,16 @@ doca_pcc_start: Failed to create Flex IO process, please check USER_PROGRAMMABLE
 - 即:固件比用户态新了约 4 个 DOCA 版本。通用 FlexIO ABI 兼容(rpc 样例可跑),
   但 PCC 专用的 FlexIO process/outbox 创建接口不兼容 → 固件拒绝(syndrome 0x6d0fd5)。
 
+## 决定性补充证据(2026-07-03 下午)
+
+DPU 上发现前人工作 `/home/ubuntu/bzx/pcc_fixed_rate_10g`(2026-05-28,含
+EXPERIMENT_LOG.md):当时在**同一台 DPU、同一个 DOCA 2.9.3008** 上,固定速率
+PCC 实测把 host PF 流量从 177.13 Gbps 压到 9.18 Gbps,SIGINT 退出后恢复——
+PCC 曾经完全可用。今天重跑**当时验证过的同一个二进制**,报同样的
+outbox/0x6d0fd5 失败。结论:5/28 之后有人把固件升到 32.47.2682,破坏了
+DOCA 2.9 的 PCC。该日志同时确认了 S2 探测的可行性先例(fixed-rate 控速有效、
+`algo_slot=0xf` 的 fallback 陷阱、以及 in-tree build.sh 的构建配方,均可复用)。
+
 ## 结论
 
 fw 32.47.2682 与 DOCA 2.9 的 PCC 库不兼容。要在本 lab 跑 PCC,必须让固件与

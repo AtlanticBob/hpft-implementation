@@ -3,3 +3,4 @@ results/*/raw/
 *.dpa.o
 build/
 pcc/build-host/
+backup/**/*.tgz
