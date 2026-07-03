@@ -75,6 +75,12 @@ go/no-go 决策,探测项按风险从高到低排序:
 验收(GO 判据):VF 流量被 DPA 设定值钳制,误差 ≤5%;host 侧零改动。
 NO-GO 时的备选路线:hairpin + DevX SQ packet pacing 探测(调研报告 §3c)。
 
+**重要先验(2026-07-03,来自用户)**:5/28 的 `pcc_fixed_rate_10g` 实验对
+**PF** 流量限速成功(177→9.18 Gbps),但当时**对 VF 流量施加限速似乎无效**。
+S2 因此是真正的未决问题,必须显式分开测试 PF 与 VF 两种流量;若 VF 确实不在
+PCC 覆盖范围,需要查证:VF QP 的 CC 事件是否路由到 DPA(可能需要 fw 配置,如
+per-function CC 使能/vport CC 归属)、DOCA 3.4 是否改变此行为,再决定 go/no-go。
+
 ### S3 Probe B:流标识与 pair 映射(2 天)
 
 操作:
