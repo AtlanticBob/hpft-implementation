@@ -1,0 +1,16 @@
+[2026-07-02 13:11:53:060105][2727641120][DOCA][INF][CORE][doca_log.cpp:1281] DOCA version 3.4.0112
+Info: Welcome to DOCA Programmable Congestion Control (PCC) application
+Info: Starting DOCA PCC
+Info: Press ctrl + C to exit
+Info: PCC host status Standby
+Info: Waiting on DOCA PCC
+/ 1940186411 / 0 / 22528 / format 0 - user init: port num = 0, algo index = 0, algo slot = 0, algo enable = 0x1, disable event bitmask = 0x10
+/ 1940186413 / 1 / 22528 / format 0 - user init: port num = 0x1, algo index = 0, algo slot = 0, algo enable = 0x1, disable event bitmask = 0x10
+/ 1940186414 / 2 / 22528 / format 0 - user init: port num = 0x2, algo index = 0, algo slot = 0, algo enable = 0x1, disable event bitmask = 0x10
+/ 1940186416 / 3 / 22528 / format 0 - user init: port num = 0x3, algo index = 0, algo slot = 0, algo enable = 0x1, disable event bitmask = 0x10
+/5800/doca_pcc_dev_user_init, disable_event_bitmask=0x10
+[1;32m[17605] [0mInfo: PCC host status Active
+Info: Waiting on DOCA PCC
+Info: PCC host status Deactivated
+Info: Finished waiting on DOCA PCC
+[DTrace] Tracer callback thread termination...
