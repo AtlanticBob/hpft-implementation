@@ -1,0 +1,3 @@
+ 154237 algo slot = 0x74249a41, result rate = 0x1e3
+ 146580 algo slot = 0x74249a41, result rate = 0x1e4
+ 144345 algo slot = 0x74249a41, result rate = 0x1e5

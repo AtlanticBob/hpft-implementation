@@ -1,0 +1,30 @@
+ WARNING: BW peak won't be measured in this run.
+---------------------------------------------------------------------------------------
+                    RDMA_Write BW Test
+ Dual-port       : OFF		Device         : mlx5_6
+ Number of qps   : 2		Transport type : IB
+ Connection type : RC		Using SRQ      : OFF
+ PCIe relax order: ON		Lock-free      : OFF
+ ibv_wr* API     : ON		Using Enhanced Reorder      : OFF
+ TX depth        : 128
+ CQ Moderation   : 1
+ CQE Poll Batch  : Dynamic
+ Mtu             : 1024[B]
+ Link type       : Ethernet
+ GID index       : 3
+ Max inline data : 0[B]
+ rdma_cm QPs	 : OFF
+ Data ex. method : Ethernet
+---------------------------------------------------------------------------------------
+ local address: LID 0000 QPN 0x01e4 PSN 0x9f63fc RKey 0x055000 VAddr 0x007f6b08c57000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:01
+ local address: LID 0000 QPN 0x01e5 PSN 0xc96436 RKey 0x055000 VAddr 0x007f6b08c67000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:01
+ remote address: LID 0000 QPN 0xe456 PSN 0x3af2a7 RKey 0x055100 VAddr 0x007f5d0c1a1000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:02
+ remote address: LID 0000 QPN 0xe457 PSN 0xd6c505 RKey 0x055100 VAddr 0x007f5d0c1b1000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:02
+---------------------------------------------------------------------------------------
+ #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
+ 65536      315249           0.00               18.36  		     0.035027
+---------------------------------------------------------------------------------------

@@ -1,0 +1,17 @@
+[2026-07-02 13:30:32:999118][2898481184][DOCA][INF][CORE][doca_log.cpp:1281] DOCA version 3.4.0112
+Info: Welcome to DOCA Programmable Congestion Control (PCC) application
+Info: Starting DOCA PCC
+Info: Press ctrl + C to exit
+Info: PCC host status Standby
+Info: Waiting on DOCA PCC
+/5800/doca_pcc_dev_user_init, disable_event_bitmask=0x10
+/ 3061168875 / 0 / 22528 / format 0 - user init: port num = 0, algo index = 0, algo slot = 0, algo enable = 0x1, disable event bitmask = 0x10
+/ 3061168876 / 1 / 22528 / format 0 - user init: port num = 0x1, algo index = 0, algo slot = 0, algo enable = 0x1, disable event bitmask = 0x10
+/ 3061168878 / 2 / 22528 / format 0 - user init: port num = 0x2, algo index = 0, algo slot = 0, algo enable = 0x1, disable event bitmask = 0x10
+/ 3061168879 / 3 / 22528 / format 0 - user init: port num = 0x3, algo index = 0, algo slot = 0, algo enable = 0x1, disable event bitmask = 0x10
+Info: PCC host status Active
+Info: Waiting on DOCA PCC
+/ 3068150473 / 4 / 22528 / format 1 - user algo: algo slot = 0x74249a41, result rate = 0x1e0, result rtt req = 0x1, port num = 0x3, timestamp = 0
+/ 3072432491 / 5 / 22656 / format 1 - user algo: algo slot = 0x11f4386b, result rate = 0x15b, result rtt req = 0x1, port num = 0x3, timestamp = 0
+/ 3076787551 / 6 / 22528 / format 1 - user algo: algo slot = 0x24cb08a6, result rate = 0x1c1, result rtt req = 0, port num = 0x3, timestamp = 0
+/ 3081035929 / 7 / 22528 / format 1 - user algo: algo slot = 0xd228ea8, result rate = 0x2c3, result rtt req = 0x1, port num = 0x3, timestamp = 0

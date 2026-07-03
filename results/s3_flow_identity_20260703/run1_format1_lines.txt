@@ -1,0 +1,4 @@
+/ 3068150473 / 4 / 22528 / format 1 - user algo: algo slot = 0x74249a41, result rate = 0x1e0, result rtt req = 0x1, port num = 0x3, timestamp = 0
+/ 3072432491 / 5 / 22656 / format 1 - user algo: algo slot = 0x11f4386b, result rate = 0x15b, result rtt req = 0x1, port num = 0x3, timestamp = 0
+/ 3076787551 / 6 / 22528 / format 1 - user algo: algo slot = 0x24cb08a6, result rate = 0x1c1, result rtt req = 0, port num = 0x3, timestamp = 0
+/ 3081035929 / 7 / 22528 / format 1 - user algo: algo slot = 0xd228ea8, result rate = 0x2c3, result rtt req = 0x1, port num = 0x3, timestamp = 0
