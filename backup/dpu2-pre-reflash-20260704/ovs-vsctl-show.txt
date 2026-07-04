@@ -1,0 +1,26 @@
+a6ce7837-f5fd-4098-a8fe-b6008f525c06
+    Bridge underlay-p0
+        Port underlay-p0
+            Interface underlay-p0
+                type: internal
+        Port pf0hpf
+            Interface pf0hpf
+        Port p0
+            Interface p0
+    Bridge underlay-p1
+        Port pf1vf3
+            Interface pf1vf3
+        Port underlay-p1
+            Interface underlay-p1
+                type: internal
+        Port p1
+            Interface p1
+        Port pf1vf1
+            Interface pf1vf1
+        Port pf1vf0
+            Interface pf1vf0
+        Port pf1hpf
+            Interface pf1hpf
+        Port pf1vf2
+            Interface pf1vf2
+    ovs_version: "2.9.3-0016-25.06-based-3.3.3"

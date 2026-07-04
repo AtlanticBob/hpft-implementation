@@ -1,0 +1,2 @@
+bzx
+268K	/home/ubuntu/bzx
