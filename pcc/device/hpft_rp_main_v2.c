@@ -185,10 +185,13 @@ typedef struct {
 	volatile uint32_t dbg_epochs;
 	volatile uint32_t dbg_ev_b32;
 	volatile uint32_t dbg_hits;	/* racy per-event counter for visibility */
+	volatile uint32_t remote_rx_rate;	/* from NP RTT response payload w1 */
+	volatile uint32_t remote_cap;		/* from NP RTT response payload w2 */
 	volatile uint32_t b32_shard[HPFT_MAX_THREADS];
 } hpft_pair_t;
 
 static hpft_pair_t g_hpft_pairs[HPFT_PAIRS];
+static volatile uint32_t g_hpft_rtt_traces;
 /* event-observed bytes per port (32B units, running totals, sharded).
  * The HW port counter gives exact TX bytes; the ratio port_true/port_ev is
  * the event-undersampling factor used to correct per-pair estimates. */
@@ -222,11 +225,11 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[0] = c->flowtag;
 			rsp[1] = c->budget;
 			rsp[2] = c->level;
-			rsp[3] = c->avg_b32_x16;
+			rsp[3] = c->remote_rx_rate;
 			rsp[4] = c->dbg_r_units;
 			rsp[5] = c->dbg_hits;
 			rsp[6] = c->dbg_epochs;
-			rsp[7] = c->dbg_ev_b32;
+			rsp[7] = c->remote_cap;
 			*response_size = 8 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
@@ -266,14 +269,36 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	doca_pcc_dev_event_general_attr_t a = doca_pcc_dev_get_ev_attr(event);
 	uint32_t now = doca_pcc_dev_get_timer_lo();
 
+	uint32_t want_rtt = 0;
+
 	(void)algo_ctxt;
 	(void)attr;
 	results->rtt_req = 0;
+	if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT && g_hpft_rtt_traces < 8) {
+		uint32_t *w = (uint32_t *)doca_pcc_dev_get_rtt_raw_data(event);
+
+		g_hpft_rtt_traces++;
+		/* format 3: raw w0,w1,w2 + flowtag + now (any pair) */
+		doca_pcc_dev_trace_5(3, w[0], w[1], w[2], ft, now);
+		doca_pcc_dev_trace_flush();
+	}
 	for (int i = 0; i < HPFT_PAIRS; i++) {
 		hpft_pair_t *c = &g_hpft_pairs[i];
 
 		if (c->flowtag != ft)
 			continue;
+		if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT) {
+			uint32_t *w = (uint32_t *)doca_pcc_dev_get_rtt_raw_data(event);
+
+			c->remote_rx_rate = w[1];
+			c->remote_cap = w[2];
+			if (g_hpft_rtt_traces < 8) {
+				g_hpft_rtt_traces++;
+				/* format 3: w0(echoed ts), rx_rate, cap, flowtag, now */
+				doca_pcc_dev_trace_5(3, w[0], w[1], w[2], ft, now);
+				doca_pcc_dev_trace_flush();
+			}
+		}
 		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX) {
 			doca_pcc_dev_roce_tx_cntrs_t tc = doca_pcc_dev_get_roce_tx_cntrs(event);
 			uint32_t rank = doca_pcc_dev_thread_rank() % HPFT_MAX_THREADS;
@@ -377,15 +402,25 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 					}
 					c->level = lvl;
 				}
+				want_rtt = 1;
 			}
 		}
 		uint32_t cc = hpft_cc_rate();
 		uint32_t lvl = c->level;
 
 		results->rate = (cc < lvl) ? cc : lvl;
+		results->rtt_req = want_rtt;
 		return;
 	}
-	/* no pair entry for this flowtag: fail open */
+	/* no pair entry for this flowtag: fail open (probe occasionally so the
+	 * receiver-driven channel can be tested on any flow) */
+	{
+		static volatile uint32_t g_hpft_fo_cnt;
+
+		g_hpft_fo_cnt++;
+		if ((g_hpft_fo_cnt & 1023u) == 0)
+			results->rtt_req = 1;
+	}
 	results->rate = DOCA_PCC_DEV_MAX_RATE;
 }
 
