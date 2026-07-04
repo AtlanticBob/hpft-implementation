@@ -163,7 +163,7 @@ void doca_pcc_dev_user_port_info_changed(uint32_t portid)
  * This is max-min water-filling without counting flows: O(1) state per pair,
  * works for any QP count. cc_rate is a placeholder (MAX) until DCQCN
  * reintegration. Flows without a pair entry fail open. */
-#define HPFT_PAIRS (8)
+#define HPFT_PAIRS (16)
 #define HPFT_EPOCH_US (1000u)
 #define HPFT_MIN_LEVEL (2u)
 #define HPFT_MAX_THREADS (256)
@@ -172,6 +172,7 @@ void doca_pcc_dev_user_port_info_changed(uint32_t portid)
  * so no atomics are needed on the hot path; the epoch winner sums the shards */
 typedef struct {
 	volatile uint32_t flowtag;
+	volatile uint32_t dst_tag;	/* dst_ip (0 = any/single-dst) */
 	volatile uint32_t budget;
 	volatile uint32_t level;
 	volatile uint32_t epoch_ts;	/* us, timer_lo domain */
@@ -193,6 +194,11 @@ typedef struct {
 } hpft_pair_t;
 
 static hpft_pair_t g_hpft_pairs[HPFT_PAIRS];
+#define HPFT_QPMAP_SIZE (8192)
+#define HPFT_QPMAP_PROBE (8)
+static volatile uint32_t g_qpn_key[HPFT_QPMAP_SIZE];  /* qpn+1; 0 = empty */
+static volatile uint32_t g_qpn_pair[HPFT_QPMAP_SIZE]; /* pair index */
+static volatile uint32_t g_qpn_map_active;
 static volatile uint32_t g_hpft_rtt_traces;
 static volatile uint32_t g_hpft_unknown_ft;
 static volatile uint32_t g_hpft_ctx_seen[64];
@@ -217,6 +223,67 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 		uint32_t budget = ((volatile uint32_t *)request)[1];
 		int free_idx = -1;
 
+		if ((ft & 0xffff0000u) == 0xb48d0000u) {
+			/* explicit pair config: word0=0xB48D|n, then n x
+			 * {pair_idx, flowtag, dst_tag, budget, rx_rate}. budget=0 frees. */
+			uint32_t n = ft & 0xffffu;
+			volatile uint32_t *req = (volatile uint32_t *)request;
+
+			if (request_size < (1 + 5 * n) * sizeof(uint32_t))
+				return DOCA_PCC_DEV_STATUS_OK;
+			for (uint32_t e = 0; e < n; e++) {
+				uint32_t pidx = req[1 + 5 * e] % HPFT_PAIRS;
+				uint32_t eft = req[2 + 5 * e];
+				uint32_t edst = req[3 + 5 * e];
+				uint32_t ebud = req[4 + 5 * e];
+				uint32_t erx = req[5 + 5 * e];
+				hpft_pair_t *c = &g_hpft_pairs[pidx];
+
+				if (ebud == 0) {
+					c->flowtag = 0;
+					continue;
+				}
+				if (c->flowtag != eft || c->dst_tag != edst || c->budget != ebud) {
+					c->budget = ebud;
+					c->level = ebud;
+					c->cc_rate = DOCA_PCC_DEV_MAX_RATE;
+					if (c->flowtag != eft || c->dst_tag != edst) {
+						for (int sh = 0; sh < HPFT_MAX_THREADS; sh++)
+							c->b32_shard[sh] = 0;
+						c->epoch_ts = 0;
+					}
+					c->dst_tag = edst;
+					c->flowtag = eft;
+				}
+				c->remote_rx_rate = erx;
+			}
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		if ((ft & 0xffff0000u) == 0xb48e0000u) {
+			/* qpn map: word0=0xB48E|n, then n x {qpn, pair_idx}. */
+			uint32_t n = ft & 0xffffu;
+			volatile uint32_t *req = (volatile uint32_t *)request;
+
+			if (request_size < (1 + 2 * n) * sizeof(uint32_t))
+				return DOCA_PCC_DEV_STATUS_OK;
+			for (uint32_t e = 0; e < n; e++) {
+				uint32_t qpn = req[1 + 2 * e];
+				uint32_t pidx = req[2 + 2 * e];
+				uint32_t h = (qpn * 2654435761u) % HPFT_QPMAP_SIZE;
+
+				for (uint32_t pr = 0; pr < HPFT_QPMAP_PROBE; pr++) {
+					uint32_t idx = (h + pr) % HPFT_QPMAP_SIZE;
+
+					if (g_qpn_key[idx] == qpn + 1 || g_qpn_key[idx] == 0) {
+						g_qpn_key[idx] = qpn + 1;
+						g_qpn_pair[idx] = pidx % HPFT_PAIRS;
+						break;
+					}
+				}
+			}
+			g_qpn_map_active = 1;
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
 		if ((ft & 0xffff0000u) == 0xb47c0000u) {
 			/* batch update: word0 = 0xB47C0000|n, then n x
 			 * {flowtag, budget, rx_rate}. budget=0 deletes. */
@@ -367,11 +434,34 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		doca_pcc_dev_trace_5(3, w[0], w[1], w[2], ft, now);
 		doca_pcc_dev_trace_flush();
 	}
-	for (int i = 0; i < HPFT_PAIRS; i++) {
-		hpft_pair_t *c = &g_hpft_pairs[i];
+	int target = -1;
 
-		if (c->flowtag != ft)
-			continue;
+	if (g_qpn_map_active) {
+		uint32_t qpn = doca_pcc_dev_get_flow_qpn(event);
+		uint32_t h = (qpn * 2654435761u) % HPFT_QPMAP_SIZE;
+
+		for (uint32_t pr = 0; pr < HPFT_QPMAP_PROBE; pr++) {
+			uint32_t idx = (h + pr) % HPFT_QPMAP_SIZE;
+
+			if (g_qpn_key[idx] == qpn + 1) {
+				target = g_qpn_pair[idx];
+				break;
+			}
+			if (g_qpn_key[idx] == 0)
+				break;
+		}
+	}
+	if (target < 0) {
+		for (int i = 0; i < HPFT_PAIRS; i++) {
+			if (g_hpft_pairs[i].flowtag == ft) {
+				target = i;
+				break;
+			}
+		}
+	}
+	if (target >= 0) {
+		hpft_pair_t *c = &g_hpft_pairs[target];
+
 		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
 			/* fabric congestion: multiplicative decrease (DCQCN-style) */
 			uint32_t nr = c->cc_rate - (c->cc_rate >> 3);
