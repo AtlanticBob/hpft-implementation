@@ -185,7 +185,8 @@ typedef struct {
 	volatile uint32_t dbg_epochs;
 	volatile uint32_t dbg_ev_b32;
 	volatile uint32_t dbg_hits;	/* racy per-event counter for visibility */
-	volatile uint32_t remote_rx_rate;	/* from NP RTT response payload w1 */
+	volatile uint32_t remote_rx_rate;	/* receiver-measured RX rate (agent/NP fed) */
+	volatile uint32_t last_rrx_used;	/* control-step gating on fresh samples */
 	volatile uint32_t remote_cap;		/* from NP RTT response payload w2 */
 	volatile uint32_t b32_shard[HPFT_MAX_THREADS];
 } hpft_pair_t;
@@ -217,6 +218,54 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 		uint32_t ft = ((volatile uint32_t *)request)[0];
 		uint32_t budget = ((volatile uint32_t *)request)[1];
 		int free_idx = -1;
+
+		if ((ft & 0xffff0000u) == 0xb47c0000u) {
+			/* batch update: word0 = 0xB47C0000|n, then n x
+			 * {flowtag, budget, rx_rate}. budget=0 deletes. */
+			uint32_t n = ft & 0xffffu;
+			volatile uint32_t *req = (volatile uint32_t *)request;
+
+			if (request_size < (1 + 3 * n) * sizeof(uint32_t))
+				return DOCA_PCC_DEV_STATUS_OK;
+			for (uint32_t e = 0; e < n; e++) {
+				uint32_t eft = req[1 + 3 * e];
+				uint32_t ebud = req[2 + 3 * e];
+				uint32_t erx = req[3 + 3 * e];
+				int fidx = -1;
+
+				for (int i = 0; i < HPFT_PAIRS; i++) {
+					hpft_pair_t *c = &g_hpft_pairs[i];
+
+					if (c->flowtag == eft) {
+						if (ebud == 0) {
+							c->flowtag = 0;
+						} else {
+							if (c->budget != ebud) {
+								c->budget = ebud;
+								c->level = ebud;
+							}
+							c->remote_rx_rate = erx;
+						}
+						fidx = -2;
+						break;
+					}
+					if (fidx < 0 && c->flowtag == 0)
+						fidx = i;
+				}
+				if (fidx >= 0 && ebud != 0) {
+					hpft_pair_t *c = &g_hpft_pairs[fidx];
+
+					c->budget = ebud;
+					c->level = ebud;
+					c->remote_rx_rate = erx;
+					for (int s = 0; s < HPFT_MAX_THREADS; s++)
+						c->b32_shard[s] = 0;
+					c->epoch_ts = 0;
+					c->flowtag = eft;
+				}
+			}
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
 
 		if (ft == 0xdebu) {
 			hpft_pair_t *c = &g_hpft_pairs[budget % HPFT_PAIRS];
@@ -373,34 +422,58 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				/* R in 2^20-of-200G units: bytes32*32B*8b / dt_us / 200e9 * 2^20 */
 				uint64_t r_units = (b32_corr << 28) / ((uint64_t)dt * 200000u);
 				uint32_t bud = c->budget, lvl = c->level;
-				/* smooth the per-epoch measurement: at high flow counts
-				 * events arrive in waves and 1ms windows alias badly */
-				uint32_t rs = c->r_ewma;
+				uint32_t rrx = c->remote_rx_rate;
+				uint32_t rs;
 
-				rs = rs + (uint32_t)(((int64_t)r_units - (int64_t)rs) >> 2);
-				c->r_ewma = rs;
+				uint32_t do_ctrl = 1;
+
+				if (rrx != 0) {
+					/* receiver-measured RX rate (agent-fed): exact,
+					 * no event-loss undercount. One control step per
+					 * fresh sample - R updates slower than epochs. */
+					rs = rrx;
+					c->r_ewma = rrx;
+					if (rrx == c->last_rrx_used)
+						do_ctrl = 0;
+					else
+						c->last_rrx_used = rrx;
+				} else {
+					/* fallback: smoothed TX-event estimate */
+					rs = c->r_ewma;
+					rs = rs + (uint32_t)(((int64_t)r_units - (int64_t)rs) >> 2);
+					c->r_ewma = rs;
+				}
 
 				c->dbg_r_units = rs;
 				c->dbg_s_x16 = (uint32_t)s_x16;
 				c->dbg_epochs++;
 				c->dbg_ev_b32 = b32;
 
-				if (ets != 0 && bud > 0) {
-					if (rs > bud) {
-						uint64_t nl = (uint64_t)lvl * bud / rs;
+				if (do_ctrl && ets != 0 && bud > 0) {
+					/* small-step integral control: with 1000+ flows the
+					 * per-flow rate-application latency (event cadence)
+					 * makes fast level swings leave stale-rate mass;
+					 * a slowly-moving level converges every flow onto
+					 * the same L* and the integral term pins R to B. */
+					int64_t err = (int64_t)bud - (int64_t)rs;
+					int64_t adj = ((int64_t)lvl * err) / ((int64_t)bud * 8);
+					int64_t lim = (int64_t)(lvl >> 3) + 1;
 
-						if (nl < (lvl >> 1))
-							nl = lvl >> 1; /* bounded shrink per epoch */
-						lvl = (nl < HPFT_MIN_LEVEL) ? HPFT_MIN_LEVEL : (uint32_t)nl;
-					} else if (rs < bud - (bud >> 5)) {
-						/* additive growth only: no multiplicative pumping */
-						uint64_t nl = (uint64_t)lvl + (bud >> 6) + 1;
+					if (adj == 0 && err != 0)
+						adj = (err > 0) ? 1 : -1; /* kill the
+									   * truncation deadband */
 
-						lvl = (nl > bud) ? bud : (uint32_t)nl;
-					} else if (rs < bud) {
-						lvl = (lvl < bud) ? lvl + 1 : bud;
-					}
-					c->level = lvl;
+					if (adj > lim)
+						adj = lim;
+					if (adj < -lim)
+						adj = -lim;
+					int64_t nl = (int64_t)lvl + adj;
+
+					if (nl < (int64_t)HPFT_MIN_LEVEL)
+						nl = HPFT_MIN_LEVEL;
+					if (nl > (int64_t)bud)
+						nl = bud;
+					c->level = (uint32_t)nl;
 				}
 				want_rtt = 1;
 			}
