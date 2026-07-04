@@ -193,6 +193,7 @@ typedef struct {
 
 static hpft_pair_t g_hpft_pairs[HPFT_PAIRS];
 static volatile uint32_t g_hpft_rtt_traces;
+static volatile uint32_t g_hpft_unknown_ft;
 /* event-observed bytes per port (32B units, running totals, sharded).
  * The HW port counter gives exact TX bytes; the ratio port_true/port_ev is
  * the event-undersampling factor used to correct per-pair estimates. */
@@ -267,6 +268,15 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 
+		if (ft == 0xdeau) {
+			volatile uint32_t *rsp = (volatile uint32_t *)response;
+
+			rsp[0] = g_hpft_unknown_ft;
+			for (int i = 1; i < 8; i++)
+				rsp[i] = 0;
+			*response_size = 8 * sizeof(uint32_t);
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
 		if (ft == 0xdebu) {
 			hpft_pair_t *c = &g_hpft_pairs[budget % HPFT_PAIRS];
 			volatile uint32_t *rsp = (volatile uint32_t *)response;
@@ -490,6 +500,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	}
 	/* no pair entry for this flowtag: fail open (probe occasionally so the
 	 * receiver-driven channel can be tested on any flow) */
+	g_hpft_unknown_ft = ft;
 	{
 		static volatile uint32_t g_hpft_fo_cnt;
 
