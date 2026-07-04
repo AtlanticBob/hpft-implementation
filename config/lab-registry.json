@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "comment": "hpft-shaper v2 lab registry. RDMA caps enforced via DOCA PCC on the BF3 DPA. rate_bps is the pair cap; the controller converts to 2^20-of-linerate units (line = 200 Gb/s).",
+  "line_rate_bps": 200000000000,
+  "sender_host": "sgpu01",
+  "receiver_host": "sgpu02",
+  "sender_dpu": "hpft-dpu",
+  "receiver_dpu": "hpft-dpu2",
+  "vnics": [
+    {"vnic_id": "sgpu01/vf0", "host": "sgpu01", "rdma_dev": "mlx5_6", "netdev": "dpu1vf0", "representor": "pf1vf0", "ip": "10.1.0.1", "flowtag": "0x74249a41"},
+    {"vnic_id": "sgpu01/vf1", "host": "sgpu01", "rdma_dev": "mlx5_7", "netdev": "dpu1vf1", "representor": "pf1vf1", "ip": "10.1.1.1", "flowtag": "0x11f4386b"},
+    {"vnic_id": "sgpu01/vf2", "host": "sgpu01", "rdma_dev": "mlx5_8", "netdev": "dpu1vf2", "representor": "pf1vf2", "ip": "10.1.2.1", "flowtag": "0xde985a90"},
+    {"vnic_id": "sgpu01/vf3", "host": "sgpu01", "rdma_dev": "mlx5_9", "netdev": "dpu1vf3", "representor": "pf1vf3", "ip": "10.1.3.1", "flowtag": "0x7973f1b0"},
+    {"vnic_id": "sgpu02/vf0", "host": "sgpu02", "rdma_dev": "mlx5_6", "netdev": "dpu1vf0", "representor": "pf1vf0", "ip": "10.1.0.2"},
+    {"vnic_id": "sgpu02/vf1", "host": "sgpu02", "rdma_dev": "mlx5_7", "netdev": "dpu1vf1", "representor": "pf1vf1", "ip": "10.1.1.2"},
+    {"vnic_id": "sgpu02/vf2", "host": "sgpu02", "rdma_dev": "mlx5_8", "netdev": "dpu1vf2", "representor": "pf1vf2", "ip": "10.1.2.2"},
+    {"vnic_id": "sgpu02/vf3", "host": "sgpu02", "rdma_dev": "mlx5_9", "netdev": "dpu1vf3", "representor": "pf1vf3", "ip": "10.1.3.2"}
+  ],
+  "rdma_rules": [
+    {"src_vnic": "sgpu01/vf0", "dst_vnic": "sgpu02/vf0", "rate_bps": 8000000000},
+    {"src_vnic": "sgpu01/vf1", "dst_vnic": "sgpu02/vf1", "rate_bps": 4000000000},
+    {"src_vnic": "sgpu01/vf2", "dst_vnic": "sgpu02/vf2", "rate_bps": 2000000000},
+    {"src_vnic": "sgpu01/vf3", "dst_vnic": "sgpu02/vf3", "rate_bps": 2000000000}
+  ]
+}
