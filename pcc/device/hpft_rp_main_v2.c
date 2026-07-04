@@ -201,8 +201,6 @@ static volatile uint32_t g_qpn_pair[HPFT_QPMAP_SIZE]; /* pair index */
 static volatile uint32_t g_qpn_map_active;
 static volatile uint32_t g_hpft_rtt_traces;
 static volatile uint32_t g_hpft_unknown_ft;
-static volatile uint32_t g_hpft_ctx_seen[64];
-static volatile uint32_t g_hpft_ctx_traces;
 static volatile uint32_t g_hpft_cc_freeze;
 /* event-observed bytes per port (32B units, running totals, sharded).
  * The HW port counter gives exact TX bytes; the ratio port_true/port_ev is
@@ -413,19 +411,6 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	(void)algo_ctxt;
 	(void)attr;
 	results->rtt_req = 0;
-	if (g_hpft_ctx_traces < 12) {
-		uint32_t qpn0 = doca_pcc_dev_get_flow_qpn(event);
-		uint32_t sig = (uint32_t)(uintptr_t)algo_ctxt ^ qpn0;
-		uint32_t h = (qpn0 * 2654435761u) >> 26;
-
-		if (g_hpft_ctx_seen[h] != sig) {
-			g_hpft_ctx_seen[h] = sig;
-			g_hpft_ctx_traces++;
-			/* format 5: ctx pointer, qpn, flowtag */
-			doca_pcc_dev_trace_5(5, (uint32_t)(uintptr_t)algo_ctxt, qpn0, ft, 0, 0);
-			doca_pcc_dev_trace_flush();
-		}
-	}
 	if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT && g_hpft_rtt_traces < 8) {
 		uint32_t *w = (uint32_t *)doca_pcc_dev_get_rtt_raw_data(event);
 
