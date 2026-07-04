@@ -20,6 +20,8 @@ CAPS_FILE = "/tmp/hpft_caps.conf"   # lines: "<dst_ip> <cap_units>", re-read per
 DEVS = {
     "10.1.0.2": "pf1vf0",
     "10.1.1.2": "pf1vf1",
+    "10.1.2.2": "pf1vf2",
+    "10.1.3.2": "pf1vf3",
 }
 
 

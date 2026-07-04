@@ -19,6 +19,8 @@ HZ = 20
 PAIRS = {
     "10.1.0.2": {"ft": 0x74249a41, "dev": "pf1vf0"},
     "10.1.1.2": {"ft": 0x11f4386b, "dev": "pf1vf1"},
+    "10.1.2.2": {"ft": 0xde985a90, "dev": "pf1vf2"},
+    "10.1.3.2": {"ft": 0x7973f1b0, "dev": "pf1vf3"},
 }
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
