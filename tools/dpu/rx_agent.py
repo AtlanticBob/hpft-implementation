@@ -15,11 +15,24 @@ import time
 
 SENDER = ("10.0.4.201", 9709)
 HZ = 20
-# dst_ip -> {dev: representor, cap: units}
-CONFIG = {
-    "10.1.0.2": {"dev": "pf1vf0", "cap": 41943},
-    "10.1.1.2": {"dev": "pf1vf1", "cap": 0},
+CAPS_FILE = "/tmp/hpft_caps.conf"   # lines: "<dst_ip> <cap_units>", re-read per tick
+# dst_ip -> representor dev
+DEVS = {
+    "10.1.0.2": "pf1vf0",
+    "10.1.1.2": "pf1vf1",
 }
+
+
+def read_caps():
+    caps = {}
+    try:
+        for line in open(CAPS_FILE):
+            toks = line.split()
+            if len(toks) == 2:
+                caps[toks[0]] = int(toks[1])
+    except FileNotFoundError:
+        pass
+    return caps
 
 
 def vport_tx_bytes(dev):
@@ -32,19 +45,21 @@ def vport_tx_bytes(dev):
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 prev = {}
-print(f"rx_agent: {len(CONFIG)} dsts -> {SENDER} @{HZ}Hz", flush=True)
+print(f"rx_agent: {len(DEVS)} dsts -> {SENDER} @{HZ}Hz caps={CAPS_FILE}", flush=True)
 while True:
     t = time.time_ns()
+    caps = read_caps()
     lines = []
-    for ip, c in CONFIG.items():
-        v = vport_tx_bytes(c["dev"])
+    for ip, dev in DEVS.items():
+        cap = caps.get(ip, 0)
+        v = vport_tx_bytes(dev)
         if v is None:
             continue
         pv, pt = prev.get(ip, (v, t))
         prev[ip] = (v, t)
         dt = t - pt
         rate = int((v - pv) * 8 * (1 << 20) // (dt * 200)) if dt > 0 else 0
-        lines.append(f"{ip} {c['cap']} {rate}")
+        lines.append(f"{ip} {cap} {rate}")
     if lines:
         sock.sendto("\n".join(lines).encode(), SENDER)
     time.sleep(max(0.0, 1.0 / HZ - (time.time_ns() - t) / 1e9))
