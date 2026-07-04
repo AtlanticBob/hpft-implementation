@@ -70,3 +70,16 @@
   `results/s5_shared_cap_20260703/`
 - 探测代码快照:`pcc/s2-fixed-rate/`(S2/S3/S4 各版本 device main + host 补丁);
   DPU 上活树:`~/bzx/doca34-apps`(S5 版本)
+
+## Phase 2 指令修正(2026-07-04,用户)
+
+1. 步骤 1 推进:rate 公式必须正确(min(cc, budget));共享 cap 不得用 cap/N
+   均分;≥1024 QP 下总速率误差要低。
+2. 步骤 2 推进:实验中近似 **dst_vnic ≡ dst_ip**(一 vNIC 一 IP)。
+3. 步骤 3 推进但换机制:mailbox 延迟太高。后续计划是 CC 式接收端驱动——
+   接收端通过 out-of-band 消息告知发送端 cap,发送端 vNIC 读取消息取出 cap
+   并实施。集成点判断:**PCC RTT request/response 通道**(NP 在响应负载中
+   携带 cap,RP 从 ROCE_RTT 事件的 rtt_raw_data 提取,µs 级、逐流、零 host
+   参与);CNP 类无请求消息为备选(可携带数据太少)。需要 sgpu02 DPU 上的
+   NP 部署。mailbox 降级为慢速策略通道。
+4. 步骤 4、5 暂缓。
