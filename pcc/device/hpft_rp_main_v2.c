@@ -469,8 +469,11 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 						adj = -lim;
 					int64_t nl = (int64_t)lvl + adj;
 
-					if (nl < (int64_t)HPFT_MIN_LEVEL)
-						nl = HPFT_MIN_LEVEL;
+					int64_t floor_lvl = (int64_t)(bud >> 7) + HPFT_MIN_LEVEL;
+
+					if (nl < floor_lvl)
+						nl = floor_lvl; /* keep QPs alive: never crush
+								 * below ~0.8% of budget */
 					if (nl > (int64_t)bud)
 						nl = bud;
 					c->level = (uint32_t)nl;
