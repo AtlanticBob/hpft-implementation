@@ -187,6 +187,7 @@ typedef struct {
 	volatile uint32_t dbg_hits;	/* racy per-event counter for visibility */
 	volatile uint32_t remote_rx_rate;	/* receiver-measured RX rate (agent/NP fed) */
 	volatile uint32_t last_rrx_used;	/* control-step gating on fresh samples */
+	volatile uint32_t cc_rate;		/* pair DCQCN-lite term, 2^20 units */
 	volatile uint32_t remote_cap;		/* from NP RTT response payload w2 */
 	volatile uint32_t b32_shard[HPFT_MAX_THREADS];
 } hpft_pair_t;
@@ -194,17 +195,13 @@ typedef struct {
 static hpft_pair_t g_hpft_pairs[HPFT_PAIRS];
 static volatile uint32_t g_hpft_rtt_traces;
 static volatile uint32_t g_hpft_unknown_ft;
+static volatile uint32_t g_hpft_ctx_seen[64];
+static volatile uint32_t g_hpft_ctx_traces;
+static volatile uint32_t g_hpft_cc_freeze;
 /* event-observed bytes per port (32B units, running totals, sharded).
  * The HW port counter gives exact TX bytes; the ratio port_true/port_ev is
  * the event-undersampling factor used to correct per-pair estimates. */
 static volatile uint32_t g_port_ev[DOCA_PCC_DEV_MAX_NUM_PORTS][HPFT_MAX_THREADS];
-
-static inline uint32_t hpft_cc_rate(void)
-{
-	/* placeholder for the congestion-control term of rate = min(cc, level);
-	 * becomes the DCQCN/RTT-template output after ctx-mapping is resolved */
-	return DOCA_PCC_DEV_MAX_RATE;
-}
 
 doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 						      uint32_t request_size,
@@ -258,6 +255,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 
 					c->budget = ebud;
 					c->level = ebud;
+					c->cc_rate = DOCA_PCC_DEV_MAX_RATE;
 					c->remote_rx_rate = erx;
 					for (int s = 0; s < HPFT_MAX_THREADS; s++)
 						c->b32_shard[s] = 0;
@@ -268,6 +266,20 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 
+		if (ft == 0xcccu) {
+			/* validation: 0xccc <idx> <cc_value>. cc_value>0 freezes cc_rate at
+			 * that value (emulates sustained fabric congestion); 0 unfreezes. */
+			hpft_pair_t *c = &g_hpft_pairs[((volatile uint32_t *)request)[2] % HPFT_PAIRS];
+			uint32_t val = budget;
+
+			if (val > 0) {
+				c->cc_rate = val;
+				g_hpft_cc_freeze = 1;
+			} else {
+				g_hpft_cc_freeze = 0;
+			}
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
 		if (ft == 0xdeau) {
 			volatile uint32_t *rsp = (volatile uint32_t *)response;
 
@@ -286,7 +298,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[2] = c->level;
 			rsp[3] = c->remote_rx_rate;
 			rsp[4] = c->dbg_r_units;
-			rsp[5] = c->dbg_hits;
+			rsp[5] = c->cc_rate;
 			rsp[6] = c->dbg_epochs;
 			rsp[7] = c->remote_cap;
 			*response_size = 8 * sizeof(uint32_t);
@@ -309,6 +321,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 		if (budget != 0 && free_idx >= 0) {
 			g_hpft_pairs[free_idx].budget = budget;
 			g_hpft_pairs[free_idx].level = budget;
+			g_hpft_pairs[free_idx].cc_rate = DOCA_PCC_DEV_MAX_RATE;
 			g_hpft_pairs[free_idx].avg_b32_x16 = 34 * 16; /* ~1088B pkts */
 			for (int s = 0; s < HPFT_MAX_THREADS; s++)
 				g_hpft_pairs[free_idx].b32_shard[s] = 0;
@@ -333,6 +346,19 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	(void)algo_ctxt;
 	(void)attr;
 	results->rtt_req = 0;
+	if (g_hpft_ctx_traces < 12) {
+		uint32_t qpn0 = doca_pcc_dev_get_flow_qpn(event);
+		uint32_t sig = (uint32_t)(uintptr_t)algo_ctxt ^ qpn0;
+		uint32_t h = (qpn0 * 2654435761u) >> 26;
+
+		if (g_hpft_ctx_seen[h] != sig) {
+			g_hpft_ctx_seen[h] = sig;
+			g_hpft_ctx_traces++;
+			/* format 5: ctx pointer, qpn, flowtag */
+			doca_pcc_dev_trace_5(5, (uint32_t)(uintptr_t)algo_ctxt, qpn0, ft, 0, 0);
+			doca_pcc_dev_trace_flush();
+		}
+	}
 	if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT && g_hpft_rtt_traces < 8) {
 		uint32_t *w = (uint32_t *)doca_pcc_dev_get_rtt_raw_data(event);
 
@@ -346,6 +372,12 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 
 		if (c->flowtag != ft)
 			continue;
+		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
+			/* fabric congestion: multiplicative decrease (DCQCN-style) */
+			uint32_t nr = c->cc_rate - (c->cc_rate >> 3);
+
+			c->cc_rate = (nr < HPFT_MIN_LEVEL) ? HPFT_MIN_LEVEL : nr;
+		}
 		if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT) {
 			uint32_t *w = (uint32_t *)doca_pcc_dev_get_rtt_raw_data(event);
 
@@ -488,10 +520,18 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 						nl = bud;
 					c->level = (uint32_t)nl;
 				}
+				/* additive CC recovery toward line rate, every epoch,
+				 * independent of the level control step */
+				if (!g_hpft_cc_freeze) {
+					uint32_t cr = c->cc_rate + (DOCA_PCC_DEV_MAX_RATE >> 8);
+
+					c->cc_rate = (cr < c->cc_rate || cr > DOCA_PCC_DEV_MAX_RATE)
+							     ? DOCA_PCC_DEV_MAX_RATE : cr;
+				}
 				want_rtt = 1;
 			}
 		}
-		uint32_t cc = hpft_cc_rate();
+		uint32_t cc = c->cc_rate;
 		uint32_t lvl = c->level;
 
 		results->rate = (cc < lvl) ? cc : lvl;
