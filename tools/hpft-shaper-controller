@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""hpft-shaper-controller: single entry point for the RDMA shaper v2 control
+plane, driven by a registry aligned with the v1 {src_vnic,dst_vnic,rate_bps}
+interface.
+
+Responsibilities (single-dst main path):
+  - parse the registry, resolve each rdma_rule to a receiver representor + cap
+  - render the receiver-side caps file (dst_ip -> cap_units) consumed by the
+    receiver rx_agent, and (re)start the enforcement processes
+  - accept JSON-lines control on stdin to change a pair's rate at runtime
+    ({"cmd":"set","src_vnic":..,"dst_vnic":..,"rate_bps":..})
+
+The distributed enforcement pieces (RP on the sender DPU, rx_agent on the
+receiver DPU) are managed as named services; this controller is the one place
+an operator drives them from the registry. The multi-dst qpn-override path
+(tools/dpu/mdst_controller.py + tools/host/qpn_resolver.py) plugs in the same
+way and is documented in results/p22_multidst_20260704/summary.md.
+
+Usage:
+  hpft-shaper-controller --registry config/lab-registry.json --apply
+  hpft-shaper-controller --registry config/lab-registry.json --json   # dry run
+"""
+import argparse
+import json
+import subprocess
+import sys
+
+LINE_BPS_DEFAULT = 200_000_000_000
+CAPS_PATH = "/tmp/hpft_caps.conf"
+
+
+def load(path):
+    reg = json.load(open(path))
+    vnics = {v["vnic_id"]: v for v in reg["vnics"]}
+    line = reg.get("line_rate_bps", LINE_BPS_DEFAULT)
+    caps = []          # (dst_ip, cap_units, rule)
+    for r in reg["rdma_rules"]:
+        dst = vnics[r["dst_vnic"]]
+        units = max(1, round(r["rate_bps"] / line * (1 << 20)))
+        caps.append((dst["ip"], units, r))
+    return reg, vnics, caps, line
+
+
+def render_caps(caps):
+    return "".join(f"{ip} {u}\n" for ip, u, _ in caps)
+
+
+def ssh(host, cmd):
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", host, cmd],
+                          capture_output=True, text=True)
+
+
+def apply(reg, caps):
+    rx_dpu = reg["receiver_dpu"]
+    body = render_caps(caps)
+    # write caps file on the receiver DPU (rx_agent hot-reads it every tick)
+    ssh(rx_dpu, f"cat > {CAPS_PATH} <<'EOF'\n{body}EOF")
+    ssh(rx_dpu, "systemctl is-active hpft-rxagent >/dev/null 2>&1 || "
+                "sudo systemd-run --unit=hpft-rxagent --property=Restart=always "
+                "/usr/bin/python3 -u /tmp/rx_agent.py")
+    print(f"applied {len(caps)} rdma rules -> {rx_dpu}:{CAPS_PATH}", flush=True)
+
+
+def control_loop(path):
+    """JSON-lines runtime rate changes on stdin."""
+    reg, vnics, caps, line = load(path)
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            print(json.dumps({"ok": False, "err": "bad json"}), flush=True)
+            continue
+        if msg.get("cmd") == "set":
+            for r in reg["rdma_rules"]:
+                if r["src_vnic"] == msg["src_vnic"] and r["dst_vnic"] == msg["dst_vnic"]:
+                    r["rate_bps"] = msg["rate_bps"]
+            _, _, caps, _ = load(path) if False else (None, None,
+                [(vnics[r["dst_vnic"]]["ip"], max(1, round(r["rate_bps"] / line * (1 << 20))), r)
+                 for r in reg["rdma_rules"]], None)
+            apply(reg, caps)
+            print(json.dumps({"ok": True}), flush=True)
+        elif msg.get("cmd") == "quit":
+            break
+        else:
+            print(json.dumps({"ok": False, "err": "unknown cmd"}), flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--registry", required=True)
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--json", action="store_true", help="dry-run: print plan")
+    ap.add_argument("--control", action="store_true", help="JSON-lines stdin control loop")
+    a = ap.parse_args()
+    reg, vnics, caps, line = load(a.registry)
+    if a.json or not (a.apply or a.control):
+        plan = [{"src_vnic": r["src_vnic"], "dst_vnic": r["dst_vnic"],
+                 "dst_ip": ip, "rate_bps": r["rate_bps"], "cap_units": u}
+                for ip, u, r in caps]
+        print(json.dumps({"caps_file": CAPS_PATH, "rules": plan}, indent=2))
+        return
+    if a.apply:
+        apply(reg, caps)
+    if a.control:
+        control_loop(a.registry)
+
+
+if __name__ == "__main__":
+    main()
