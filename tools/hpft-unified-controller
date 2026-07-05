@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""hpft-unified-controller: ONE resident control plane for both the TCP and the
+RDMA shaper, keyed by {src_vnic, dst_vnic, rate_bps} — protocol-agnostic on the
+wire, protocol-specific only in the backend it dispatches to.
+
+  TCP  rate change -> in-process direct bpf() map write on the sender egress
+                      (opt3 v3 EDT, pinned /sys/fs/bpf/hpft_tcp_edt), ~48us,
+                      NEVER forks a CLI (the rate-perf report's hard requirement).
+  RDMA rate change -> PCC receiver-cap path: rewrite the caps file the rx_agent
+                      hot-reads on the receiver DPU (DOCA PCC on the BF3 DPA).
+
+This is the single operator entry point. It replaces driving tcp-shaper-* and
+the rdma controller separately, and satisfies "resident process + direct bpf,
+not fork-per-set" for the TCP high-frequency path.
+
+Registries (kept per-proto; a single merged schema is a later cleanup):
+  --rdma-registry config/lab-registry.json       (vnics + rdma_rules)
+  --tcp-registry  config/lab-tcp-registry.json    (vnics [+ optional tcp_rules])
+
+Modes:
+  --json      dry-run: print the combined plan
+  --apply     apply both backends' initial rates from the registries
+  --control   resident JSON-lines stdin loop; per line one command:
+      {"cmd":"set","proto":"tcp","src_vnic":..,"dst_vnic":..,"rate_bps":..}
+      {"cmd":"set","proto":"rdma","src_vnic":..,"dst_vnic":..,"rate_bps":..}
+      {"cmd":"get"}                      -> current rate table
+      {"cmd":"quit"}
+    each 'set' replies {"ok":true,"proto":..,"latency_us":..}
+
+--apply and --control compose: --apply --control applies then serves.
+"""
+import argparse
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-exp/tcp_shaper/tools")
+from tcp_shaper_lib import (  # noqa: E402
+    DirectBpfMapWriter,
+    build_pair_cfg_update,
+    make_generation,
+)
+
+LINE_BPS_DEFAULT = 200_000_000_000
+CAPS_PATH = "/tmp/hpft_caps.conf"
+TCP_PIN_DIR = Path("/sys/fs/bpf/hpft_tcp_edt")
+TCP_BURST_BYTES = 262_144
+DEFAULT_TCP_OBJECT = "/home/zhaoxiang/hyperfront/hpft-shaper-v2/tcp/bpf-opt3/hpft_tcp_edt_kern.o"
+TCP_APPLY = "/home/zhaoxiang/hyperfront/hpft-exp/tcp_shaper/tools/tcp-shaper-apply"
+
+
+def ssh(host, cmd):
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", host, cmd],
+                          capture_output=True, text=True)
+
+
+# ---------------------------------------------------------------- RDMA backend
+def rdma_load(path):
+    reg = json.load(open(path))
+    vnics = {v["vnic_id"]: v for v in reg["vnics"]}
+    line = reg.get("line_rate_bps", LINE_BPS_DEFAULT)
+    return reg, vnics, line
+
+
+def rdma_caps(reg, vnics, line):
+    caps = []
+    for r in reg["rdma_rules"]:
+        dst = vnics[r["dst_vnic"]]
+        units = max(1, round(r["rate_bps"] / line * (1 << 20)))
+        caps.append((dst["ip"], units, r))
+    return caps
+
+
+def rdma_apply(reg, caps):
+    rx_dpu = reg["receiver_dpu"]
+    body = "".join(f"{ip} {u}\n" for ip, u, _ in caps)
+    ssh(rx_dpu, f"cat > {CAPS_PATH} <<'EOF'\n{body}EOF")
+    ssh(rx_dpu, "systemctl is-active hpft-rxagent >/dev/null 2>&1 || "
+                "sudo systemd-run --unit=hpft-rxagent --property=Restart=always "
+                "/usr/bin/python3 -u /tmp/rx_agent.py")
+
+
+# ----------------------------------------------------------------- TCP backend
+class TcpBackend:
+    """Direct-bpf writer over the pinned opt3 EDT maps on the sender egress."""
+
+    def __init__(self, registry_path, egress_dev, bpf_object):
+        self.registry = json.load(open(registry_path))
+        self.egress_dev = egress_dev
+        self.bpf_object = bpf_object
+        self.writer = None
+
+    def ensure_applied(self):
+        """Idempotently install the opt3 EDT program on the egress dev."""
+        if TCP_PIN_DIR.exists():
+            return
+        argv = ["sudo", "-n", "env", "PATH=/usr/sbin:" + __import__("os").environ.get("PATH", ""),
+                TCP_APPLY, "--registry", self._registry_path(), "--egress-dev", self.egress_dev,
+                "--qdisc-mode", "root-fq", "--bpf-object", self.bpf_object, "--apply"]
+        subprocess.run(argv, capture_output=True, text=True)
+
+    def _registry_path(self):
+        return self._reg_path
+
+    def open(self):
+        self.writer = DirectBpfMapWriter(TCP_PIN_DIR).__enter__()
+        try:
+            self.writer.fd("hpft_pair_cfg")  # open+cache the map fd now (not on first set)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def set_rate(self, src_vnic, dst_vnic, rate_bps):
+        if self.writer is None:
+            self.open()
+        upd = build_pair_cfg_update(registry=self.registry, src_vnic=src_vnic,
+                                    dst_vnic=dst_vnic, rate_bps=int(rate_bps),
+                                    burst_bytes=TCP_BURST_BYTES,
+                                    generation=make_generation())
+        return self.writer.update(upd)  # ns
+
+
+# ----------------------------------------------------------------- controller
+def build_plan(rdma_reg, vnics, line, tcp_reg):
+    rules = []
+    for ip, u, r in rdma_caps(rdma_reg, vnics, line):
+        rules.append({"proto": "rdma", "src_vnic": r["src_vnic"],
+                      "dst_vnic": r["dst_vnic"], "rate_bps": r["rate_bps"],
+                      "dst_ip": ip, "cap_units": u})
+    for r in tcp_reg.get("tcp_rules", []):
+        rules.append({"proto": "tcp", "src_vnic": r["src_vnic"],
+                      "dst_vnic": r["dst_vnic"], "rate_bps": r["rate_bps"]})
+    return rules
+
+
+def control_loop(rdma_reg, vnics, line, tcp):
+    # warm the TCP direct-bpf fds now so the first 'set' isn't a cold open
+    if TCP_PIN_DIR.exists():
+        try:
+            tcp.open()
+        except Exception:  # noqa: BLE001
+            pass
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            print(json.dumps({"ok": False, "err": "bad json"}), flush=True)
+            continue
+        cmd = msg.get("cmd")
+        if cmd == "quit":
+            print(json.dumps({"ok": True, "bye": True}), flush=True)
+            break
+        if cmd == "get":
+            print(json.dumps({"ok": True, "rdma": rdma_reg["rdma_rules"]}), flush=True)
+            continue
+        if cmd != "set":
+            print(json.dumps({"ok": False, "err": "unknown cmd"}), flush=True)
+            continue
+        proto = msg.get("proto")
+        try:
+            if proto == "tcp":
+                ns = tcp.set_rate(msg["src_vnic"], msg["dst_vnic"], msg["rate_bps"])
+                print(json.dumps({"ok": True, "proto": "tcp",
+                                  "latency_us": round(ns / 1000, 1)}), flush=True)
+            elif proto == "rdma":
+                t0 = time.monotonic_ns()
+                for r in rdma_reg["rdma_rules"]:
+                    if r["src_vnic"] == msg["src_vnic"] and r["dst_vnic"] == msg["dst_vnic"]:
+                        r["rate_bps"] = int(msg["rate_bps"])
+                rdma_apply(rdma_reg, rdma_caps(rdma_reg, vnics, line))
+                print(json.dumps({"ok": True, "proto": "rdma",
+                                  "latency_us": round((time.monotonic_ns() - t0) / 1000, 1)}),
+                      flush=True)
+            else:
+                print(json.dumps({"ok": False, "err": "proto must be tcp|rdma"}), flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(json.dumps({"ok": False, "proto": proto, "err": str(e)}), flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rdma-registry", default="/home/zhaoxiang/hyperfront/hpft-shaper-v2/config/lab-registry.json")
+    ap.add_argument("--tcp-registry", default="/home/zhaoxiang/hyperfront/hpft-shaper-v2/config/lab-tcp-registry.json")
+    ap.add_argument("--tcp-egress-dev", default="dpu1vf0")
+    ap.add_argument("--tcp-bpf-object", default=DEFAULT_TCP_OBJECT)
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--control", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    rdma_reg, vnics, line = rdma_load(a.rdma_registry)
+    tcp_reg = json.load(open(a.tcp_registry))
+    tcp = TcpBackend(a.tcp_registry, a.tcp_egress_dev, a.tcp_bpf_object)
+    tcp._reg_path = a.tcp_registry
+
+    if a.json or not (a.apply or a.control):
+        print(json.dumps({"caps_file": CAPS_PATH, "tcp_pin": str(TCP_PIN_DIR),
+                          "tcp_object": a.tcp_bpf_object,
+                          "rules": build_plan(rdma_reg, vnics, line, tcp_reg)}, indent=2))
+        return
+
+    if a.apply:
+        rdma_apply(rdma_reg, rdma_caps(rdma_reg, vnics, line))
+        tcp.ensure_applied()
+        for r in tcp_reg.get("tcp_rules", []):
+            tcp.set_rate(r["src_vnic"], r["dst_vnic"], r["rate_bps"])
+        print(json.dumps({"applied": {"rdma_rules": len(rdma_reg["rdma_rules"]),
+                                      "tcp_rules": len(tcp_reg.get("tcp_rules", []))}}),
+              flush=True)
+
+    if a.control:
+        control_loop(rdma_reg, vnics, line, tcp)
+
+
+if __name__ == "__main__":
+    main()
