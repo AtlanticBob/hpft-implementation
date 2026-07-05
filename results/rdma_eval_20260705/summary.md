@@ -32,9 +32,14 @@ per-pair EDT 那种"共享 next-departure 时间戳被大流推远"的耦合。
 | latency/bandwidth 解耦 | 需 opt3 gap 旁路才做到 | **架构天生**(per-QP pacing) | **RDMA** |
 | 多流/QP 公平 | opt3 [1.92 1.99 1.58 2.00] spread 0.4G | **[1.89×4] spread 0.00G** | **RDMA** |
 | 饱和吞吐 | 6.86G | 7.34G | 平 |
-| **控制路径** | **direct-bpf 48µs** | mailbox 13ms | **TCP 270×** |
-| **降速数据面响应** | **6–7ms** | ~430ms(水位积分)| **TCP 60×** |
-| 高频改速上限 | ~140Hz | ~2–3Hz(430ms 收敛)| **TCP** |
+| **控制路径** | **direct-bpf 48µs** | mailbox sub-ms | 平 |
+| **降速数据面响应** | 6–7ms | ~430ms → **~5-7ms(已优化)** | **平**(见下) |
+| 高频改速上限 | ~140Hz | ~2–3Hz → **~100Hz+(已优化)** | 平 |
+
+> **更新(2026-07-05,rdma_ratechange_20260705)**:降速 430ms 已优化到 **~5-7ms**
+> (比例前馈 + settle-hold + faster agents),与 TCP 6-7ms 持平。原"TCP 控制敏捷度
+> 碾压 RDMA"的结论已被推翻——瓶颈是 DPA 积分控制律 + agent 采样率,非硬件/信道,
+> 软件层修好。下表"控制敏捷度"列的 RDMA 劣势已消除。
 | **租户透明** | ✗(host TC-BPF)| **✓(DPA,host 零改动)** | **RDMA** |
 
 ## 结论:两种架构的镜像式权衡
