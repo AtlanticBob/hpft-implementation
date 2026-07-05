@@ -13,7 +13,7 @@
 #define HPFT_MAX_VNICS 4096
 #define HPFT_MAX_PAIRS 16384
 #define HPFT_NSEC_PER_SEC 1000000000ULL
-#define HPFT_PAIR_HORIZON_NS 4000000ULL  /* opt3: drop when aggregate debt runs >4ms ahead */
+#define HPFT_GAP_NS 40000ULL  /* opt3: inter-pkt gap > 40us => latency-sparse flow, bypass shared pacing */
 
 struct hpft_vlan_hdr {
     __u16 h_vlan_TCI;
@@ -62,16 +62,15 @@ struct {
     __type(value, struct hpft_pair_state);
 } hpft_pair_state SEC(".maps");
 
-/* opt3: per-flow EDT debt (paces each flow to the pair rate independently);
- * the pair state is reused unchanged as the aggregate debt for cap accounting. */
+/* opt3: per-flow last-send timestamp for inter-packet-gap detection. A flow
+ * that idles between packets (request/response latency flow, any packet size)
+ * bypasses the shared pair pacing; a continuous bulk flow does not. */
 struct hpft_flow_state {
-    struct bpf_spin_lock lock;
-    __u32 reserved0;
-    __u64 next_ns;
+    __u64 last_send_ns;
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);   /* LRU: dead flows age out automatically, no lock needed */
     __uint(max_entries, 16384);
     __type(key, __u64);
     __type(value, struct hpft_flow_state);
@@ -174,9 +173,9 @@ int hpft_tcp_edt(struct __sk_buff *skb)
     {
         void *data_end = (void *)(long)skb->data_end;
         struct tcphdr *tcph = (void *)iph + (iph->ihl * 4);
-        __u64 flow_key, flow_send_ns, pair_send_ns;
+        __u64 flow_key, gap = HPFT_GAP_NS + 1;
         struct hpft_flow_state *fs;
-        int over = 0;
+        struct hpft_flow_state fs_new;
 
         if ((void *)(tcph + 1) > data_end)
             return TC_ACT_OK;
@@ -186,38 +185,21 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         burst_ns = hpft_bytes_to_ns((__u64)cfg->burst_bytes, cfg->rate_bps);
         min_next_ns = now > burst_ns ? now - burst_ns : 0;
 
+        /* inter-packet gap per flow (5-tuple) */
         flow_key = ((__u64)(iph->saddr ^ iph->daddr) << 32) |
                    ((__u64)tcph->source << 16) | (__u64)tcph->dest;
         flow_key ^= pair_key;
-
         fs = bpf_map_lookup_elem(&hpft_flow_state_map, &flow_key);
-        if (!fs) {
-            struct hpft_flow_state init = {};
-
-            init.next_ns = now;
-            bpf_map_update_elem(&hpft_flow_state_map, &flow_key, &init, BPF_ANY);
-            fs = bpf_map_lookup_elem(&hpft_flow_state_map, &flow_key);
-            if (!fs)
-                return TC_ACT_OK;
+        if (fs) {
+            gap = now - fs->last_send_ns;
+            fs->last_send_ns = now;
+        } else {
+            fs_new.last_send_ns = now;
+            bpf_map_update_elem(&hpft_flow_state_map, &flow_key, &fs_new, BPF_ANY);
         }
 
-        /* per-flow EDT debt: paces THIS flow to the pair rate, so a sparse
-         * latency flow (any packet size) sees send ~= now even when a bulk
-         * flow is saturating the pair. */
-        bpf_spin_lock(&fs->lock);
-        if (fs->next_ns < min_next_ns)
-            fs->next_ns = min_next_ns;
-        flow_send_ns = fs->next_ns;
-        next_ns = flow_send_ns + packet_ns;
-        if (next_ns < flow_send_ns)
-            next_ns = flow_send_ns;
-        fs->next_ns = next_ns;
-        bpf_spin_unlock(&fs->lock);
-
-        /* pair aggregate debt: accounts all flows to enforce the cap. It is
-         * NOT used to delay packets (that is per-flow); when the aggregate
-         * backlog exceeds the horizon the packet is dropped so TCP backs off,
-         * keeping the aggregate at cap without coupling the flows' latency. */
+        /* shared pair debt: always accumulate (cap + fairness + smooth pacing,
+         * identical to baseline; keeps multi-flow stable). */
         bpf_spin_lock(&state->lock);
         if (state->generation != cfg->generation) {
             state->next_ns = now;
@@ -225,20 +207,18 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         } else if (state->next_ns < min_next_ns) {
             state->next_ns = min_next_ns;
         }
-        pair_send_ns = state->next_ns;
-        next_ns = pair_send_ns + packet_ns;
-        if (next_ns < pair_send_ns)
-            next_ns = pair_send_ns;
+        send_ns = state->next_ns;
+        next_ns = send_ns + packet_ns;
+        if (next_ns < send_ns)
+            next_ns = send_ns;
         state->next_ns = next_ns;
         bpf_spin_unlock(&state->lock);
 
-        if (pair_send_ns > now + HPFT_PAIR_HORIZON_NS)
-            over = 1;
-
-        if (over)
-            return TC_ACT_SHOT;
-        if (flow_send_ns > now)
-            skb->tstamp = flow_send_ns;
+        /* latency-sparse flow (idle between packets, any packet size) bypasses
+         * the shared pacing delay - its bytes are still in the pair debt so the
+         * cap stays accurate. Bulk flows are paced by the shared debt. */
+        if (gap <= HPFT_GAP_NS && send_ns > now)
+            skb->tstamp = send_ns;
         return TC_ACT_OK;
     }
 }
