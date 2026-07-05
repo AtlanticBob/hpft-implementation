@@ -166,6 +166,9 @@ void doca_pcc_dev_user_port_info_changed(uint32_t portid)
 #define HPFT_PAIRS (16)
 #define HPFT_EPOCH_US (1000u)
 #define HPFT_MIN_LEVEL (2u)
+#define HPFT_SETTLE_HOLD (3u)	/* after a cap change, hold the integral ~3 fresh-R steps
+				 * (~60ms @50Hz) so the wire responds to the feed-forward
+				 * level before the integral reacts to the stale-high R */
 #define HPFT_MAX_THREADS (256)
 
 /* byte accumulation is sharded per DPA thread (each thread owns its slot),
@@ -188,6 +191,7 @@ typedef struct {
 	volatile uint32_t dbg_hits;	/* racy per-event counter for visibility */
 	volatile uint32_t remote_rx_rate;	/* receiver-measured RX rate (agent/NP fed) */
 	volatile uint32_t last_rrx_used;	/* control-step gating on fresh samples */
+	volatile uint32_t hold;		/* settle-hold: skip integral for N fresh-R steps after a cap change */
 	volatile uint32_t cc_rate;		/* pair DCQCN-lite term, 2^20 units */
 	volatile uint32_t remote_cap;		/* from NP RTT response payload w2 */
 	volatile uint32_t b32_shard[HPFT_MAX_THREADS];
@@ -248,6 +252,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 						uint64_t nl = ((uint64_t)c->level * ebud) / c->budget;
 						c->level = nl > 0 ? (uint32_t)nl : 1;
 						c->last_rrx_used = erx;
+						c->hold = HPFT_SETTLE_HOLD;
 					} else {
 						c->level = ebud;
 					}
@@ -326,6 +331,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 									}
 									c->budget = ebud;
 									c->last_rrx_used = erx; /* don't integrate on pre-change (stale) R */
+									c->hold = HPFT_SETTLE_HOLD;
 								}
 								c->remote_rx_rate = erx;
 						}
@@ -403,6 +409,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 						c->level = budget;
 					}
 					c->budget = budget;
+					c->hold = HPFT_SETTLE_HOLD;
 				}
 				return DOCA_PCC_DEV_STATUS_OK;
 			}
@@ -591,6 +598,11 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				c->dbg_s_x16 = (uint32_t)s_x16;
 				c->dbg_epochs++;
 				c->dbg_ev_b32 = b32;
+
+				if (do_ctrl && c->hold > 0) {
+					c->hold--;
+					do_ctrl = 0;	/* let the wire catch up to the feed-forward level first */
+				}
 
 				if (do_ctrl && ets != 0 && bud > 0) {
 					/* small-step integral control: with 1000+ flows the
