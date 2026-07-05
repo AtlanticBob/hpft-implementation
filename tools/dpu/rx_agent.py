@@ -14,7 +14,7 @@ import sys
 import time
 
 SENDER = ("10.0.4.201", 9709)
-HZ = 20
+HZ = 100
 CAPS_FILE = "/tmp/hpft_caps.conf"   # lines: "<dst_ip> <cap_units>", re-read per tick
 # dst_ip -> representor dev
 DEVS = {
@@ -37,12 +37,17 @@ def read_caps():
     return caps
 
 
+_cnt_fd = {}
 def vport_tx_bytes(dev):
-    out = subprocess.run(["ethtool", "-S", dev], capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        if " vport_tx_bytes:" in line:
-            return int(line.split(":")[1])
-    return None
+    """sysfs tx_bytes (representor TX = wire->VF) - no ethtool fork."""
+    fd = _cnt_fd.get(dev)
+    if fd is None:
+        try:
+            fd = _cnt_fd[dev] = open("/sys/class/net/%s/statistics/tx_bytes" % dev)
+        except OSError:
+            return None
+    fd.seek(0)
+    return int(fd.read())
 
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

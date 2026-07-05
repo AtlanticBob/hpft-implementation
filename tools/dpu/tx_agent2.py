@@ -14,7 +14,7 @@ import time
 
 FIFO = "/tmp/rp_fifo"
 LISTEN = ("10.0.4.201", 9709)
-HZ = 20
+HZ = 50
 # src vNIC: flowtag + local representor dev; dst_ip keys the receiver caps
 PAIRS = {
     "10.1.0.2": {"ft": 0x74249a41, "dev": "pf1vf0"},
@@ -57,12 +57,18 @@ def fifo_write(line):
         return False
 
 
+_cnt_fd = {}
 def vport_rx_bytes(dev):
-    out = subprocess.run(["ethtool", "-S", dev], capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        if " vport_rx_bytes:" in line:
-            return int(line.split(":")[1])
-    return None
+    """sysfs rx_bytes (= vport_rx_bytes rate, verified) - no ethtool fork, so
+    the tick isn't capped at ~16Hz by 4 subprocess calls."""
+    fd = _cnt_fd.get(dev)
+    if fd is None:
+        try:
+            fd = _cnt_fd[dev] = open("/sys/class/net/%s/statistics/rx_bytes" % dev)
+        except OSError:
+            return None
+    fd.seek(0)
+    return int(fd.read())
 
 
 print(f"tx_agent2: {len(PAIRS)} pairs, local R + receiver caps @{HZ}Hz", flush=True)
