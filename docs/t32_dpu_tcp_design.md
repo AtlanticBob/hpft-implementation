@@ -119,11 +119,35 @@ DOCA Flow 加 pacing punt pipe——这是生产可行的共存架构,但切换�
 uplink RSS pipe(rx_ipv4_tcp)无法建立——是 bring-up 层面的环境/版本问题,非我们
 配置的表层错误(devargs/pmd-mask 都已按官方给足)。**路线 B 当前被此 blocker 卡住。**
 
+## 选项1 深挖结果:OVS-DOCA HWS RSS bring-up 环境级失败(2026-07-05)
+
+按用户建议深挖 + 网络搜索(NVIDIA 官方 docs/troubleshooting/论坛/known-issues)。
+尝试过的组合(均失败于同一点):
+- doca-init=true + hw-offload=true + hugepages(6GB)+ 正确端口顺序(PF 先于 VF)
+- **pmd-cpu-mask=0xF000**(PMD 队列分配确实开始跑,日志有 "pmd to rx queue assignment")
+- **dv_flow_en=2**(HWS 硬件 steering 模式,论坛指认的关键 flag)
+
+**始终失败**:物理端口 p0/p1 建 OVS-DOCA 默认上行 RSS pipe 报
+`hws_queue_mapping.c: Failed to get RX queue information - logical queue id 0 not
+exist` → `rx_ipv4_tcp rss entry: Invalid input` → `failed to add p0 as port`。
+p1 侧 representors 连锁 `Error attaching to DPDK`(PF port RSS 失败后 stop 所致)。
+
+排查排除项:非 devargs 语法错、非端口顺序错、非 pmd 核缺失、非 HWS flag 缺失、
+非 doca_pcc 设备占用(RP 持 mlx5_0=p0 恰是成功侧)。DOCA 3.4 known-issues 无此条。
+FLEX_PARSER_PROFILE_ENABLE=0 / PROG_PARSE_GRAPH=False(基础 RSS 不应依赖这些)。
+
+**判定**:本组合(DOCA 3.4.0112 / fw 32.49.1014 / OVS 3.4.0040)上 OVS-DOCA 的
+uplink HWS RSS 默认流建不起来,是**环境/版本级 bring-up 缺陷**,非表层配置可解;
+需固件层调查或换 OVS-DOCA/DOCA 版本或 NVIDIA 支持。**路线 B 在此环境不可行。**
+每次尝试均干净回滚,RDMA(5.57G)+ 降速优化 + TCP opt3(6.90G)全程可恢复完好。
+
 ## 待决策(停止点)
 
-1. 深挖 OVS-DOCA RSS bring-up(n_rxq/dpdk-lcore-mask/固件标志/版本 workaround)——
-   深水区,且每次试都短暂断 RDMA。
-2. 回到路线 A(独立 DOCA Flow app 编程 eSwitch)——但与 OVS-kernel 共存性未验证,
-   同样有破坏风险。
-3. 重新评估 DPU-offload TCP 的性价比(基础设施摩擦大;host opt3 已是可用形态,
-   只差"透明"这一条)。
+1. **路线 A**(独立 DOCA Flow app,如 flow_switch_rss/simple_fwd_vnf 改造)——
+   **反而可能可行**:自建 app 自己控制端口/队列/RSS 的建立,不走 OVS-DOCA 那条
+   坏掉的 uplink RSS 路径,故大概率绕开本 bug。风险仍是与 OVS-kernel 的 eSwitch
+   共存(需验证,testpmd probe 已证 PMD 层共存;编程 eSwitch 层未证)。
+2. **固件/版本层**:调 mlxconfig(steering/flex-parser)或换 DOCA/OVS-DOCA 版本
+   重试 OVS-DOCA。深水、不保证成、可能需重刷。
+3. **重新评估**:host opt3 已是完整可用 TCP shaper(性能全达标),唯缺透明。透明化
+   的基础设施摩擦已被证明很大。可权衡是否值得继续投 DPU 卸载。
