@@ -55,7 +55,37 @@ host vf0 TCP egress
 - DOCA Flow RSS 样例:`/opt/mellanox/doca/samples/doca_flow/flow_switch_rss`。
 - host opt3(现网 TCP shaper)仍在 dpu1vf0 正常运行,D1-D4 期间不影响。
 
-## 下一步:D1 第一小步
+## D1 进展与关键未知(2026-07-05)
 
-构建并运行 `flow_switch_rss` 样例,验证能把匹配流 steer 到 Arm RX 队列(不影响
-RDMA);再把 vf0 TCP 的匹配 + TX-回-uplink 接起来,得到"透明直通"原型。
+**已 de-risk:DPDK 与内核/OVS/RDMA 共存(PCI 功能共享)。**
+`dpdk-testpmd -a 0000:03:00.1,representor=vf0 --disable-device-start` 探测 PF +
+representor(探到 4 个 port:PF/uplink + representors),**探测后 RDMA 仍 5.57G、
+ping OK**。mlx5 PMD 用 devx/verbs 自建队列,与内核共享同一 PCI 功能,不独占。
+
+**steering 模型已看清(flow_switch_rss)**:DOCA Flow pipe 匹配流 →
+`DOCA_FLOW_FWD_RSS` 到 SW 队列 0 → app 用托管 RX 收包。这正是把 vf0 TCP punt 到
+Arm 的机制。
+
+**剩余关键未知:eSwitch 编程是否与 OVS 共存。**
+testpmd 探测用了 `--disable-device-start`(只 probe、不编程 eSwitch)。真正的 app
+要往 eSwitch 加 steering pipe:
+- 若 DOCA Flow **switch 模式**独占 eSwitch → 会顶掉 OVS,破坏 RDMA/其他 VF。
+- 若能 **vnf/isolated 模式**或与 OVS-DOCA 共享 eSwitch → 非破坏性,只 punt 匹配流。
+验证它必须跑一个会编程 eSwitch 的 app,有破坏已优化 RDMA 面的风险(需完整状态
+备份 + 恢复流程:OVS 配置、tx/rx_agent、RP、underlay/SF 网)。
+
+**OVS 已支持 DOCA 数据面**:`doca-openvswitch-switch` 已装,
+`datapath_types: [doca, netdev, system]`,DPDK 26.03-doca4。当前跑 system(kernel)
++ hw-offload。若走 OVS-DOCA 共存,可把 underlay 桥切到 `datapath_type=doca`,再用
+DOCA Flow 加 pacing punt pipe——这是生产可行的共存架构,但切换是对活跃系统的大改。
+
+## D1 下一步(二选一,需权衡风险)
+
+1. **谨慎验证 eSwitch 共存**:全量备份 RDMA 面状态 → 跑最小 DOCA Flow steering app
+   (只加一条 vf0 TCP → SW 队列的规则)→ 观察 RDMA 是否存活 + 队列是否收到包 →
+   立即恢复。决定 switch 模式能否共存。
+2. **走 OVS-DOCA 路线**:先在低峰把 underlay 桥切到 doca 数据面并验证 RDMA/OVS
+   正常,再在其上加 pacing punt pipe。更接近生产,但改动更大。
+
+环境就绪:hugepages 2GB、DOCA 工具链(simple_fwd_vnf 编译通过)、flow_switch_rss
+样例已定位、DPDK 探测端口模型已知。
