@@ -242,8 +242,16 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					continue;
 				}
 				if (c->flowtag != eft || c->dst_tag != edst || c->budget != ebud) {
+					/* proportional feed-forward on a pure cap change (same
+					 * pair); a new pair still initialises level=ebud. */
+					if (c->flowtag == eft && c->dst_tag == edst && c->budget > 0 && c->level > 0) {
+						uint64_t nl = ((uint64_t)c->level * ebud) / c->budget;
+						c->level = nl > 0 ? (uint32_t)nl : 1;
+						c->last_rrx_used = erx;
+					} else {
+						c->level = ebud;
+					}
 					c->budget = ebud;
-					c->level = ebud;
 					c->cc_rate = DOCA_PCC_DEV_MAX_RATE;
 					if (c->flowtag != eft || c->dst_tag != edst) {
 						for (int sh = 0; sh < HPFT_MAX_THREADS; sh++)
@@ -304,10 +312,22 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 							c->flowtag = 0;
 						} else {
 							if (c->budget != ebud) {
-								c->budget = ebud;
-								c->level = ebud;
-							}
-							c->remote_rx_rate = erx;
+									/* proportional feed-forward: level tracks bud/N,
+									 * so rescaling by the cap ratio lands it on the
+									 * new bud/N in one step (any N); the small-step
+									 * integral then only fine-tunes. level=ebud would
+									 * overshoot to Nx target and force a slow (~430ms)
+									 * integral descent. */
+									if (c->budget > 0 && c->level > 0) {
+										uint64_t nl = ((uint64_t)c->level * ebud) / c->budget;
+										c->level = nl > 0 ? (uint32_t)nl : 1;
+									} else {
+										c->level = ebud;
+									}
+									c->budget = ebud;
+									c->last_rrx_used = erx; /* don't integrate on pre-change (stale) R */
+								}
+								c->remote_rx_rate = erx;
 						}
 						fidx = -2;
 						break;
@@ -375,8 +395,14 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 				if (budget == 0) {
 					g_hpft_pairs[i].flowtag = 0;
 				} else {
-					g_hpft_pairs[i].budget = budget;
-					g_hpft_pairs[i].level = budget;
+					hpft_pair_t *c = &g_hpft_pairs[i];
+					if (c->budget > 0 && c->level > 0) {
+						uint64_t nl = ((uint64_t)c->level * budget) / c->budget;
+						c->level = nl > 0 ? (uint32_t)nl : 1;
+					} else {
+						c->level = budget;
+					}
+					c->budget = budget;
 				}
 				return DOCA_PCC_DEV_STATUS_OK;
 			}
