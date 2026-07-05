@@ -5,7 +5,7 @@ while True:
     c,_=s.accept(); c.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
     try:
         while True:
-            d=c.recv(16)
+            d=c.recv(65536)
             if not d: break
             c.sendall(d)
     except Exception: pass
