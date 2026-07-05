@@ -89,3 +89,41 @@ DOCA Flow 加 pacing punt pipe——这是生产可行的共存架构,但切换�
 
 环境就绪:hugepages 2GB、DOCA 工具链(simple_fwd_vnf 编译通过)、flow_switch_rss
 样例已定位、DPDK 探测端口模型已知。
+
+## D1 路线 B 尝试:切 OVS-DOCA 失败(2026-07-05)
+
+用户选路线 B(先切 OVS-DOCA 再加 pacing)。完整安全准备后尝试:
+- 备份:conf.db.bak(pre-doca)+ 回滚脚本;SSH 走 rshim(tmfifo_net0)独立于数据口。
+- 官方流程(NVIDIA docs):`other_config:doca-init=true` + `hw-offload=true` +
+  `pmd-cpu-mask` + `dpdk-extra="-a PCI,representor=[...]"`;桥 `datapath_type=netdev`;
+  端口 `type=dpdk options:dpdk-devargs=PCI,representor=[N]`;重启 OVS。
+- 端口映射:p0=03:00.0、p1=03:00.1、pf1vf0-3=03:00.1(representor=vfN)、
+  SF en3f*pf*sf0(representor=sf0)、host PF rep(representor=[65535])。
+
+**结果:两次尝试均失败,OVS-DOCA 无法 bring-up 物理端口。**
+- EAL/DOCA 初始化成功(DOCA 3.4/DPDK 26.03),representor 列表语法被接受。
+- 物理端口 p0/p1 建默认 RSS pipe 失败:`Failed to get RX queue information -
+  logical queue id 0 not exist` → `pipe 'OVS_RSS_PIPE_...' entry add failed,
+  queue=0, rc=-22` → `Failed to create 'rx_ipv4_tcp' rss entry: Invalid input`
+  → `Failed to init DOCA port p0` → `failed to add p0 as port: Invalid argument`。
+- 加 `pmd-cpu-mask=0xF000`(PMD 队列分配确实开始跑)后,物理端口 RSS 仍失败,
+  p1 侧 representors 变 `could not set configuration (Invalid argument)`。
+- **排除 RP 冲突**:RP(doca_pcc -d mlx5_0)持有 mlx5_0=03:00.0=p0,而 **p0 侧
+  成功、p1(03:00.1)侧失败**,故非 doca_pcc 占用设备所致。p0/p1 不对称原因未定
+  (p1 带 4 个 VF,p0 不带 VF)。
+
+**每次失败都干净回滚**(restore conf.db + 重建 kernel 桥):四 VF ping、RP
+(4h+)、tx/rx agents、RDMA 5.57G、降速优化、TCP opt3 6.90G 全部完好。
+
+**判定**:本系统(DOCA 3.4.0112 / fw 32.49 / OVS 3.4.0040)上 OVS-DOCA 的默认
+uplink RSS pipe(rx_ipv4_tcp)无法建立——是 bring-up 层面的环境/版本问题,非我们
+配置的表层错误(devargs/pmd-mask 都已按官方给足)。**路线 B 当前被此 blocker 卡住。**
+
+## 待决策(停止点)
+
+1. 深挖 OVS-DOCA RSS bring-up(n_rxq/dpdk-lcore-mask/固件标志/版本 workaround)——
+   深水区,且每次试都短暂断 RDMA。
+2. 回到路线 A(独立 DOCA Flow app 编程 eSwitch)——但与 OVS-kernel 共存性未验证,
+   同样有破坏风险。
+3. 重新评估 DPU-offload TCP 的性价比(基础设施摩擦大;host opt3 已是可用形态,
+   只差"透明"这一条)。
