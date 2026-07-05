@@ -42,24 +42,25 @@ per-pair EDT 那种"共享 next-departure 时间戳被大流推远"的耦合。
 > 软件层修好。下表"控制敏捷度"列的 RDMA 劣势已消除。
 | **租户透明** | ✗(host TC-BPF)| **✓(DPA,host 零改动)** | **RDMA** |
 
-## 结论:两种架构的镜像式权衡
+## 结论(2026-07-05 降速优化后)
 
-- **RDMA(NIC 硬件 per-QP pacing)赢数据面质量**:空闲/饱和延迟低 20×+、
-  latency/bandwidth 天生零耦合(TCP 要 opt3 才勉强追平)、公平严格(spread 0)、
-  且**租户透明**。代价是**控制敏捷度差**:receiver-driven 水位积分环 + mailbox,
-  降速要 ~430ms、改速上限仅几 Hz。
-- **TCP(host 软件 fq+EDT)赢控制敏捷度**:EDT 直接改 departure 时间戳,控制
-  48µs、降速 6–7ms、可 140Hz。代价是**数据面质量差**:per-pair EDT 债务把
-  latency 与 bandwidth 耦合(饱和小包 23×),要 opt3(gap 旁路)才修好,且修好后
-  延迟仍是 RDMA 的 24 倍;**且尚未透明**(在 host 内核)。
+降速优化前是"镜像式权衡"(RDMA 赢数据面、TCP 赢控制敏捷度)。**优化后 RDMA 补齐了
+控制敏捷度**(降速 430ms→~5-7ms、改速 ~100Hz+),于是:
 
-架构根因:执行点位置决定一切。RDMA 在 **NIC 硬件**(pacing 精细、并行、透明,但
-控制要绕 receiver→mailbox→积分环,慢);TCP 在 **host 内核 qdisc**(改时间戳即时,
-但单一 pair 债务串行耦合、且在租户面)。
+- **RDMA(PCC/DPA)现在几乎全面领先**:数据面质量(延迟低 20×+、latency/bandwidth
+  天生零耦合、公平 spread 0)、租户透明、且控制敏捷度已追平 TCP(降速 ~5-7ms、
+  控制路径 sub-ms)。唯一还需注意:连续高频改速的上限受 mailbox 串行处理(~100Hz);
+  若未来要更高,P2-3 的 SF NP 代理仍是备选路。
+- **TCP(host 软件 fq+EDT)** 仅在"纯软件、无需 DPU/DPA"这一点上更易部署;但数据面
+  质量需 opt3 才勉强追平(饱和延迟仍是 RDMA 的 24 倍),且**尚未租户透明**(在 host
+  内核)。
 
-这也解释了 T3 的方向:把 TCP 也做到 RDMA 那种硬件级数据面质量+透明,需要等价的
-硬件/DPA pacing 卸载点——即 T3.2 DOCA/DPDK 例外路径。而若沿用软件 EDT,opt3 已是
-该架构下的最优,控制敏捷度反而远胜 RDMA。
+架构根因仍成立:执行点位置决定一切。RDMA 在 **NIC 硬件**(pacing 精细、并行、透明);
+TCP 在 **host 内核 qdisc**(改时间戳即时但 pair 债务串行耦合、且在租户面)。RDMA 原
+先"控制慢"是**软件控制律**问题(积分慢收敛 + agent 采样),已修复——不是硬件短板。
+
+对 T3 的启示不变:把 TCP 做到 RDMA 那种硬件级数据面质量 + 透明,需等价的硬件/DPA
+pacing 卸载点(T3.2 DOCA/DPDK 例外路径);沿用软件 EDT 则 opt3 已是该架构最优。
 
 ## 环境状态
 
