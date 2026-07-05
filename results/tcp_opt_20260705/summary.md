@@ -31,3 +31,39 @@ M4 saturated 吞吐。判据:每步相对基线是正优化(M3 改善,M1/M2/M4 �
 
 编译:clang -O2 -g -target bpf -c hpft_tcp_edt_kern.c -o .o -I. -I/usr/include/x86_64-linux-gnu
 BPF 源与 .o:tcp/bpf/。
+
+## opt3:BPF per-flow EDT 债务 + pair 聚合丢包 ★★ 最通用
+
+`tcp/bpf-opt3/hpft_tcp_edt_kern.c`:
+- **per-flow EDT 债务**:5-tuple hash → 独立 next_ns(HASH map,16384 项),
+  每个 flow 独立 pace 到 pair 速率。sparse(低带宽)latency 流的 flow 债务
+  ≈now → 低延迟,**不依赖包大小**。
+- **pair 聚合债务(next_ns 结构不变,兼容 apply)**:累计所有 flow 记账;
+  当聚合债务超前 horizon(4ms)则**丢包**(TC_ACT_SHOT)→ TCP 反压,聚合
+  维持 cap,但不施加共享延迟(延迟由 per-flow 债务负责)。
+
+标准 eval(小包):M1 7.99G | M2 69µs | M3 65µs | M4 7.99G —— 全不回退,
+M3 与 opt2 相当,cap 甚至更准(丢包比小包旁路更精确)。
+
+### 决定性对比:大包(1400B)latency 流 under saturation
+
+| 变体 | 小包 RR sat | **大包(1400B)RR sat** |
+|---|---|---|
+| baseline | 1505µs | 986µs |
+| opt2 小包旁路 | 70µs | **985µs(失效)** |
+| **opt3 per-flow+drop** | 65µs | **74µs(13×)** |
+
+**opt2 只对小包有效**(≤256B 旁路);大包 latency 流(大 RPC/大 message)
+opt2 失效。**opt3 按 flow 的 sparse/bulk 区分,对任意包大小的 latency 流都
+有效**,是更通用、更彻底的正优化。
+
+## 推荐
+
+- **opt3 是首选**:小包+大包 latency 流都保护,cap/吞吐/idle 全不回退。
+- opt2 是轻量备选(仅小包场景,BPF 改动更小,无 per-flow map 内存)。
+- opt1 flow_limit 可作为不改 BPF 时的快速缓解。
+- opt3 生产化 TODO:per-flow HASH map 需老化(LRU_HASH + spin_lock 内核
+  当前不支持,需自定义老化或无锁 per-CPU 方案);horizon 参数按链路 RTT 标定。
+
+编译:clang -O2 -g -target bpf -c hpft_tcp_edt_kern.c -o .o -I. -I/usr/include/x86_64-linux-gnu
+(helpers.h 需补 bpf_map_update_elem 声明,helper ID 2)。
