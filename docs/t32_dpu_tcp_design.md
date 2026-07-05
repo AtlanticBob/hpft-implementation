@@ -170,3 +170,28 @@ uplink HWS RSS 默认流建不起来,是**环境/版本级 bring-up 缺陷**,非
 **结论:路线 A 可行且非破坏。**端口映射:Port2=uplink(p1),Port3=vf0 rep。
 下一步:基于 flow_switch_rss 写 DOCA Flow app —— 匹配 {vf0, TCP} → RSS 到 SW 队列
 (punt 到 Arm),app RX→(D2 pacing)→TX 回 uplink;RDMA/非 TCP 默认走 OVS 不动。
+
+## 路线 A 可行性定论:需自定义 fdb-preserving app(2026-07-05)
+
+厘清了 switch vs vnf 的架构张力,结论明确:
+- **端口级共存已证**(testpmd,RDMA 存活)——前提是**不禁用默认 FDB**。
+- **stock switch 样例不能用**:`flow_switch_rss` 默认 dev args 含 `fdb_def_rule_en=0`
+  (禁默认 FDB、app 完全接管 eSwitch 转发)→ 必然顶掉 OVS-kernel、破坏 RDMA。
+  已构建但**正确地没有运行**(会 takeover)。
+- **vnf 模式不行**:bump-in-the-wire 拿 vf0 全部流量(含 RoCE)→ RDMA 绕过 PCC。
+- **唯一可行**:写自定义 DOCA Flow app,`fdb_def_rule_en=1`(保留 OVS 默认转发)
+  + 加一条**高优先级 pipe 只匹配 {vf0 rep, IPv4, TCP} → RSS 到 Arm SW 队列**,
+  其余(RoCE/非TCP/其他VF)命中默认 FDB 走 OVS 不动。app RX → EDT pacing → TX 回
+  uplink。**这是能"只截 TCP、RDMA 留 PCC、不破坏 OVS"的唯一架构。**
+
+**未证的最后一环**:高优先级 punt 规则能否与 OVS 的 FDB 规则在同一 eSwitch 共存
+(加在其上、更高优先级、不禁 FDB)。需自定义 app 实测。端口共存已证使这**很可能**成立。
+
+## 剩余工作(路线 A 落地)
+
+1. 写自定义 DOCA Flow app(基座 flow_switch_rss,但 `fdb_def_rule_en=1` + 单条
+   TCP punt pipe + managed RX)。验证:vf0 TCP 被 punt 到 Arm 队列,RDMA/OVS 存活。
+2. app 内 TX 回 uplink(transfer pipe:from Arm queue → uplink),验证透明直通 +
+   吞吐 ≥ 基线(~24G)。
+3. D2 EDT pacing(复刻 opt3);D3 controller;D4 优化到 ≥ opt3。
+这是一个多步、需在活跃系统上迭代的自定义 DPDK/DOCA 开发,每步带回滚。
