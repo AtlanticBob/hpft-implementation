@@ -151,3 +151,22 @@ uplink HWS RSS 默认流建不起来,是**环境/版本级 bring-up 缺陷**,非
    重试 OVS-DOCA。深水、不保证成、可能需重刷。
 3. **重新评估**:host opt3 已是完整可用 TCP shaper(性能全达标),唯缺透明。透明化
    的基础设施摩擦已被证明很大。可权衡是否值得继续投 DPU 卸载。
+
+
+## 路线 A 共存已证(2026-07-05,关键 de-risk)
+
+用 testpmd 实测(可逆),回答了路线 A 的成败前提:
+- **端口能启动**:`dpdk-testpmd -a 0000:03:00.1,representor=vf0,dv_flow_en=2` 启动
+  端口成功(port2=uplink 0000:03:00.1 200Gbps,port3=vf0 representor 200Gbps)——
+  **没触发 OVS-DOCA 那个 RSS bug**,证实该 bug 是 OVS-DOCA 特有、非硬件限制,
+  独立 DPDK/DOCA app 能绕开。
+- **与 OVS-kernel/RDMA 共存**:testpmd 运行期间 RDMA vf0=5.52G、vf1=185G 正常,
+  host TCP 也正常;退出后全部恢复(vf0 RDMA 5.54G、TCP 7.07G)。**端口级共存成立,
+  无性能回退、无冲突**(直接满足用户约束)。
+- steering 待用 DOCA Flow API:HWS 模式(dv_flow_en=2)用异步 template flow API,
+  testpmd 的经典 `flow create` 不生效(vf0 TCP 未被拦),故 steering 规则要用
+  DOCA Flow(doca_flow_pipe,如 flow_switch_rss)编程,不能手搓 rte_flow。
+
+**结论:路线 A 可行且非破坏。**端口映射:Port2=uplink(p1),Port3=vf0 rep。
+下一步:基于 flow_switch_rss 写 DOCA Flow app —— 匹配 {vf0, TCP} → RSS 到 SW 队列
+(punt 到 Arm),app RX→(D2 pacing)→TX 回 uplink;RDMA/非 TCP 默认走 OVS 不动。
