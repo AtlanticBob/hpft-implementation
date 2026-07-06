@@ -221,3 +221,46 @@ punt 到 Arm CPU**(rx_success_cb 收到包,entry 计数增长),与 OVS/RDMA 共�
 
 **路线 A 结论:核心可行性已用工作代码证明(D1/D1b)。剩余 D1c/D2/D3/D4 是把
 CPU 转发+pacing 数据面建起来并优化到 ≥ opt3——实质但路径清晰的工程。**
+---
+
+## D1c 收尾 = 方向匹配的架构墙(2026-07-06,决定性诊断)
+
+**已证工作**:CPU TX re-inject 数据面(`doca_eth_txq`)机制正确——rx=tx、无 loop、无
+崩溃;且**双向 TCP 在"不误 punt 回程"时能完整直通**(用 iperf3 验证:当 app 不拦回程
+SYN-ACK 时,连接建立、跑满 ~6.7G;当 punt-all-TCP 时回程被弹回 wire、连接挂死只剩 SYN)。
+
+**要透明只 punt host→net(sender 侧),必须在 root pipe 按方向/源判别**。逐项试验(~15 次
+构建)后**确诊架构墙**:
+
+| root pipe 匹配字段 | 结果 |
+|---|---|
+| `parser_meta.outer_l3_type` / `outer_l4_type`(L2/L3/L4 **类型**寄存器) | ✅ 匹配(rx>0) |
+| `outer.ip4.src_ip` / `dst_ip`(深度包头字段) | ⚠️ pipe 能建、但**匹配 0 包** |
+| `parser_meta.port_id`(源 vport) | ✗ 建 pipe 时 **core dump** |
+
+**根因 = `fdb_def_rule_en=1`**(OVS 共存必需:保留内核 FDB,miss→OVS)。它把 root pipe
+挂在**浅层挂载点**:只有 parser_meta 预算好的**类型元数据寄存器**可匹配,深度包头
+(IP 地址、TCP 端口、源 port_id)在该点**未解析**,故 `outer.ip4` 静默匹配 0、`port_id`
+崩溃。对照:`samples/flow_switch_rss` 的 root ingress pipe **能**匹配 `outer.ip4.src_ip`
++ FWD_PIPE——因为它用 **`fdb_def_rule_en=0`(全量接管 FDB)**,root 挂在真正的 FDB
+ingress、全解析可用。二者不可兼得:
+
+- **`fdb_def_rule_en=1`**(共存):可 punt(按 L3/L4 类型),但**无法在 root 做方向/5-tuple
+  判别**。net→host 与 host→net 都是 IPv4+TCP,类型寄存器无法区分;而 net→host 必须
+  **miss root** 才能走内核回到 host——一旦 match 就进 punt 面回不去。死结。
+- **`fdb_def_rule_en=0`**(接管):root 全解析、可精确判别方向,但要**自己实现所有转发**
+  (RoCE/ARP/其它 VF/net→host),= 等价 OVS-DOCA 的大重写。
+
+**证实了 memory 里"既透明又保 pacing 的 DPU 挂载点只剩 DOCA/DPDK 例外路径(大工程)"**
+——"大工程"的实质就是 `fdb_def_rule_en=0` 的 FDB 接管。
+
+### 三条出路(需决策)
+- **A. per-vnic bump-in-the-wire(最外科)**:把**被限速的 vf0 rep** 开成 DOCA 端口
+  (2 端口 app:vf0-rep + uplink),vf0 移出 OVS,app 自己接管 vf0 双向(host→net punt/
+  pace/TX-wire;net→host uplink→vf0-rep 转发)。其它 VF/RoCE 仍在 OVS。**风险**:vf0 连通
+  性从此依赖 app 运行;且 vf0 的 **RDMA/PCC 面**也走同一 eSwitch,DOCA 接管 vf0-rep 可能
+  干扰 RoCE——需先验证不破坏 RDMA。
+- **B. EGRESS 域 pipe**:egress pipe 只见 host→net(发往 uplink),net→host 不经过。是
+  sanctioned 图式,但在 `fdb_def_rule_en=1` 下如何把流量引入 DOCA egress 域(内核在做转发)
+  未解,早前尝试 rx=0。
+- **C. `fdb_def_rule_en=0` 全接管**:root 全解析、干净,但 = 大重写(自实现 OVS 全部转发)。
