@@ -12,7 +12,7 @@
 
 DOCA_LOG_REGISTER(FLOW_TCP_PUNT::MAIN);
 
-#define TCP_PUNT_PORTS 2 /* PF/uplink + vf0 representor */
+#define TCP_PUNT_PORTS 1 /* just the switch/PF; do NOT open a VF rep so VF miss->kernel(OVS) works */
 
 /* keep the default FDB rule so unmatched traffic (RoCE/other) stays on OVS */
 #define TCP_PUNT_DEV_ARGS "dv_flow_en=2,fdb_def_rule_en=1,dv_xmeta_en=4"

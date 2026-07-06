@@ -180,7 +180,7 @@ flow_cleanup:
 	doca_flow_destroy();
 dev_cleanup:
 	if (dev_ctx)
-		flow_eth_common_destroy_dev_resources(&dev_ctx);
+		flow_eth_common_destroy_dev_resources(dev_ctx);
 pe_cleanup:
 	if (pe)
 		doca_pe_destroy(pe);
