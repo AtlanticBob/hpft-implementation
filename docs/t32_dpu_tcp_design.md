@@ -264,3 +264,35 @@ ingress、全解析可用。二者不可兼得:
   sanctioned 图式,但在 `fdb_def_rule_en=1` 下如何把流量引入 DOCA egress 域(内核在做转发)
   未解,早前尝试 rx=0。
 - **C. `fdb_def_rule_en=0` 全接管**:root 全解析、干净,但 = 大重写(自实现 OVS 全部转发)。
+
+---
+
+## 决定性验证:deep-match 在 fdb_def_rule_en=1 下**全层不可用**(2026-07-06)
+
+选了路线 A 后,先测 linchpin:**deep 包头匹配在非 root 子 pipe 上是否可用**(flow_switch_rss
+在子 pipe 匹配 outer.ip4 成功——但它用 fdb_def_rule_en=0)。结构:root(parser_meta IPv4+TCP,
+浅层,可匹配)→ FWD_PIPE → child(outer.ip4.src_ip=10.1.0.1,深层)→ RSS CPU。结果:
+
+- **ROOT(parser_meta IPv4+TCP):73980 pkts / 5 MB**(匹配)
+- **CHILD(deep outer.ip4.src_ip):0 pkts**(深匹配在**子 pipe 也失败**)
+- iperf3 仍 6.43G 完成
+
+**结论(确凿)**:`fdb_def_rule_en=1` 下,**任何 pipe 层级**(root 或 child)都**只有 parser_meta
+类型寄存器可匹配,深层包头字段(IP/端口/源 vport)全不可用**。方向/5-tuple/src-vnic 判别
+在共存模式下**根本做不到**——唯一出路是 `fdb_def_rule_en=0`(全量 FDB 接管)。
+
+**对路线 A 的影响**:per-vnic bump-in-the-wire 的 **net→host 交付**需要按 dst 深匹配把
+wire→vf0 送到 vf0-rep——同样在 fdb_def_rule_en=1 下失败。故**路线 A 也必须 fdb_def_rule_en=0**,
+不再"外科",退化为 C 的 scoped 版(仍要自实现 vf0 之外流量的转发,否则 fdb_def_rule_en=0
+下无内核兜底)。
+
+**第二信号(硬件卸载旁路)**:ROOT 在 2.4GB 流里只见 **5 MB**——OVS 把 bulk flow 硬件卸载、
+**绕过了 DOCA HWS pipe**(此测 root 是 FWD 而非 punt,故 OVS 得以卸载)。含义:若 root 真的
+punt host→net(不是 forward),OVS 看不到这些包→无法卸载→punt 面能抓全量(利于 pacing);
+但一旦设计里出现"forward 让其正常走",就会被卸载旁路。任何真实设计都要显式处理。
+
+### 决策收敛
+A / B / 简单子 pipe 方案 **都撞同一堵墙**(deep-match 需 fdb_def_rule_en=0)。真实选择塌缩为:
+- **C(scoped 全接管)**:fdb_def_rule_en=0,DOCA 拥有 FDB;自建透明 L2 转发(全 VF/hpf/uplink
+  按 dst MAC)+ 仅对 vf0 的 host→net TCP punt/pace。是"大工程",且风险覆盖整机所有 VF 网络。
+- **暂停**:D1c 数据面 + 本诊断已是完整成果;把结论固化,pacing/接管路线之后再评估投入产出。
