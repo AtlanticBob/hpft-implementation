@@ -195,3 +195,29 @@ uplink HWS RSS 默认流建不起来,是**环境/版本级 bring-up 缺陷**,非
    吞吐 ≥ 基线(~24G)。
 3. D2 EDT pacing(复刻 opt3);D3 controller;D4 优化到 ≥ opt3。
 这是一个多步、需在活跃系统上迭代的自定义 DPDK/DOCA 开发,每步带回滚。
+
+## D1b 完成 + D1c 精确定型(2026-07-05/06)
+
+**D1(突破)**:自定义 DOCA Flow app(`tcp/dpu-punt/`,switch+fdb_def_rule_en=1,
+单条 IPv4/TCP→RSS队列0 root pipe,无 fwd_miss)一次编译通过,**把 host TCP 选择性
+punt 到 Arm CPU**(rx_success_cb 收到包,entry 计数增长),与 OVS/RDMA 共存,退出恢复。
+
+**D1b(完成)**:
+- segfault 修复:`flow_eth_common_destroy_dev_resources(dev_ctx)`(之前误传 &dev_ctx =
+  指针的指针)。现 exit 0、无 core。
+- 只开 PF(1 端口,不开 VF rep)。**决定性验证:app 运行时四个 VF 的 ICMP ping 全 OK**
+  → 非 TCP 转发经 miss→内核→OVS 存活。之前"vf0 RoCE 失败"是**测试假象**:ib_write_bw/
+  iperf3(连 -u)都用 TCP 建连,被 punt-all-TCP 拦了;RoCE 数据本身是 UDP,miss→内核不受影响。
+- 结论:选择性 TCP punt 到 CPU + 非 TCP 留 OVS/PCC,无破坏,已充分验证。
+
+**D1c(精确定型 = D2 数据面核心)**:透明直通需把 punt 的 TCP 经 **CPU TX 回 wire**:
+- 用 `doca_eth_txq`(REGULAR/CPU)+ send-task 循环,把每个 RX 的 doca_buf 发回 uplink。
+- **关键挑战:re-inject loop**——CPU TX 的 TCP 会再次命中 punt pipe → 死循环。需
+  loop 避免(txq 直发 wire 绕过 root pipe,或用 metadata 标记 re-injected 走高优先级
+  转发到 wire)。
+- 这与 D2(pacing=按时释放再 TX)共用同一数据面。是 ~150+ 行 DOCA eth TX + 缓冲
+  生命周期 + loop 避免 + 性能优化的实质构建,基座:`applications/eth_l2_fwd`(CPU
+  RX→TX 转发)、`samples/doca_eth/eth_txq_batch_send_ethernet_frames`。
+
+**路线 A 结论:核心可行性已用工作代码证明(D1/D1b)。剩余 D1c/D2/D3/D4 是把
+CPU 转发+pacing 数据面建起来并优化到 ≥ opt3——实质但路径清晰的工程。**
