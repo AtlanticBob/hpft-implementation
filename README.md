@@ -22,9 +22,14 @@
 - 两个 enforcer 之上是同一个 controller,键为 `{src_vnic, dst_vnic}`,沿用 v1 的
   registry 与高频更新协议。
 
-## 当前阶段
+## 当前阶段 / 接管入口
 
-Phase 1:DOCA PCC 可行性探测。见 `docs/phase1_pcc_probe_plan.md`。
+> **新会话/新 agent 从 [`HANDOFF.md`](HANDOFF.md) 开始**——它是最新的单一入口
+> (状态、lab 事实、文档地图、阅读顺序、硬性规则)。本 README 记录的是初版设计意图
+> (Phase 1,DOCA 2.9/fw 32.47),已过时,仅作背景。
+
+当前:RDMA shaper(PCC/DPA)为主成果、近完成;TCP 用 host fq+edt;统一 controller 完成;
+T3.2(TCP 透明 DPU 卸载)已暂停(负结论)。细节见 HANDOFF.md。
 
 ## 仓库布局
 
