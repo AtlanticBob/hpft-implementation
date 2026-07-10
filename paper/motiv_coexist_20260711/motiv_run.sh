@@ -5,7 +5,7 @@
 # usage: motiv_run.sh <tag> <R> <T> <tclass>   (tclass 0 = default/shared)
 set -e
 TAG=$1; R=$2; T=$3; TCLASS=$4
-DIR=/home/zhaoxiang/hyperfront/hpft-v2/results/motiv_coexist_20260711/$TAG
+DIR=/home/zhaoxiang/hyperfront/hpft-v2/paper/motiv_coexist_20260711/$TAG
 PT=$HOME/hyperfront/perftest-26015/ib_write_bw
 mkdir -p $DIR
 TCA=""; [ "$TCLASS" != 0 ] && TCA="--tclass=$TCLASS"
