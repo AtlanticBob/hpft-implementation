@@ -30,7 +30,7 @@ FIFO = "/tmp/rp_fifo"   # PCC RP mailbox (batched: 0xb47c000N ft bud rate ...)
 
 class FlowState:
     __slots__ = ("R", "al_count", "last_rx", "last_seq", "mode", "pace", "r",
-                 "log_R", "log_age", "log_mode")
+                 "log_R", "log_age", "log_mode", "R_good", "fr", "ai_run", "e_last")
 
     def __init__(self, tree, now):
         self.R = tree          # Q20: optimistic start at the tree share
@@ -43,6 +43,10 @@ class FlowState:
         self.log_R = -1.0
         self.log_age = 0
         self.log_mode = ""
+        self.R_good = 0.0      # F2: last known-good rate (DCQCN target-rate)
+        self.fr = False        # F2: fast-recovery active
+        self.ai_run = 0        # F2: consecutive unmarked AI ticks (HAI)
+        self.e_last = 0.0      # last granted e_f from telemetry
 
 
 def waterfill(capacity, items):
@@ -272,6 +276,9 @@ def main():
     beta = ep["beta"]
     theta_al, m_al, eps_al = ep["theta_al"], ep["m_al"], ep["eps_al"]
     n1, n2 = ep["n1_freeze"], ep["n2_failopen"]
+    fast_rec = bool(ep.get("fast_recovery", False))
+    hai_after = int(ep.get("hai_after", 0))
+    hai_max = int(ep.get("hai_max", 8))
     floor = ctl["pace_floor_bps"]
     shim = PaceShim(ctl["pace_shim"][local_host])
     mailbox = RpMailbox(line)
@@ -344,20 +351,55 @@ def main():
                 st.last_rx = now
                 st.last_seq = msg.get("seq", -1)
                 s, r = rec.get("s", 0.0), rec.get("r", 0)
+                st.e_last = rec.get("e", st.e_last)
                 # app-limited detection
                 if r < theta_al * st.R:
                     st.al_count += 1
                 else:
                     st.al_count = 0
                 if s > 0:
+                    # F2/DCQCN-style: remember the pre-cut rate as the
+                    # recovery target; transient marks bounce back fast,
+                    # persistent marks ratchet R_good down naturally
+                    if fast_rec:
+                        st.R_good = st.R
+                        st.fr = True
+                    st.ai_run = 0
                     st.R *= (1.0 - beta * s)
                     st.mode = "md"
                 elif st.al_count >= m_al:
+                    if fast_rec and st.R_good < st.R:
+                        pass   # keep the higher pre-dip R_good
                     st.R = max(r * (1.0 + eps_al), floor)
+                    st.ai_run = 0
+                    if fast_rec:
+                        st.fr = True
                     st.mode = "app_limited"
+                elif fast_rec and st.fr and st.R < 0.95 * st.R_good:
+                    # FR: converge by averaging (~5 ticks), but only INTO
+                    # the granted rate - a bounce past the demand-lagged
+                    # grant self-marks and starves (observed f12): fast
+                    # into the grant, AI beyond it.
+                    tgt = st.R_good
+                    if st.e_last > 0:
+                        tgt = min(tgt, st.e_last * 1.15)
+                    if st.R < 0.95 * tgt:
+                        st.R = min((st.R + tgt) / 2.0, tree_of(fsid))
+                        st.mode = "fr"
+                    else:
+                        st.fr = False
+                        st.R = min(st.R + A_of(fsid), tree_of(fsid))
+                        st.mode = "ai"
                 else:
-                    st.R = min(st.R + A_of(fsid), tree_of(fsid))
-                    st.mode = "ai"
+                    st.fr = False
+                    st.ai_run += 1
+                    mult = 1
+                    if hai_after and st.ai_run > hai_after:
+                        mult = min(st.ai_run - hai_after + 1, hai_max)
+                    st.R = min(st.R + A_of(fsid) * mult, tree_of(fsid))
+                    if st.al_count == 0:
+                        st.R_good = max(st.R_good, st.R)
+                    st.mode = "ai" if mult == 1 else "hai"
                 st.R = max(st.R, floor)
                 actuate(fsid, st, r, rdma_batch)
                 # throttled logging: on change (>1% R move or mode flip)
