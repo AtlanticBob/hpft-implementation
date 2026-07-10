@@ -209,6 +209,8 @@
     "hai_max": 8,
     "demand_hold_s": 0.0,
     "delta_boost": 0.0,
-    "peak_ref_s": 0.0
+    "peak_ref_s": 0.0,
+    "share_floor": false,
+    "share_floor_grace_s": 0.5
   }
 }
