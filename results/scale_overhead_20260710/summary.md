@@ -34,3 +34,23 @@
 
 原始数据：sc_rx.jsonl / sc_tx.jsonl / cpu_samples.txt / sc_rdma*.log；
 runner scale_run.sh（注意 perftest --rate_limit 是硬件档位制：2.5/5/10...）。
+
+## 优化落地（2026-07-10 第二批）
+
+**单遍 ceiling 算法**（tools/dpu/fastfill.py，rx/tx 共用）：每层一次排序+
+前缀和，每成员 O(log m) 求"解除封顶后的水位"（含 VM 层 cap→MaxRate 的
+替换变体）。等价性：随机 12000 例（纯 waterfill）+ 各 300 例（rx/tx
+agent 级、随机政策/速率）**全零误差**。
+
+实测收益（~16-20 fs 同档重测）：
+
+| 指标 | 优化前 | 优化后 |
+|---|---|---|
+| rx sched p50 | 1892µs | **448µs**（4.2×） |
+| rx tick 总 p50 | 3.4ms | **2.0ms** |
+| tx tree p50/p95 | 2043/2084µs | **354/386µs**（5.8×） |
+
+复杂度 O(N²)→O(N log N)：舒适上限从 ~50-60 fs 推到数百（Python 常数下
+估算 ~300-500 fs @T=50ms；再往上是语言重写的事）。另：tx 日志节流改为
+"模式翻转或 R 移动>1% + 1s 心跳"；浸泡看门狗增加 300MB 日志轮转
+（DPU /tmp 为 tmpfs）。

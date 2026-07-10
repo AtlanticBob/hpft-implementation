@@ -23,11 +23,14 @@ import os
 import socket
 import time
 
+from fastfill import waterfill_ceilings
+
 FIFO = "/tmp/rp_fifo"   # PCC RP mailbox (batched: 0xb47c000N ft bud rate ...)
 
 
 class FlowState:
-    __slots__ = ("R", "al_count", "last_rx", "last_seq", "mode", "pace", "r")
+    __slots__ = ("R", "al_count", "last_rx", "last_seq", "mode", "pace", "r",
+                 "log_R", "log_age", "log_mode")
 
     def __init__(self, tree, now):
         self.R = tree          # Q20: optimistic start at the tree share
@@ -37,6 +40,9 @@ class FlowState:
         self.mode = "fresh"
         self.pace = 0.0
         self.r = 0             # last telemetry r_f (sender-tree demand)
+        self.log_R = -1.0
+        self.log_age = 0
+        self.log_mode = ""
 
 
 def waterfill(capacity, items):
@@ -109,11 +115,31 @@ class SenderTree:
             if st.pace > 0 and st.r >= 0.85 * st.pace:
                 d = max(d, st.pace * (1.0 + self.delta))   # cap-hit boost
             demand[f] = d
+        # single-pass ceiling cascade (same math as the per-fs N-fill
+        # loop; property-tested) - O(N log N)
+        tree = {}
+        for f, d in demand.items():
+            src_dst, cls = f.rsplit("|", 1)
+            src = src_dst.split(">")[0]
+            tree.setdefault(src, {}).setdefault(cls, {})[f] = d
+        vms = self.policy["vms"]
+        vm_items, vm_repl = {}, {}
+        for src, classes in tree.items():
+            dsum = sum(d for fs in classes.values() for d in fs.values())
+            maxr = vms.get(src, {}).get("max_rate_bps") or float("inf")
+            vm_items[src] = (vms.get(src, {}).get("weight", 1),
+                             min(maxr, dsum))
+            vm_repl[src] = maxr
+        vm_ceil = waterfill_ceilings(self.cap, vm_items, vm_repl)
         out = {}
-        for f in demand:
-            d2 = dict(demand)
-            d2[f] = float("inf")
-            out[f] = self._fill(d2)[f]
+        for src, classes in tree.items():
+            cw = vms.get(src, {}).get("class_weights", {})
+            cls_items = {c: (cw.get(c, 1), sum(fs.values()))
+                         for c, fs in classes.items()}
+            cls_ceil = waterfill_ceilings(vm_ceil[src], cls_items)
+            for c, fs in classes.items():
+                out.update(waterfill_ceilings(
+                    cls_ceil[c], {f: (1, d) for f, d in fs.items()}))
         return out
 
 
@@ -334,12 +360,22 @@ def main():
                     st.mode = "ai"
                 st.R = max(st.R, floor)
                 actuate(fsid, st, r, rdma_batch)
-                logf.write(json.dumps(
-                    {"ts": round(time.time(), 4), "fs": fsid,
-                     "seq": st.last_seq, "s": s, "r": r,
-                     "R": int(st.R), "pace": int(st.pace),
-                     "tree": int(tree_of(fsid)), "tus": tree_us,
-                     "mode": st.mode}) + "\n")
+                # throttled logging: on change (>1% R move or mode flip)
+                # plus a 1 s heartbeat - full-rate logging wrote ~20
+                # lines/s/fs (340/s at 20 fs)
+                st.log_age += 1
+                changed = (st.mode != st.log_mode or st.log_R < 0
+                           or abs(st.R - st.log_R) > 0.01 * st.log_R)
+                if changed or st.log_age >= 20:
+                    st.log_R = st.R
+                    st.log_age = 0
+                    st.log_mode = st.mode
+                    logf.write(json.dumps(
+                        {"ts": round(time.time(), 4), "fs": fsid,
+                         "seq": st.last_seq, "s": s, "r": r,
+                         "R": int(st.R), "pace": int(st.pace),
+                         "tree": int(tree_of(fsid)), "tus": tree_us,
+                         "mode": st.mode}) + "\n")
         # --- local ticker: fail-open (design_e §3.5) ---
         if now - last_ticker >= period:
             last_ticker = now
