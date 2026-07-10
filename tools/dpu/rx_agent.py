@@ -519,9 +519,7 @@ def main():
          if v["host"] == local_host},
         ep.get("mix_window_s", 2.0))
     sched = Scheduler(reg["policy"], line, ep["headroom"], ep["delta_demand"])
-    dhold = DemandHold(ep.get("peak_ref_s", ep.get("demand_hold_s", 0.0)))
-    delta_boost = ep.get("delta_boost", 0.0)
-    boost_below = ep.get("boost_below", 0.8)
+    last_seen = {}
     marker = VQMarker(v_full, v_max)
     telem = Telemetry(vnic_host, reg["control"]["telemetry_ip"],
                       ep["telemetry_port"])
@@ -562,18 +560,33 @@ def main():
             stage_us = (0, 0)
         else:
             _i0 = time.monotonic()
-            # F3 (tiered delta): a flow below its recent peak gets a
-            # larger growth allowance so the grant recovers at compound
-            # speed after a tenant-CC dip; the grant itself still tracks
-            # r (no stickiness -> no F1-style fairness lock-in)
-            peaks = dhold.peaks(sched_rates, time.monotonic())
-            demand = {}
-            for f, r in sched_rates.items():
-                boost = delta_boost if (delta_boost and
-                                        r < boost_below * peaks.get(f, 0)) \
-                    else ep["delta_demand"]
-                demand[f] = r * (1.0 + boost)
-            ents, ceils = sched.entitlements(sched_rates, demand)
+            # share-floored demand (2026-07-10, user-approved direction
+            # after F3's zero-sum lesson): D = max(r(1+delta), s_hat) -
+            # a dipping flow's recovery headroom is funded by its OWN
+            # entitled share s_hat (all-active-infinite fill), never by
+            # siblings' usable share; bounded by the share, so no
+            # F1-style lock-in. Idle > grace drops the floor so
+            # borrowing opens as before.
+            nowm = time.monotonic()
+            for f in sched_rates:
+                last_seen[f] = nowm
+            active = dict(sched_rates)
+            grace = ep.get("share_floor_grace_s", 0.5)
+            for f, t_ in list(last_seen.items()):
+                if f not in active:
+                    if nowm - t_ <= grace:
+                        active[f] = 0.0
+                    else:
+                        del last_seen[f]
+            if ep.get("share_floor", False):
+                shat = sched._fill({f: float("inf") for f in active})
+                demand = {f: max(r * (1.0 + ep["delta_demand"]),
+                                 shat.get(f, 0.0))
+                          for f, r in active.items()}
+            else:
+                demand = {f: r * (1.0 + ep["delta_demand"])
+                          for f, r in active.items()}
+            ents, ceils = sched.entitlements(active, demand)
             _i1 = time.monotonic()
             marks = marker.step(sched_rates, ents, ceils, dt)
             telem.send(marks, sched_rates, ents)
