@@ -1,25 +1,212 @@
 {
-  "version": 2,
-  "comment": "hpft-shaper v2 lab registry. RDMA caps enforced via DOCA PCC on the BF3 DPA. rate_bps is the pair cap; the controller converts to 2^20-of-linerate units (line = 200 Gb/s).",
+  "version": 3,
+  "comment": "hpft-shaper v2 lab registry. v3 adds scheme-E fields: per-vnic MAC, policy (design_e §3.1), e_params (design_e §5.4 initial values, tuned in M4). rdma_rules kept for the legacy static-cap controller path. Units: rate_bps absolute; PCC converts to 2^20-of-linerate units (line = 200 Gb/s).",
   "line_rate_bps": 200000000000,
   "sender_host": "sgpu01",
   "receiver_host": "sgpu02",
   "sender_dpu": "hpft-dpu",
   "receiver_dpu": "hpft-dpu2",
   "vnics": [
-    {"vnic_id": "sgpu01/vf0", "host": "sgpu01", "rdma_dev": "mlx5_6", "netdev": "dpu1vf0", "representor": "pf1vf0", "ip": "10.1.0.1", "flowtag": "0x74249a41"},
-    {"vnic_id": "sgpu01/vf1", "host": "sgpu01", "rdma_dev": "mlx5_7", "netdev": "dpu1vf1", "representor": "pf1vf1", "ip": "10.1.1.1", "flowtag": "0x11f4386b"},
-    {"vnic_id": "sgpu01/vf2", "host": "sgpu01", "rdma_dev": "mlx5_8", "netdev": "dpu1vf2", "representor": "pf1vf2", "ip": "10.1.2.1", "flowtag": "0xde985a90"},
-    {"vnic_id": "sgpu01/vf3", "host": "sgpu01", "rdma_dev": "mlx5_9", "netdev": "dpu1vf3", "representor": "pf1vf3", "ip": "10.1.3.1", "flowtag": "0x7973f1b0"},
-    {"vnic_id": "sgpu02/vf0", "host": "sgpu02", "rdma_dev": "mlx5_6", "netdev": "dpu1vf0", "representor": "pf1vf0", "ip": "10.1.0.2"},
-    {"vnic_id": "sgpu02/vf1", "host": "sgpu02", "rdma_dev": "mlx5_7", "netdev": "dpu1vf1", "representor": "pf1vf1", "ip": "10.1.1.2"},
-    {"vnic_id": "sgpu02/vf2", "host": "sgpu02", "rdma_dev": "mlx5_8", "netdev": "dpu1vf2", "representor": "pf1vf2", "ip": "10.1.2.2"},
-    {"vnic_id": "sgpu02/vf3", "host": "sgpu02", "rdma_dev": "mlx5_9", "netdev": "dpu1vf3", "representor": "pf1vf3", "ip": "10.1.3.2"}
+    {
+      "vnic_id": "sgpu01/vf0",
+      "host": "sgpu01",
+      "rdma_dev": "mlx5_6",
+      "netdev": "dpu1vf0",
+      "representor": "pf1vf0",
+      "ip": "10.1.0.1",
+      "mac": "8a:e2:3c:ce:47:fb",
+      "flowtag": "0x74249a41"
+    },
+    {
+      "vnic_id": "sgpu01/vf1",
+      "host": "sgpu01",
+      "rdma_dev": "mlx5_7",
+      "netdev": "dpu1vf1",
+      "representor": "pf1vf1",
+      "ip": "10.1.1.1",
+      "mac": "aa:15:ed:f9:0d:85",
+      "flowtag": "0x11f4386b"
+    },
+    {
+      "vnic_id": "sgpu01/vf2",
+      "host": "sgpu01",
+      "rdma_dev": "mlx5_8",
+      "netdev": "dpu1vf2",
+      "representor": "pf1vf2",
+      "ip": "10.1.2.1",
+      "mac": "aa:57:fa:13:95:5c",
+      "flowtag": "0xde985a90"
+    },
+    {
+      "vnic_id": "sgpu01/vf3",
+      "host": "sgpu01",
+      "rdma_dev": "mlx5_9",
+      "netdev": "dpu1vf3",
+      "representor": "pf1vf3",
+      "ip": "10.1.3.1",
+      "mac": "42:10:c2:b5:72:e0",
+      "flowtag": "0x7973f1b0"
+    },
+    {
+      "vnic_id": "sgpu02/vf0",
+      "host": "sgpu02",
+      "rdma_dev": "mlx5_6",
+      "netdev": "dpu1vf0",
+      "representor": "pf1vf0",
+      "ip": "10.1.0.2",
+      "mac": "e2:85:a8:5d:86:87"
+    },
+    {
+      "vnic_id": "sgpu02/vf1",
+      "host": "sgpu02",
+      "rdma_dev": "mlx5_7",
+      "netdev": "dpu1vf1",
+      "representor": "pf1vf1",
+      "ip": "10.1.1.2",
+      "mac": "16:01:73:7b:cb:ab"
+    },
+    {
+      "vnic_id": "sgpu02/vf2",
+      "host": "sgpu02",
+      "rdma_dev": "mlx5_8",
+      "netdev": "dpu1vf2",
+      "representor": "pf1vf2",
+      "ip": "10.1.2.2",
+      "mac": "56:18:25:ed:38:89"
+    },
+    {
+      "vnic_id": "sgpu02/vf3",
+      "host": "sgpu02",
+      "rdma_dev": "mlx5_9",
+      "netdev": "dpu1vf3",
+      "representor": "pf1vf3",
+      "ip": "10.1.3.2",
+      "mac": "06:8f:10:46:04:c2"
+    }
   ],
   "rdma_rules": [
-    {"src_vnic": "sgpu01/vf0", "dst_vnic": "sgpu02/vf0", "rate_bps": 8000000000},
-    {"src_vnic": "sgpu01/vf1", "dst_vnic": "sgpu02/vf1", "rate_bps": 4000000000},
-    {"src_vnic": "sgpu01/vf2", "dst_vnic": "sgpu02/vf2", "rate_bps": 2000000000},
-    {"src_vnic": "sgpu01/vf3", "dst_vnic": "sgpu02/vf3", "rate_bps": 2000000000}
-  ]
+    {
+      "src_vnic": "sgpu01/vf0",
+      "dst_vnic": "sgpu02/vf0",
+      "rate_bps": 8000000000
+    },
+    {
+      "src_vnic": "sgpu01/vf1",
+      "dst_vnic": "sgpu02/vf1",
+      "rate_bps": 4000000000
+    },
+    {
+      "src_vnic": "sgpu01/vf2",
+      "dst_vnic": "sgpu02/vf2",
+      "rate_bps": 2000000000
+    },
+    {
+      "src_vnic": "sgpu01/vf3",
+      "dst_vnic": "sgpu02/vf3",
+      "rate_bps": 2000000000
+    }
+  ],
+  "policy": {
+    "comment": "design_e §3.1. VM == vnic in this lab. weight = W_i (inter-tenant); max_rate_bps = MaxRate_i (null = uncapped); class_weights = W_{i,TCP}/W_{i,RDMA}. per_sender_weights: 'dst_vnic|class|src_vnic' -> u (absent = 1). Receiver scheduler reads dst-VM params; sender tree reads src-VM params.",
+    "vms": {
+      "sgpu01/vf0": {
+        "weight": 1,
+        "max_rate_bps": 20000000000,
+        "class_weights": {
+          "tcp": 1,
+          "rdma": 1
+        }
+      },
+      "sgpu01/vf1": {
+        "weight": 1,
+        "max_rate_bps": 20000000000,
+        "class_weights": {
+          "tcp": 1,
+          "rdma": 1
+        }
+      },
+      "sgpu01/vf2": {
+        "weight": 1,
+        "max_rate_bps": 20000000000,
+        "class_weights": {
+          "tcp": 1,
+          "rdma": 1
+        }
+      },
+      "sgpu01/vf3": {
+        "weight": 1,
+        "max_rate_bps": 20000000000,
+        "class_weights": {
+          "tcp": 1,
+          "rdma": 1
+        }
+      },
+      "sgpu02/vf0": {
+        "weight": 1,
+        "max_rate_bps": 20000000000,
+        "class_weights": {
+          "tcp": 1,
+          "rdma": 1
+        }
+      },
+      "sgpu02/vf1": {
+        "weight": 1,
+        "max_rate_bps": 20000000000,
+        "class_weights": {
+          "tcp": 1,
+          "rdma": 1
+        }
+      },
+      "sgpu02/vf2": {
+        "weight": 1,
+        "max_rate_bps": 20000000000,
+        "class_weights": {
+          "tcp": 1,
+          "rdma": 1
+        }
+      },
+      "sgpu02/vf3": {
+        "weight": 1,
+        "max_rate_bps": 20000000000,
+        "class_weights": {
+          "tcp": 1,
+          "rdma": 1
+        }
+      }
+    },
+    "per_sender_weights": {}
+  },
+  "control": {
+    "comment": "Scheme-E control plane addressing. telemetry: host -> its DPU's in-band ctl IP (PF1 SF on underlay-p1, rides the p1/switch data path per design_e §3.4 user note). pace_shim: sender host -> shim addr as reachable from that host's DPU (tmfifo). tree_stub_bps = static Tree_f until M5's sender tree.",
+    "telemetry_ip": {
+      "sgpu01": "10.1.9.1",
+      "sgpu02": "10.1.9.2"
+    },
+    "pace_shim": {
+      "sgpu01": "192.168.102.1:9711"
+    },
+    "tree_stub_bps": 50000000000,
+    "pace_floor_bps": 50000000
+  },
+  "e_params": {
+    "comment": "design_e §5.4 initial values; M4 sensitivity analysis produces the recommended set. V = v_periods * T * line_rate * headroom; V_max = vmax_over_v * V; A = a_frac_linerate * line_rate per period.",
+    "period_ms": 50,
+    "delta_demand": 0.15,
+    "headroom": 0.03,
+    "a_frac_linerate": 0.0005,
+    "beta": 0.3,
+    "v_periods": 2,
+    "vmax_over_v": 1.0,
+    "theta_al": 0.85,
+    "m_al": 10,
+    "eps_al": 0.1,
+    "n1_freeze": 5,
+    "n2_failopen": 40,
+    "telemetry_port": 9710,
+    "mix_window_s": 2.0,
+    "a_frac_linerate_by_class": {
+      "tcp": 0.0005,
+      "rdma": 0.00125
+    }
+  }
 }

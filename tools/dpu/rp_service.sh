@@ -6,10 +6,10 @@ BIN=/home/ubuntu/bzx/doca34-apps/build/pcc/doca_pcc
 case "$1" in
 start)
     sudo pkill -9 -x doca_pcc 2>/dev/null
-    pkill -9 -f "sleep 1200" 2>/dev/null
+    pkill -9 -f "sleep infinity" 2>/dev/null
     sleep 1
     rm -f $FIFO; mkfifo $FIFO
-    setsid bash -c "sleep 1200 > $FIFO" </dev/null >/dev/null 2>&1 &
+    setsid bash -c "sleep infinity > $FIFO" </dev/null >/dev/null 2>&1 &
     setsid sudo env HPFT_RATE_STDIN=1 $BIN -d mlx5_0 --remote-sw-handler -l 40 -w 1100 \
         < $FIFO > $LOG 2>&1 &
     sleep 6
