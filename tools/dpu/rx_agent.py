@@ -339,7 +339,7 @@ class Scheduler:
         Root capacity must follow, or the account never sees the shortage."""
         self.c_root = speed_bps * (1.0 - self.headroom)
 
-    def entitlements(self, rates, held=None):
+    def entitlements(self, rates, demand_in=None):
         """rates: {fsid: r_f} -> ({fsid: e_f}, {fsid: ceil_f}).
 
         e_f: demand-capped water-filling share (design §3.3) - the grant.
@@ -349,8 +349,8 @@ class Scheduler:
         tiny) could never drain its vq and stayed marked forever (observed
         2026-07-09). At equilibrium r ~= ceil_f so drain ~= 0: no free
         unmarking."""
-        base = held if held is not None else rates
-        demand = {f: base[f] * (1.0 + self.delta) for f in rates}
+        demand = demand_in if demand_in is not None else \
+            {f: r * (1.0 + self.delta) for f, r in rates.items()}
         e = self._fill(demand)
         # ceil_f: this fs wants infinity, OTHERS keep their actual demands
         # (a global all-infinite fill dilutes the ceiling by phantom
@@ -519,7 +519,9 @@ def main():
          if v["host"] == local_host},
         ep.get("mix_window_s", 2.0))
     sched = Scheduler(reg["policy"], line, ep["headroom"], ep["delta_demand"])
-    dhold = DemandHold(ep.get("demand_hold_s", 0.0))
+    dhold = DemandHold(ep.get("peak_ref_s", ep.get("demand_hold_s", 0.0)))
+    delta_boost = ep.get("delta_boost", 0.0)
+    boost_below = ep.get("boost_below", 0.8)
     marker = VQMarker(v_full, v_max)
     telem = Telemetry(vnic_host, reg["control"]["telemetry_ip"],
                       ep["telemetry_port"])
@@ -560,8 +562,18 @@ def main():
             stage_us = (0, 0)
         else:
             _i0 = time.monotonic()
-            held = dhold.peaks(sched_rates, time.monotonic())
-            ents, ceils = sched.entitlements(sched_rates, held)
+            # F3 (tiered delta): a flow below its recent peak gets a
+            # larger growth allowance so the grant recovers at compound
+            # speed after a tenant-CC dip; the grant itself still tracks
+            # r (no stickiness -> no F1-style fairness lock-in)
+            peaks = dhold.peaks(sched_rates, time.monotonic())
+            demand = {}
+            for f, r in sched_rates.items():
+                boost = delta_boost if (delta_boost and
+                                        r < boost_below * peaks.get(f, 0)) \
+                    else ep["delta_demand"]
+                demand[f] = r * (1.0 + boost)
+            ents, ceils = sched.entitlements(sched_rates, demand)
             _i1 = time.monotonic()
             marks = marker.step(sched_rates, ents, ceils, dt)
             telem.send(marks, sched_rates, ents)

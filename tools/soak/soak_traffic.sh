@@ -10,8 +10,11 @@ esac
 {
   echo "=== $TS mode=$MODE"
   if [ "$MODE" != tcp ]; then
-    ssh -o BatchMode=yes -o ConnectTimeout=10 sgpu02 \
-      "pkill -f 'ib_write_b[w].*18519' 2>/dev/null; setsid nohup $PT -d mlx5_6 -p 18519 --report_gbits -D 60 > /tmp/soak_server.log 2>&1 < /dev/null &" 
+    # pkill and server start MUST be separate ssh commands: in one shell
+    # the pkill regex matches the server invocation text on its own
+    # command line and kills the shell (root cause of 9/9 failed rounds)
+    ssh -o BatchMode=yes -o ConnectTimeout=10 sgpu02 "pkill -f 'ib_write_b[w].*18519' 2>/dev/null; true"
+    ssh -o BatchMode=yes -o ConnectTimeout=10 -f sgpu02 "$PT -d mlx5_6 -p 18519 --report_gbits -D 60 > /tmp/soak_server.log 2>&1"
     sleep 3
   fi
   if [ "$MODE" != rdma ]; then

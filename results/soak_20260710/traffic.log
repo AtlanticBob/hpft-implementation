@@ -1,0 +1,25 @@
+=== 2026-07-10T05:45:01Z mode=dual
+tcp_gbps=16.20
+=== 2026-07-10T06:00:01Z mode=rdma
+=== 2026-07-10T06:15:01Z mode=tcp
+tcp_gbps=16.32
+=== 2026-07-10T06:30:01Z mode=dual
+tcp_gbps=16.27
+=== 2026-07-10T06:45:01Z mode=rdma
+=== 2026-07-10T07:00:01Z mode=tcp
+tcp_gbps=11.60
+=== 2026-07-10T07:15:02Z mode=dual
+tcp_gbps=16.71
+=== 2026-07-10T07:30:01Z mode=rdma
+=== 2026-07-10T07:45:01Z mode=tcp
+tcp_gbps=16.58
+=== 2026-07-10T08:00:01Z mode=dual
+tcp_gbps=16.51
+=== 2026-07-10T08:15:01Z mode=rdma
+=== 2026-07-10T08:30:01Z mode=tcp
+tcp_gbps=16.27
+=== 2026-07-10T08:45:01Z mode=dual
+tcp_gbps=16.61
+=== 2026-07-10T08:52:04Z mode=dual
+rdma_gbps=9.10
+tcp_gbps=8.67
