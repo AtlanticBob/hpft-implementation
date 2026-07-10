@@ -1,9 +1,15 @@
-# HPFT Shaper v2 — Handoff (2026-07-08)
+# HPFT Shaper v2 — Handoff (2026-07-09)
 
 Single entry point for a new agent/session taking over. Read this first, then the
 "Reading order" below. The project builds **transparent sender-side rate limiting**
 for RDMA + TCP on a BlueField-3 DPU, granularity `{src_vnic_id, dst_vnic_id}`,
 tenant-transparent, pacing (not drop-policing).
+
+> **当前活跃工作（2026-07-09 起）**：EuroSys 投稿——方案 E（边缘虚拟队列政策
+> 标记 + 统一响应律），在既有 shaper 之上做租户间/类间两层公平。设计定稿
+> `docs/rd_fairness_design_e.md`；**实现交接入口 `HANDOFF_IMPL_E.md`**（含
+> 已验证 lab 操作、已知 bug、里程碑）。下方原有内容（RDMA/TCP shaper 等）是
+> 其依赖的既有系统，全部仍然有效。
 
 ## Status at a glance
 
@@ -18,8 +24,10 @@ tenant-transparent, pacing (not drop-policing).
 ## Hard rules (read before touching the lab)
 - **Do NOT resume T3.2 / TCP DPU offloading** unless the user re-raises it. See
   `docs/t32_dpu_tcp_design.md` for why (deep-match needs `fdb_def_rule_en=0` = big rewrite).
-- **Never touch `devlink port function rate`** — it wedges vf0's vport (100% loss);
-  only recovery is OVS `del-port`+`add-port`.
+- ~~Never touch `devlink port function rate`~~ **Re-verdict 2026-07-10** (user-authorized
+  retest): works cleanly on fw 32.49.1014 (vf3, set/unset, precise 10G, no wedge). The
+  2026-07-05 wedge did not reproduce; soak-test before production reliance. Now serves
+  as layer-1 (per-VM sold-rate hard cap) of design_e §3.6 v2.1.
 - Say **"host fq+edt"** or "host tc" for the TCP shaper — not "opt3".
 - Experiment-env perturbations (reflash/restart services/long runs on the 2 hosts +
   2 DPUs) are pre-authorized — no need to re-ask each time.

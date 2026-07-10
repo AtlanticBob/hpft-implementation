@@ -4,3 +4,4 @@ results/*/raw/
 build/
 pcc/build-host/
 backup/**/*.tgz
+__pycache__/
