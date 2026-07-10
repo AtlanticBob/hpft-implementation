@@ -1,0 +1,8 @@
+    0              30679922754  43220.65 GB  558.91 KB              1085843683         0            
+    1              0            0 Bytes      0 Bytes                0                  0            
+    2              0            0 Bytes      0 Bytes                0                  0            
+    3              513253919    659.95 GB    224.74 MB              456186663          0            
+    4              0            0 Bytes      0 Bytes                0                  0            
+    5              0            0 Bytes      0 Bytes                0                  0            
+    6              150          35.88 KB     0 Bytes                0                  0            
+    7              1728143      127.30 MB    0 Bytes                0                  0            
