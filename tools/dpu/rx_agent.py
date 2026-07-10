@@ -32,6 +32,8 @@ import os
 import re
 import socket
 import subprocess
+
+from fastfill import waterfill_ceilings
 import time
 
 CLASS_RULES = [
@@ -319,16 +321,36 @@ class Scheduler:
         unmarking."""
         demand = {f: r * (1.0 + self.delta) for f, r in rates.items()}
         e = self._fill(demand)
-        # ceil_f: this fs wants infinity, OTHERS keep their actual demands.
-        # (A global all-infinite fill dilutes the ceiling by phantom
-        # low-rate siblings - e.g. a perftest control connection halved the
-        # rdma ceiling to 3G < r, turning the drain negative; observed
-        # 2026-07-09 in M1b.)
-        ceil = {}
+        # ceil_f: this fs wants infinity, OTHERS keep their actual demands
+        # (a global all-infinite fill dilutes the ceiling by phantom
+        # low-rate siblings; observed 2026-07-09 in M1b). Single-pass
+        # cascade (waterfill_ceilings) instead of one full fill per fs:
+        # O(N log N), property-tested equal to the N-fill reference.
+        tree = {}
         for f in demand:
-            d2 = dict(demand)
-            d2[f] = float("inf")
-            ceil[f] = self._fill(d2)[f]
+            src_dst, cls = f.rsplit("|", 1)
+            src, dst = src_dst.split(">")
+            tree.setdefault(dst, {}).setdefault(cls, {})[f] = (src, demand[f])
+        vms = self.policy["vms"]
+        upw = self.policy.get("per_sender_weights", {})
+        vm_items, vm_repl = {}, {}
+        for dst, classes in tree.items():
+            dsum = sum(d for cls in classes.values() for _, d in cls.values())
+            maxr = vms.get(dst, {}).get("max_rate_bps") or float("inf")
+            vm_items[dst] = (vms.get(dst, {}).get("weight", 1),
+                             min(maxr, dsum))
+            vm_repl[dst] = maxr   # fs->inf leaves the VM MaxRate-capped
+        vm_ceil = waterfill_ceilings(self.c_root, vm_items, vm_repl)
+        ceil = {}
+        for dst, classes in tree.items():
+            cw = vms.get(dst, {}).get("class_weights", {})
+            cls_items = {c: (cw.get(c, 1), sum(d for _, d in fs.values()))
+                         for c, fs in classes.items()}
+            cls_ceil = waterfill_ceilings(vm_ceil[dst], cls_items)
+            for c, fs in classes.items():
+                fs_items = {f: (upw.get("%s|%s|%s" % (dst, c, src), 1), d)
+                            for f, (src, d) in fs.items()}
+                ceil.update(waterfill_ceilings(cls_ceil[c], fs_items))
         return e, ceil
 
     def _fill(self, demand):
