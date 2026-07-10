@@ -503,14 +503,21 @@ def main():
                        if f.rsplit("|", 1)[1] in SCHED_CLASSES}
         if args.meter_only:
             ents, marks = {}, {}
+            stage_us = (0, 0)
         else:
+            _i0 = time.monotonic()
             ents, ceils = sched.entitlements(sched_rates)
+            _i1 = time.monotonic()
             marks = marker.step(sched_rates, ents, ceils, dt)
             telem.send(marks, sched_rates, ents)
+            _i2 = time.monotonic()
+            stage_us = (int((_i1 - _i0) * 1e6), int((_i2 - _i1) * 1e6))
 
         if not first_tick:
             rec = {"ts": round(time.time(), 4), "dt_s": round(dt, 6),
                    "read_ms": round(read_ms, 3),
+                   "nfs": len(sched_rates),
+                   "us": stage_us if not args.meter_only else (0, 0),
                    "r": {f: int(v) for f, v in rates.items()},
                    "e": {f: int(v) for f, v in ents.items()},
                    "s": {f: round(v, 4) for f, v in marks.items()},

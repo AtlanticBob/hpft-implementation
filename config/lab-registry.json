@@ -203,10 +203,6 @@
     "n1_freeze": 5,
     "n2_failopen": 40,
     "telemetry_port": 9710,
-    "mix_window_s": 2.0,
-    "a_frac_linerate_by_class": {
-      "tcp": 0.0005,
-      "rdma": 0.00125
-    }
+    "mix_window_s": 2.0
   }
 }
