@@ -308,7 +308,9 @@ def main():
                     st = flows[fsid] = FlowState(0.0, now)
                     fresh.append(fsid)
                 st.r = rec.get("r", 0)
+            _t0 = time.monotonic()
             trees = stree.trees(flows)      # §3.6 tree follows demand
+            tree_us = int((time.monotonic() - _t0) * 1e6)
             for fsid in fresh:
                 flows[fsid].R = tree_of(fsid)   # Q20: start at tree share
             for fsid, rec in recs.items():
@@ -336,7 +338,7 @@ def main():
                     {"ts": round(time.time(), 4), "fs": fsid,
                      "seq": st.last_seq, "s": s, "r": r,
                      "R": int(st.R), "pace": int(st.pace),
-                     "tree": int(tree_of(fsid)),
+                     "tree": int(tree_of(fsid)), "tus": tree_us,
                      "mode": st.mode}) + "\n")
         # --- local ticker: fail-open (design_e §3.5) ---
         if now - last_ticker >= period:

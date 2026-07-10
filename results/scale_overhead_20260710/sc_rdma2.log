@@ -1,0 +1,3 @@
+ duration mismatch: local=135, remote=200
+ Failed to negotiate parameters
+ WARNING: BW peak won't be measured in this run.
