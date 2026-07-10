@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # usage: f_run.sh <name> <hold_s> <fr> <hai_after> [delta_boost] [peak_ref_s]
 set -e
-NAME=$1; HOLD=$2; FR=$3; HAI=$4; DB=${5:-0}; PR=${6:-0}; SF=${7:-False}; GR=${8:-0.5}
+NAME=$1; HOLD=$2; FR=$3; HAI=$4; DB=${5:-0}; PR=${6:-0}; SF=${7:-False}; GR=${8:-0.5}; AF=${9:-0.0005}
 DIR=/home/zhaoxiang/hyperfront/hpft-shaper-v2/results/f1f2_20260710
 PT=$HOME/hyperfront/perftest-26015/ib_write_bw
 for h in hpft-dpu2 hpft-dpu; do
@@ -16,6 +16,8 @@ r['e_params']['delta_boost'] = $DB
 r['e_params']['peak_ref_s'] = $PR
 r['e_params']['share_floor'] = $SF
 r['e_params']['share_floor_grace_s'] = $GR
+r['e_params']['a_frac_linerate'] = $AF
+r['e_params']['a_frac_linerate_by_class'] = {}
 r['policy']['vms']['sgpu02/vf0']['max_rate_bps'] = 6000000000
 json.dump(r, open(p, 'w'))\""
 done

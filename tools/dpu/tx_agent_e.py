@@ -385,6 +385,11 @@ def main():
                         tgt = min(tgt, st.e_last * 1.15)
                     if st.R < 0.95 * tgt:
                         st.R = min((st.R + tgt) / 2.0, tree_of(fsid))
+                        # the FR jump itself makes r lag R for a tick or
+                        # two; without this reset the al clamp re-fires
+                        # and locks recovery into a ~7%/tick staircase
+                        # (solo-RDMA regression, 2026-07-10)
+                        st.al_count = 0
                         st.mode = "fr"
                     else:
                         st.fr = False
