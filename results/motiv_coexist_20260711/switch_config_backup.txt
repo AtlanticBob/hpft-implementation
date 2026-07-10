@@ -1,0 +1,160 @@
+nv set bridge domain br_default vlan
+nv set bridge domain br_p4_area_1
+nv set bridge domain br_p4_area_2 mac-address 2c:5e:ab:6e:be:02
+nv set bridge domain br_p4_area_2 stp state up
+nv set bridge domain br_tmp
+nv set interface eth0 ip address dhcp
+nv set interface eth0 ip vrf mgmt
+nv set interface eth0 type eth
+nv set interface swp1 bridge domain br_default access 10
+nv set interface swp1-4,14,17-18,29,33,37 link breakout 2x
+nv set interface swp1-4,14,17-18,29,33,37,41,swp14s0-1,swp17s0-1,swp18s0-1,swp1s0-1,swp29s0-1,swp2s0-1,swp33s0-1,swp37s0-1,swp3s0-1,swp4s0-1 type swp
+nv set interface swp1s0,swp2s0 link mtu 9216
+nv set interface swp1s0,swp2s0 qos congestion-control profile ecn_red_off
+nv set interface swp1s0,swp2s0 qos pfc
+nv set interface swp1s0-1,swp2s0,swp3s0 bridge domain br_default
+nv set interface swp2 bridge domain br_default access 20
+nv set interface swp2s1 bridge domain br_p4_area_2
+nv set interface swp3s1 ip address 101.1.3.1/30
+nv set interface swp4s0 ip address 101.0.4.1/30
+nv set interface swp4s1 ip address 101.1.1.200/32
+nv set interface swp4s1 ip address 101.1.4.1/30
+nv set interface swp4s1 ip address 137.4.1.1/24
+nv set interface swp4s1 qos egress-shaper
+nv set interface swp14,29,swp14s0-1 router adaptive-routing enable on
+nv set interface swp14s0 neighbor ipv4 10.255.0.1 lladdr 2c:5e:ab:6e:be:84
+nv set interface swp14s0-1,swp1s1,swp2s1,swp3s0-1,swp4s0-1 link mtu 8192
+nv set interface swp14s0-1,swp29s0-1 link state down
+nv set interface swp14s0-1,swp33,swp33s0-1 router adaptive-routing link-utilization-threshold 70
+nv set interface swp14s1 neighbor ipv4 10.255.1.1 lladdr 2c:5e:ab:6e:be:86
+nv set interface swp14s1 qos congestion-control
+nv set interface swp14s1,swp3s0 router pbr map
+nv set interface swp17-18,33,swp17s0-1,swp18s0-1,swp29s0-1,swp33s0-1,swp3s0-1,swp4s0-1 router adaptive-routing enable off
+nv set interface swp17s0 link mac-address 2c:5e:ab:6e:be:b4
+nv set interface swp17s0,swp33s0 ip address 10.255.0.0/31
+nv set interface swp17s0-1,swp18s0-1,swp29,33,41,swp2s0-1,swp33s0-1,swp37s0-1,swp3s0-1,swp4s1 link state up
+nv set interface swp17s1 ip address 10.255.1.0/31
+nv set interface swp17s1 link mac-address 2c:5e:ab:6e:be:b6
+nv set interface swp18s0 link mac-address 2c:5e:ab:6e:be:b0
+nv set interface swp18s0,swp33s1 ip address 10.255.0.1/31
+nv set interface swp18s0-1,swp29s0-1,swp33s1,swp4s0-1 ip vrf vrf2
+nv set interface swp18s1 ip address 10.255.1.1/31
+nv set interface swp18s1 link mac-address 2c:5e:ab:6e:be:b2
+nv set interface swp29s0 neighbor ipv4 10.255.0.0 lladdr 2c:5e:ab:6e:be:c4
+nv set interface swp29s0-1,vlan10 ip address
+nv set interface swp29s1 neighbor ipv4 10.255.1.0 lladdr 2c:5e:ab:6e:be:c6
+nv set interface swp33s1 link mac-address 2c:5e:ab:6e:be:02
+nv set interface swp37s0-1 bridge domain br_default access 100
+nv set interface vlan10 vlan 10
+nv set interface vlan10,20 type svi
+nv set interface vlan20 ip address 101.0.2.254/24
+nv set interface vlan20 vlan 20
+nv set qos congestion-control bf3_roce_bzx traffic-class 3 ecn enable
+nv set qos congestion-control bf3_roce_bzx traffic-class 3 max-threshold 4194304
+nv set qos congestion-control bf3_roce_bzx traffic-class 3 min-threshold 1048576
+nv set qos congestion-control bf3_roce_bzx traffic-class 3 probability 20
+nv set qos congestion-control default-global traffic-class 0 ecn enable
+nv set qos congestion-control default-global traffic-class 0 max-threshold 1500000
+nv set qos congestion-control default-global traffic-class 0 min-threshold 150000
+nv set qos congestion-control default-global traffic-class 0 probability 100
+nv set qos congestion-control default-global traffic-class 0 red disable
+nv set qos congestion-control default-global traffic-class 3 ecn enable
+nv set qos congestion-control default-global traffic-class 3 red disable
+nv set qos congestion-control ecn_debug traffic-class 0 ecn disable
+nv set qos congestion-control ecn_debug traffic-class 0 red disable
+nv set qos congestion-control ecn_debug traffic-class 3 ecn disable
+nv set qos congestion-control ecn_debug traffic-class 3 red disable
+nv set qos congestion-control ecn_red_off traffic-class 3 ecn disable
+nv set qos congestion-control ecn_red_off traffic-class 3 red disable
+nv set qos congestion-control half-threshold traffic-class 0 ecn enable
+nv set qos congestion-control half-threshold traffic-class 0 max-threshold 750000
+nv set qos congestion-control half-threshold traffic-class 0 min-threshold 75000
+nv set qos congestion-control half-threshold traffic-class 0 probability 100
+nv set qos congestion-control half-threshold traffic-class 0 red disable
+nv set qos congestion-control quarter-threshold traffic-class 0 ecn enable
+nv set qos congestion-control quarter-threshold traffic-class 0 max-threshold 360000
+nv set qos congestion-control quarter-threshold traffic-class 0 min-threshold 39000
+nv set qos congestion-control quarter-threshold traffic-class 0 probability 100
+nv set qos congestion-control quarter-threshold traffic-class 0 red disable
+nv set qos congestion-control roce_no_ecn traffic-class 3 ecn disable
+nv set qos egress-shaper shaper-300g port-max-rate 300000000
+nv set qos pfc bf3_short_bzx cable-length 5
+nv set qos pfc bf3_short_bzx rx enable
+nv set qos pfc bf3_short_bzx switch-priority 3
+nv set qos pfc bf3_short_bzx tx enable
+nv set qos pfc default-global cable-length 100
+nv set qos pfc default-global rx enable
+nv set qos pfc default-global switch-priority 3
+nv set qos pfc default-global tx enable
+nv set qos roce enable on
+nv set qos roce mode lossless
+nv set router adaptive-routing enable on
+nv set router adaptive-routing link-utilization-threshold on
+nv set router nexthop group nh_swp14s1 via 10.255.1.1 interface swp14s1
+nv set router nexthop group nh_to_swp3s0_101_1_0_3 via 101.1.0.3 interface swp3s0
+nv set router pbr enable on
+nv set router pbr map pbr_swp3s0_force_swp14s1 rule 10 action nexthop-group nh_swp14s1
+nv set router pbr map pbr_swp3s0_force_swp14s1 rule 10 match source-ip 101.0.3.0/30
+nv set router pbr map pbr_swp14s1_to_swp3s0 rule 10 action nexthop-group nh_to_swp3s0_101_1_0_3
+nv set router pbr map pbr_swp14s1_to_swp3s0 rule 10 match destination-ip 101.1.0.3/32
+nv set service ntp mgmt server 0.cumulusnetworks.pool.ntp.org
+nv set service ntp mgmt server 1.cumulusnetworks.pool.ntp.org
+nv set service ntp mgmt server 2.cumulusnetworks.pool.ntp.org
+nv set service ntp mgmt server 3.cumulusnetworks.pool.ntp.org
+nv set system aaa class nvapply action allow
+nv set system aaa class nvapply command-path / permission all
+nv set system aaa class nvshow action allow
+nv set system aaa class nvshow command-path / permission ro
+nv set system aaa class sudo action allow
+nv set system aaa class sudo command-path / permission all
+nv set system aaa role nvue-admin class nvapply
+nv set system aaa role nvue-monitor class nvshow
+nv set system aaa role system-admin class nvapply
+nv set system aaa role system-admin class sudo
+nv set system aaa user cumulus full-name cumulus,,,
+nv set system aaa user cumulus hashed-password '*'
+nv set system aaa user cumulus role system-admin
+nv set system api state enabled
+nv set system config auto-save state enabled
+nv set system control-plane acl acl-default-dos inbound
+nv set system control-plane acl acl-default-whitelist inbound
+nv set system hostname cumulus
+nv set system reboot mode cold
+nv set system ssh-server state enabled
+nv set system wjh channel forwarding trigger l2
+nv set system wjh channel forwarding trigger l3
+nv set system wjh channel forwarding trigger tunnel
+nv set system wjh enable on
+nv set vrf default router static 101.0.1.0/24 address-family ipv4-unicast
+nv set vrf default router static 101.0.1.0/24 via 10.255.1.1 type ipv4-address
+nv set vrf default router static 101.0.3.0/30 address-family ipv4-unicast
+nv set vrf default router static 101.0.3.0/30 via 10.255.1.1 type ipv4-address
+nv set vrf default router static 101.0.4.0/30 address-family ipv4-unicast
+nv set vrf default router static 101.0.4.0/30 via 10.255.1.1 type ipv4-address
+nv set vrf default router static 101.1.1.3/24 address-family ipv4-unicast
+nv set vrf default router static 101.1.1.3/24 via 137.29.0.1 interface swp29s0
+nv set vrf default router static 101.1.1.3/24 via 137.29.0.1 type ipv4-address
+nv set vrf default router static 101.1.1.3/24 via 137.29.1.1 interface swp29s1
+nv set vrf default router static 101.1.1.3/24 via 137.29.1.1 type ipv4-address
+nv set vrf default router static 101.1.1.3/32 address-family ipv4-unicast
+nv set vrf default router static 101.1.1.3/32 via 137.14.0.1 type ipv4-address
+nv set vrf default router static 101.1.1.3/32 via 137.14.1.1 type ipv4-address
+nv set vrf default router static 101.1.1.3/32 via 137.29.0.1 type ipv4-address
+nv set vrf default router static 101.1.1.3/32 via 137.29.1.1 type ipv4-address
+nv set vrf default router static 101.1.1.4/24 address-family ipv4-unicast
+nv set vrf default router static 101.1.1.4/24 via 137.14.0.1 interface swp14s0
+nv set vrf default router static 101.1.1.4/24 via 137.14.0.1 type ipv4-address
+nv set vrf default router static 101.1.1.4/24 via 137.14.1.1 interface swp14s1
+nv set vrf default router static 101.1.1.4/24 via 137.14.1.1 type ipv4-address
+nv set vrf default router static 101.1.1.4/32 address-family ipv4-unicast
+nv set vrf default router static 101.1.1.4/32 via 137.14.0.1 type ipv4-address
+nv set vrf default router static 101.1.1.4/32 via 137.14.1.1 type ipv4-address
+nv set vrf default router static 101.1.1.4/32 via 137.29.0.1 type ipv4-address
+nv set vrf default router static 101.1.1.4/32 via 137.29.1.1 type ipv4-address
+nv set vrf default router static 101.1.4.0/30 address-family ipv4-unicast
+nv set vrf default router static 101.1.4.0/30 via 10.255.0.1 type ipv4-address
+nv set vrf default router static 101.1.4.0/30 via 10.255.1.1 type ipv4-address
+nv set vrf vrf1 table 1003
+nv set vrf vrf2 router static 101.1.3.0/30 address-family ipv4-unicast
+nv set vrf vrf2 router static 101.1.3.0/30 via 10.255.0.0 type ipv4-address
+nv set vrf vrf2 router static 101.1.3.0/30 via 10.255.1.0 type ipv4-address
