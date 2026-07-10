@@ -203,6 +203,10 @@
     "n1_freeze": 5,
     "n2_failopen": 40,
     "telemetry_port": 9710,
-    "mix_window_s": 2.0
+    "mix_window_s": 2.0,
+    "fast_recovery": true,
+    "hai_after": 10,
+    "hai_max": 8,
+    "demand_hold_s": 0.0
   }
 }

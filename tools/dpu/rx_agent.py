@@ -295,6 +295,36 @@ def waterfill(capacity, items):
     return alloc
 
 
+class DemandHold:
+    """F1 (standing-deficit fix, 2026-07-10): demand estimate holds the
+    windowed peak so a tenant-CC dip does not instantly collapse the
+    grant (e_sum p5 was 2.4G of 6G; see standing_deficit_analysis.md).
+    Two half-window buckets -> peak decays within [hold/2, hold].
+    Cost: borrowing reclaim is delayed by <= hold (~10 periods)."""
+
+    def __init__(self, hold_s):
+        self.hold = hold_s
+        self.b = {}   # fs -> [bucket_start, peak_cur, peak_prev]
+
+    def peaks(self, rates, now):
+        if self.hold <= 0:
+            return rates
+        out = {}
+        for f, r in rates.items():
+            b = self.b.get(f)
+            if b is None:
+                b = self.b[f] = [now, r, 0.0]
+            if now - b[0] >= self.hold / 2:
+                b[2] = b[1] if now - b[0] < self.hold else 0.0
+                b[0], b[1] = now, r
+            b[1] = max(b[1], r)
+            out[f] = max(r, b[1], b[2])
+        for f in list(self.b):
+            if f not in rates:
+                del self.b[f]
+        return out
+
+
 class Scheduler:
     """3-layer water-filling -> e_f (design_e §3.3)."""
 
@@ -309,7 +339,7 @@ class Scheduler:
         Root capacity must follow, or the account never sees the shortage."""
         self.c_root = speed_bps * (1.0 - self.headroom)
 
-    def entitlements(self, rates):
+    def entitlements(self, rates, held=None):
         """rates: {fsid: r_f} -> ({fsid: e_f}, {fsid: ceil_f}).
 
         e_f: demand-capped water-filling share (design §3.3) - the grant.
@@ -319,7 +349,8 @@ class Scheduler:
         tiny) could never drain its vq and stayed marked forever (observed
         2026-07-09). At equilibrium r ~= ceil_f so drain ~= 0: no free
         unmarking."""
-        demand = {f: r * (1.0 + self.delta) for f, r in rates.items()}
+        base = held if held is not None else rates
+        demand = {f: base[f] * (1.0 + self.delta) for f in rates}
         e = self._fill(demand)
         # ceil_f: this fs wants infinity, OTHERS keep their actual demands
         # (a global all-infinite fill dilutes the ceiling by phantom
@@ -488,6 +519,7 @@ def main():
          if v["host"] == local_host},
         ep.get("mix_window_s", 2.0))
     sched = Scheduler(reg["policy"], line, ep["headroom"], ep["delta_demand"])
+    dhold = DemandHold(ep.get("demand_hold_s", 0.0))
     marker = VQMarker(v_full, v_max)
     telem = Telemetry(vnic_host, reg["control"]["telemetry_ip"],
                       ep["telemetry_port"])
@@ -528,7 +560,8 @@ def main():
             stage_us = (0, 0)
         else:
             _i0 = time.monotonic()
-            ents, ceils = sched.entitlements(sched_rates)
+            held = dhold.peaks(sched_rates, time.monotonic())
+            ents, ceils = sched.entitlements(sched_rates, held)
             _i1 = time.monotonic()
             marks = marker.step(sched_rates, ents, ceils, dt)
             telem.send(marks, sched_rates, ents)
