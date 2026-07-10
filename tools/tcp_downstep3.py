@@ -6,7 +6,7 @@ import json, sys, time, threading
 from pathlib import Path
 sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-exp/tcp_shaper/tools")
 from tcp_shaper_lib import build_pair_cfg_update, DirectBpfMapWriter, make_generation
-REG="/home/zhaoxiang/hyperfront/hpft-shaper-v2/config/lab-tcp-registry.json"
+REG="/home/zhaoxiang/hyperfront/hpft-v2/config/lab-tcp-registry.json"
 SRC="sgpu01/0000:38:00.1/vf0"; DST="sgpu02/0000:38:00.1/vf0"
 PIN=Path("/sys/fs/bpf/hpft_tcp_edt"); DEV="dpu1vf0"; CNT=f"/sys/class/net/{DEV}/statistics/tx_bytes"
 HIGH,LOW=15_000_000_000,5_000_000_000; LOW_G=5.0

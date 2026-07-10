@@ -8,7 +8,7 @@
 1. 本文件。
 2. `HANDOFF.md` —— 项目级入口：lab 事实、硬性规则、既有系统（RDMA PCC shaper /
    TCP host fq+edt / 统一 controller）的状态与代码地图。**全部继承。**
-3. 自动 memory（每会话自动加载）：`hpft-shaper-v2-status.md`（lab 细节与坑）、
+3. 自动 memory（每会话自动加载）：`hpft-v2-status.md`（lab 细节与坑）、
    `eurosys-rd-fairness-design.md`（设计演进史）、`tcp-shaper-naming-and-scope.md`。
 4. `docs/rd_fairness_design_e.md` —— **实现的唯一设计依据**（含术语表、公式、
    组件职责、里程碑验收标准）。设计已定稿：**实现中不做设计变更**；发现设计

@@ -1,7 +1,13 @@
-results/*/raw/
+# build artifacts
 *.o
 *.dpa.o
+*.pyc
 build/
 pcc/build-host/
-backup/**/*.tgz
 __pycache__/
+
+# local machine backups (2GB tarballs + host inventories; never for GitHub)
+backup/
+
+# bulky raw captures kept out of history
+results/*/raw/

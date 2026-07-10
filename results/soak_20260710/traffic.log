@@ -23,3 +23,37 @@ tcp_gbps=16.61
 === 2026-07-10T08:52:04Z mode=dual
 rdma_gbps=9.10
 tcp_gbps=8.67
+=== 2026-07-10T09:00:01Z mode=rdma
+rdma_gbps=18.09
+=== 2026-07-10T09:15:01Z mode=tcp
+tcp_gbps=16.00
+=== 2026-07-10T10:00:01Z mode=tcp
+tcp_gbps=5.40
+=== 2026-07-10T10:15:02Z mode=dual
+rdma_gbps=0.81
+tcp_gbps=4.46
+=== 2026-07-10T10:30:01Z mode=rdma
+rdma_gbps=5.62
+=== 2026-07-10T10:45:01Z mode=tcp
+tcp_gbps=5.38
+=== 2026-07-10T11:00:01Z mode=dual
+rdma_gbps=2.54
+tcp_gbps=2.36
+=== 2026-07-10T11:15:01Z mode=rdma
+rdma_gbps=5.61
+=== 2026-07-10T11:30:01Z mode=tcp
+tcp_gbps=5.45
+=== 2026-07-10T11:45:01Z mode=dual
+rdma_gbps=2.38
+tcp_gbps=2.36
+=== 2026-07-10T12:00:01Z mode=rdma
+rdma_gbps=5.60
+=== 2026-07-10T12:15:01Z mode=tcp
+tcp_gbps=5.38
+=== 2026-07-10T12:30:01Z mode=dual
+rdma_gbps=2.41
+tcp_gbps=2.39
+=== 2026-07-10T12:45:01Z mode=rdma
+rdma_gbps=5.62
+=== 2026-07-10T13:00:01Z mode=tcp
+tcp_gbps=5.46

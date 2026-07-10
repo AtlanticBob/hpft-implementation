@@ -5,7 +5,7 @@
 set -u
 export PATH=/usr/sbin:$PATH
 cd /home/zhaoxiang/hyperfront/hpft-exp/tcp_shaper
-REG=/home/zhaoxiang/hyperfront/hpft-shaper-v2/config/lab-tcp-registry.json
+REG=/home/zhaoxiang/hyperfront/hpft-v2/config/lab-tcp-registry.json
 SRC="sgpu01/0000:38:00.1/vf0"; DST="sgpu02/0000:38:00.1/vf0"; PIN=/sys/fs/bpf/hpft_tcp_edt
 set_rate() { sudo -n env PATH=/usr/sbin:$PATH tools/tcp-shaper-controller \
     --registry $REG --src-vnic "$SRC" --dst-vnic "$DST" --rate-bps "$1" \

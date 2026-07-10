@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Soak watchdog (cron */5): liveness + log freshness of the E stack.
-LOG=/home/zhaoxiang/hyperfront/hpft-shaper-v2/results/soak_20260710/watchdog.log
+LOG=/home/zhaoxiang/hyperfront/hpft-v2/results/soak_20260710/watchdog.log
 TS=$(date -u +%FT%TZ)
 RX=$(ssh -o BatchMode=yes -o ConnectTimeout=8 hpft-dpu2 \
   'echo -n "$(systemctl is-active hpft-rxagent-e) "; date -r /tmp/hpft_rxagent_e.jsonl +%s 2>/dev/null || echo 0' 2>&1)

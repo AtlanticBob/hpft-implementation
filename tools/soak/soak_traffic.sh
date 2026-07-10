@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Soak traffic bundle (cron */15): rotates rdma/tcp/dual against the live
 # E stack; logs client-reported rates. Observation only - no restarts.
-LOG=/home/zhaoxiang/hyperfront/hpft-shaper-v2/results/soak_20260710/traffic.log
+LOG=/home/zhaoxiang/hyperfront/hpft-v2/results/soak_20260710/traffic.log
 PT=$HOME/hyperfront/perftest-26015/ib_write_bw
 TS=$(date -u +%FT%TZ)
 case $(( $(date +%s) / 900 % 3 )) in
