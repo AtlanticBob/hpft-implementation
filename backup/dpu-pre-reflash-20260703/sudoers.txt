@@ -1,3 +1,0 @@
-90-cloud-init-users
-README
-hpft-dpu-agent

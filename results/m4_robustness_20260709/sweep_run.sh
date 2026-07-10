@@ -4,7 +4,7 @@
 # usage: sweep_run.sh <name> <a_frac> <beta> <v_periods>
 set -e
 NAME=$1; AF=$2; BETA=$3; VP=$4
-DIR=/home/zhaoxiang/hyperfront/hpft-shaper-v2/results/m4_robustness_20260709
+DIR=/home/zhaoxiang/hyperfront/hpft-v2/results/m4_robustness_20260709
 PT=~/hyperfront/perftest-26015/ib_write_bw
 
 ssh hpft-dpu2 "python3 - <<EOF

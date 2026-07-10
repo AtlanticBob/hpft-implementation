@@ -2,7 +2,7 @@
 # usage: solo_run.sh <name> <class:rdma|tcp> <a_frac>
 set -e
 NAME=$1; CLS=$2; AF=$3; FR2=${4:-True}
-DIR=/home/zhaoxiang/hyperfront/hpft-shaper-v2/results/f1f2_20260710
+DIR=/home/zhaoxiang/hyperfront/hpft-v2/results/f1f2_20260710
 PT=$HOME/hyperfront/perftest-26015/ib_write_bw
 for h in hpft-dpu2 hpft-dpu; do
   ssh $h "python3 -c \"

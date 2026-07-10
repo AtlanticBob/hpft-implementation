@@ -2,7 +2,7 @@
 # usage: f_run.sh <name> <hold_s> <fr> <hai_after> [delta_boost] [peak_ref_s]
 set -e
 NAME=$1; HOLD=$2; FR=$3; HAI=$4; DB=${5:-0}; PR=${6:-0}; SF=${7:-False}; GR=${8:-0.5}; AF=${9:-0.0005}
-DIR=/home/zhaoxiang/hyperfront/hpft-shaper-v2/results/f1f2_20260710
+DIR=/home/zhaoxiang/hyperfront/hpft-v2/results/f1f2_20260710
 PT=$HOME/hyperfront/perftest-26015/ib_write_bw
 for h in hpft-dpu2 hpft-dpu; do
   ssh $h "python3 -c \"

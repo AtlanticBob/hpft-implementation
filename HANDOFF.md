@@ -10,7 +10,7 @@ RDMA PCC shaper 与 TCP host fq+edt 之上实现了租户间/类间两层公平�
 
 1. 本文件；
 2. 自动 memory（每会话自动加载）：`eurosys-rd-fairness-design`（设计与
-   实现全程）、`hpft-shaper-v2-status`（lab 事实）、
+   实现全程）、`hpft-v2-status`（lab 事实）、
    `writing-style-for-research-docs`（写作规范，必须遵守）；
 3. `docs/rd_fairness_design_e.md` **v2.2** —— 设计正文（术语表、机制、
    Q1-Q27 决定日志、参数终裁与三条实测权衡）；

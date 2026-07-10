@@ -8,7 +8,7 @@
 set -u
 export PATH=/usr/sbin:$PATH
 PT=/home/zhaoxiang/hyperfront/perftest-26015/ib_write_bw   # unused
-RR=/home/zhaoxiang/hyperfront/hpft-shaper-v2/tools/tcp_rr_client.py
+RR=/home/zhaoxiang/hyperfront/hpft-v2/tools/tcp_rr_client.py
 LABEL="${1:-variant}"
 DST=10.1.0.2
 
