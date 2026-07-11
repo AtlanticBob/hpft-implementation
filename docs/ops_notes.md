@@ -90,3 +90,23 @@ fail-open 会按设计接管。
 **lossy 配置。** 两端 p1 的 PFC 全关（原本即关）；dpu2 侧 802.3x 全局
 pause 原为开启（等于把最后一跳无损化），2026-07-09 已关闭。全路径无
 交换机 ECN 依赖，丢包由 RC 重传兜底——与设计的 lossy RDMA 前提一致。
+
+## 压测战役追加病历（2026-07-11 晚）
+
+**p1 变速的暂态延迟病。** 反复 ethtool 变速（200↔100↔25G）后，全
+fabric 路径（VF 与 SF 皆然）出现空载 RTT 尖峰 10-200ms（正常 0.1ms），
+两端 OVS 重启与定速重训均无效，约 1 小时后自行消退。期间带内遥测尖峰
+超过 fail-open 阈值造成间歇性控制面失守。规则：变速类实验尽量减少翻转
+次数，相邻实验之间用 `ping -c 100 -i 0.05` 验证 fabric 干净再开跑。
+
+**SF bounce 会掉 IP；OVS 重启会掉分类规则。** `ip link set enp3s0f1s0
+down/up` 抹掉其上的 10.1.9.x 地址（带内遥测双端全断）；OVS 重启抹掉
+rx_agent 的三条分类 OpenFlow 规则。恢复：重加 IP + 重启 rx_agent
+（幂等重装）。实验前 preflight 建议加两条：SF 互 ping、tx journal 无
+持续 fail_open。
+
+**"预算永不下降"型执行面失守的辨认。** 症状：律面 mode=md 且 R 在降，
+0xdeb 却显示 bud 停在高位不动、ep 冻结、线速失控。根因族：tx 侧预算
+下发链的语义 bug（曾出现 slew=1.0 边界把下降路径短路）。速查：手写一
+条 0xb47c 批量到 rp_fifo 后再查 0xdeb——若手写也"无效"，先怀疑 tx
+每 13ms 的覆盖写，而不是 RP。
