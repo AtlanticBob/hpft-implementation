@@ -636,9 +636,17 @@ def main():
             entries = []
             for ft, (bud, rate) in latest_rdma.items():
                 sent = rdma_sent_budget.get(ft)
-                if sent is None or bud == 0 or bud >= sent:
-                    if (sent is None or bud == 0
-                            or bud - sent > 0.03 * sent):
+                if sent is None or bud == 0:
+                    sent = bud
+                elif bud >= sent:
+                    if bud - sent > 0.03 * sent:
+                        sent = bud
+                elif bud_slew_per_s >= 1.0:
+                    # slew disabled: plain 3% hysteresis both ways. (A
+                    # naive sent*decay with decay=1.0 silently made
+                    # budgets NON-DESCENDING - the executor kept the
+                    # fail-open-era budget forever, D4 2026-07-11.)
+                    if sent - bud > 0.03 * sent:
                         sent = bud
                 else:
                     # slewed descent writes every flush: each write's
