@@ -242,6 +242,7 @@
     "rdma_push_ms": 13,
     "rate_window_s": 0.02,
     "policy": null,
-    "probe_over_grant": 1.05
+    "probe_over_grant": 1.05,
+    "probe_gain": 2.0
   }
 }
