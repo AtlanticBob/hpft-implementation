@@ -5,7 +5,7 @@ Runs on the sender DPU Arm. Replaces tx_agent2 for flow-sets under scheme E
 
 Per telemetry record {fsid: {s, r, e}} from the owner (receiver DPU):
     s == 0:  R_f <- min(R_f + A, Tree_f)        (A: additive increase)
-    s  > 0:  R_f <- R_f * (1 - beta * s)        (weightless MD)
+    s  > 0:  R_f <- R_f * (1 - beta * s)**(T/Tref)  (weightless MD, wall-clock dosed)
 app-limited freeze: r < theta_al*R for m consecutive ticks -> clamp R to
 r*(1+eps) and stop AI until r comes back up.
 fail-open: no telemetry for N1 periods -> freeze; for N2 -> ramp to Tree_f.
@@ -292,6 +292,12 @@ def main():
     #   - per-period increments (A) scale by period/ref (same rate per second)
     #   - period-count timeouts (N1/N2/m_al) scale by ref/period (same
     #     wall-clock timeout regardless of how many ticks fit in it)
+    #   - MD is exponentiated by period/ref: R *= (1-beta*s)**(period/ref),
+    #     so a sustained mark sheds the same fraction per wall-clock second
+    #     at any tick rate. Unscaled per-tick MD at 1ms was a 50x overdose:
+    #     a ~20ms mark burst took R from 3G to the floor in ~11 ticks, and
+    #     the floor-crush is what wedges the RP into its family-3 state
+    #     (crawl / non-enforcement; observed 2026-07-11 step test t+16s).
     ref = ep.get("ref_period_ms", 50) / 1e3
     a_scale = period / ref
     n_scale = ref / period
@@ -362,6 +368,14 @@ def main():
     latest_rdma = {}    # flowtag -> (budget_bps, rx_rate_bps)
     rdma_push_s = ep.get("rdma_push_ms", 13) / 1e3
     last_rdma_push = time.monotonic()
+    # The RP device code takes a control step only when the FED rate
+    # changes; a wire held at a constant (e.g. floor) rate therefore
+    # freezes the RP forever - budget updates alone do not un-freeze it
+    # (M2@1ms deadlock, 2026-07-11: bud=12.6G, lvl stuck at 0.02G while
+    # the fed rate never moved). Alternate the fed rate by +-max(3%, one
+    # 2^20-unit) every push so the RP always sees a change and keeps
+    # converging its level toward the budget.
+    rp_dither_flip = False
     while True:
         # --- telemetry-driven law ---
         try:
@@ -416,7 +430,16 @@ def main():
                         st.R_good = st.R
                         st.fr = True
                     st.ai_run = 0
-                    st.R *= (1.0 - beta * s)
+                    st.R *= (1.0 - beta * s) ** a_scale
+                    # MD undershoot bound (2026-07-11 M2@1ms): MD's job is to
+                    # converge R down to the grant; a budget far BELOW the
+                    # measured arrival rate is pure overshoot, and near-floor
+                    # budgets are what wedge the RP into its family-3 state
+                    # (bud=12.6G lvl=0.02G observed). R still tracks a
+                    # collapsing wire down - r follows R through actuation -
+                    # but geometrically, never 50x below reality in one storm.
+                    if r > 0:
+                        st.R = max(st.R, 0.3 * r)
                     st.mode = "md"
                 elif st.al_count >= m_al:
                     if fast_rec and st.R_good < st.R:
@@ -499,8 +522,12 @@ def main():
             latest_rdma[ft] = (bud, rate)
         if latest_rdma and now - last_rdma_push >= rdma_push_s:
             mailbox.ensure_open()
-            mailbox.write_batch([(ft, bud, rate)
-                                 for ft, (bud, rate) in latest_rdma.items()])
+            rp_dither_flip = not rp_dither_flip
+            mailbox.write_batch(
+                [(ft, bud,
+                  max(rate + (1 if rp_dither_flip else -1)
+                      * max(0.03 * rate, 2e5), 2e5))
+                 for ft, (bud, rate) in latest_rdma.items()])
             last_rdma_push = now
         shim.drain_acks()
         if now - last_print >= 5.0:
