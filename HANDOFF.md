@@ -12,8 +12,10 @@ RDMA PCC shaper 与 TCP host fq+edt 之上实现了租户间/类间两层公平�
 2. 自动 memory（每会话自动加载）：`eurosys-rd-fairness-design`（设计与
    实现全程）、`hpft-v2-status`（lab 事实）、
    `writing-style-for-research-docs`（写作规范，必须遵守）；
-3. `docs/rd_fairness_design_e.md` **v2.2** —— 设计正文（术语表、机制、
-   Q1-Q27 决定日志、参数终裁与三条实测权衡）；
+3. `docs/design_and_implementation.md` —— **设计与实现统一版（当前
+   canonical）**：把最初设计和全部实现/调优改动（类归因、1ms 化、ceil
+   锚定探测、参数时间语义）合并在一起的完整叙述。`rd_fairness_design_e.md`
+   v2.2 保留作历史（术语表、Q1-Q27 决定日志仍有参考价值）；
 4. `docs/evaluation_index.md` —— 全部实验数据的总索引；
 5. `docs/ops_notes.md` —— 平台缺陷病历与实验卫生规则（动 lab 前必读）；
 6. `docs/standing_deficit_analysis.md` —— 利用率缺口的诊断记录。
