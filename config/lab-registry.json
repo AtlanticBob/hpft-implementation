@@ -190,7 +190,7 @@
   },
   "e_params": {
     "comment": "design_e 5.4 + 1ms retrofit (2026-07-11). Params calibrated at ref_period_ms; A and the MD exponent scale by period/ref, N1/N2/m_al/hai by ref/period, V is a fixed bit quantity anchored at ref (NOT period-scaled). period_ms is the control period.",
-    "period_ms": 50,
+    "period_ms": 1,
     "delta_demand": 0.15,
     "headroom": 0.03,
     "a_frac_linerate": 0.0005,
