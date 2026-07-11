@@ -54,7 +54,7 @@ def parse_telemetry(data):
 class FlowState:
     __slots__ = ("R", "al_count", "last_rx", "last_seq", "mode", "pace", "r",
                  "log_R", "log_age", "log_mode", "R_good", "fr", "ai_run",
-                 "e_last", "ceil_last")
+                 "e_last", "ceil_last", "esc_since", "esc_log")
 
     def __init__(self, tree, now):
         self.R = tree          # Q20: optimistic start at the tree share
@@ -72,6 +72,8 @@ class FlowState:
         self.ai_run = 0        # F2: consecutive unmarked AI ticks (HAI)
         self.e_last = 0.0      # last granted e_f from telemetry
         self.ceil_last = 0.0   # last fair-share ceiling from telemetry
+        self.esc_since = 0.0   # executor-escape tripwire: since when r >> pace
+        self.esc_log = 0.0     # last escape alarm emitted
 
 
 def waterfill(capacity, items):
@@ -366,6 +368,26 @@ def main():
             if ft is not None:
                 rdma_batch.append((ft, pace, r_bps))
         st.pace = pace
+        # executor-escape tripwire (log-only). Every stress-D1 failure class
+        # was a silent one: an unpaced EDT pair, an unmatched flowtag and a
+        # wedged RP all kept every layer reporting healthy while the wire
+        # ignored the pace. r persistently above pace is the one signal the
+        # control plane can already see. 1.5x / 1s absorbs RC-retransmit
+        # inflation (~1.3x observed) and transition bursts.
+        tnow = time.monotonic()
+        if r_bps > 1.5 * pace:
+            if st.esc_since == 0.0:
+                st.esc_since = tnow
+            elif tnow - st.esc_since >= 1.0 and tnow - st.esc_log >= 5.0:
+                print("pace-escape %s r=%.2fG pace=%.2fG dur=%.0fs"
+                      % (fsid, r_bps / 1e9, pace / 1e9, tnow - st.esc_since),
+                      flush=True)
+                st.esc_log = tnow
+        else:
+            if st.esc_log > 0.0:
+                print("pace-escape clear %s r=%.2fG pace=%.2fG"
+                      % (fsid, r_bps / 1e9, pace / 1e9), flush=True)
+            st.esc_since = st.esc_log = 0.0
 
     last_print = time.monotonic()
     last_ticker = time.monotonic()
