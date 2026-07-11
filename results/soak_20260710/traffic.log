@@ -103,3 +103,9 @@ tcp_gbps=7.10
 === 2026-07-11T05:15:01Z mode=rdma
 rdma_gbps=12.23
 === 2026-07-11T06:00:01Z mode=rdma
+rdma_gbps=13.18
+=== 2026-07-11T06:15:01Z mode=tcp
+tcp_gbps=16.22
+=== 2026-07-11T06:30:01Z mode=dual
+rdma_gbps=18.28
+tcp_gbps=8.47

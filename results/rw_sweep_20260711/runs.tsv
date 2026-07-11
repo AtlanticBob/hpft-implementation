@@ -16,3 +16,5 @@
 50ms_mdfix_regression	client_gbps=5.18	steady_mean=5.31 steady_p5=0.50 steady_p95=9.86 rmax=206.97 first_entry_s=1.0 settle_s=31.0 smax=1.000 storm_frac=0.1376 last_storm_s=30.8 nticks=603	t0=1783745322.717882965
 1ms_rw20_md30r_dither_solo	client_gbps=5.66	steady_mean=5.97 steady_p5=5.52 steady_p95=6.15 rmax=19.16 first_entry_s=0.5 settle_s=31.0 smax=1.000 storm_frac=0.0135 last_storm_s=1.4 nticks=1483	t0=1783748647.153863628
 50ms_md30r_dither_regression	client_gbps=5.29	steady_mean=5.55 steady_p5=1.12 steady_p95=10.58 rmax=20.95 first_entry_s=0.5 settle_s=31.0 smax=1.000 storm_frac=0.1310 last_storm_s=30.9 nticks=603	t0=1783749029.070385846
+1ms_final_probe105_solo	client_gbps=5.66	steady_mean=5.97 steady_p5=5.50 steady_p95=6.14 rmax=19.66 first_entry_s=0.0 settle_s=30.5 smax=1.000 storm_frac=0.0135 last_storm_s=1.5 nticks=1482	t0=1783753222.830986770
+50ms_final_allfixes_solo	client_gbps=5.11	steady_mean=5.27 steady_p5=1.01 steady_p95=10.10 rmax=19.55 first_entry_s=0.0 settle_s=30.5 smax=1.000 storm_frac=0.1547 last_storm_s=30.7 nticks=601	t0=1783753522.785760023

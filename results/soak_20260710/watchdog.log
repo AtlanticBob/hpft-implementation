@@ -303,3 +303,19 @@ tx-log-rotated
 2026-07-11T05:50:01Z now=1783749002 rx=[active 1783749001] tx=[active 1783749002 1] shim=active
 2026-07-11T05:55:01Z now=1783749303 rx=[active 1783749302] tx=[active 1783749303 1] shim=active
 2026-07-11T06:00:01Z now=1783749603 rx=[active 1783749602] tx=[active 1783749603 1] shim=active
+2026-07-11T06:05:01Z now=1783749903 rx=[active 1783749902] tx=[active 1783749903 1] shim=active
+2026-07-11T06:10:02Z now=1783750203 rx=[active 1783750203] tx=[active 1783750203 1] shim=active
+2026-07-11T06:15:01Z now=1783750502 rx=[active 1783750501] tx=[active 1783750502 1] shim=active
+2026-07-11T06:20:01Z now=1783750802 rx=[active 1783750802] tx=[active 1783750802 1] shim=active
+2026-07-11T06:25:01Z now=1783751103 rx=[active 1783751102] tx=[active 1783751103 1] shim=active
+tx-log-rotated
+2026-07-11T06:30:01Z now=1783751403 rx=[active 1783751402] tx=[active 1783751403 1] shim=active
+2026-07-11T06:35:01Z now=1783751702 rx=[active 1783751702] tx=[active 1783751702 1] shim=active
+2026-07-11T06:40:02Z now=1783752003 rx=[active 1783752002] tx=[active 1783752003 1] shim=active
+2026-07-11T06:45:01Z now=1783752302 rx=[active 1783752302] tx=[active 1783752302 1] shim=active
+2026-07-11T06:50:01Z now=1783752602 rx=[active 1783752601] tx=[active 1783752589 1] shim=active
+2026-07-11T06:55:01Z now=1783752903 rx=[active 1783752902] tx=[active 1783752903 1] shim=active
+2026-07-11T07:00:01Z now=1783753203 rx=[active 1783753202] tx=[active 1783753203 1] shim=active
+tx-log-rotated
+2026-07-11T07:05:01Z now=1783753503 rx=[active 1783753502] tx=[active 1783753503 1] shim=active
+2026-07-11T07:10:01Z now=1783753803 rx=[active 1783753802] tx=[active 1783753803 1] shim=active exporter=active
