@@ -14,6 +14,8 @@ Replies {"ok":true,"latency_us":..} to the sender for path monitoring.
 import json
 import re
 import socket
+import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -23,6 +25,7 @@ from tcp_shaper_lib import (  # noqa: E402
     DirectBpfMapWriter,
     build_pair_cfg_update,
     make_generation,
+    vnic_index,
 )
 
 TCP_PIN_DIR = Path("/sys/fs/bpf/hpft_tcp_edt")
@@ -42,11 +45,38 @@ def evnic_map(tcp_reg):
     return out
 
 
+def seed_pair_states(tcp_reg):
+    """The datapath paces a pair only when BOTH cfg and state exist; the v1
+    apply tool seeds state for its static rule list (the straight pairs)
+    only, so cfg writes for any other pair were silently ignored and
+    cross-pair TCP ran unpaced (stress D1, 2026-07-11). Seed state for
+    every local-src -> remote-dst pair; noexist never clobbers a live one."""
+    state_pin = TCP_PIN_DIR / "maps" / "hpft_pair_state"
+    indices = vnic_index(tcp_reg)
+    host = socket.gethostname()
+    seeded = 0
+    for s in tcp_reg["vnics"]:
+        if str(s.get("host")) != host:
+            continue
+        for d in tcp_reg["vnics"]:
+            if str(d.get("host")) == host:
+                continue
+            key = (indices[s["vnic_id"]] << 32) | indices[d["vnic_id"]]
+            cmd = (["bpftool", "map", "update", "pinned", str(state_pin),
+                    "key", "hex"]
+                   + ["%02x" % b for b in struct.pack("<Q", key)]
+                   + ["value", "hex"] + ["00"] * 24 + ["noexist"])
+            if subprocess.run(cmd, capture_output=True).returncode == 0:
+                seeded += 1
+    print("pace_shim: pair_state seeded %d new" % seeded, flush=True)
+
+
 def main():
     tcp_reg = json.load(open(TCP_REGISTRY))
     emap = evnic_map(tcp_reg)
     writer = DirectBpfMapWriter(TCP_PIN_DIR)
     writer.fd("hpft_pair_cfg")  # open now, fail fast if EDT not applied
+    seed_pair_states(tcp_reg)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(LISTEN)
     print("pace_shim: listening %s:%d pin=%s vnics=%d"

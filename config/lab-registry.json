@@ -84,6 +84,25 @@
       "mac": "06:8f:10:46:04:c2"
     }
   ],
+  "rdma_flowtags": {
+    "comment": "per-(src,dst) PCC flowtags, probed via 0xdea 2026-07-11. The tag hashes (src function, dst function) and is stable across QP recreation, IP choice and reflash. KNOWN COLLISION: src vf1 and src vf2 produce identical tags for every dst (rows below are equal), so vf1->X and vf2->X RDMA budgets are inseparable at the RP - never schedule both concurrently. tx_agent_e keys RDMA budgets by 'src>dst' with fallback to the per-vnic flowtag.",
+    "sgpu01/vf0>sgpu02/vf0": "0x74249a41",
+    "sgpu01/vf0>sgpu02/vf1": "0x3100bbe8",
+    "sgpu01/vf0>sgpu02/vf2": "0xfe6cd913",
+    "sgpu01/vf0>sgpu02/vf3": "0xbb48f8ba",
+    "sgpu01/vf1>sgpu02/vf0": "0x54d019c2",
+    "sgpu01/vf1>sgpu02/vf1": "0x11f4386b",
+    "sgpu01/vf1>sgpu02/vf2": "0xde985a90",
+    "sgpu01/vf1>sgpu02/vf3": "0x9bbc7b39",
+    "sgpu01/vf2>sgpu02/vf0": "0x54d019c2",
+    "sgpu01/vf2>sgpu02/vf1": "0x11f4386b",
+    "sgpu01/vf2>sgpu02/vf2": "0xde985a90",
+    "sgpu01/vf2>sgpu02/vf3": "0x9bbc7b39",
+    "sgpu01/vf3>sgpu02/vf0": "0xb61f934b",
+    "sgpu01/vf3>sgpu02/vf1": "0xf33bb2e2",
+    "sgpu01/vf3>sgpu02/vf2": "0x3c57d019",
+    "sgpu01/vf3>sgpu02/vf3": "0x7973f1b0"
+  },
   "rdma_rules": [
     {
       "src_vnic": "sgpu01/vf0",
