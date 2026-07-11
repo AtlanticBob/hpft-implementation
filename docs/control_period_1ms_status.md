@@ -194,3 +194,20 @@ megaflow 滞后）。
 （20G 验证 11.36G，在稳定系统自身 12-18G 波动带内；soak cron 已恢复）。
 tx_agent_e.py 含三个新修复（β 指数化、MD 下界、RP 喂率抖动），
 registry 的 rate_window_s=0.020，其余与正典一致。
+
+## 追加四：类归因新路线的判别实验（2026-07-11 晚，通过）
+
+归因失真的修复路线已经用实验定死：**接收端 host 的 per-VF netdev RX
+计数器是一个新鲜的 TCP-only 字节源。** 判别数据：纯 RDMA 13.13Gbps
+跑 10 秒（线上约 16.4GB），sgpu02 上 dpu1vf0 的 netdev rx_bytes 只动
+2386 字节（ARP 级噪声）——RoCE 由 HCA 旁路消费、完全不过内核网络栈；
+纯 TCP 下 netdev 增量速率与 iperf3 发送速率比值 1.059（帧头+重传开销，
+吻合）。内核计数器读取无频率限制、无 1 秒硬件缓存。
+
+由此下一步实现是：接收端 host 跑一个极小的速率导出 shim（模式仿照
+发送端的 pace shim），把 per-VF 的 netdev RX 速率按 tick 级新鲜度推给
+接收端 DPU 的 rx_agent；rx_agent 用 r_tcp = host 报告值、
+r_rdma = vport 总量 − r_tcp 做类级拆分，megaflow mix 只用于同类内部
+多发送方的细分（单发送方场景下类率即流集合率）。这把 M2 振荡的
+主要助燃剂（类级 50/50 错误切分）从根上去掉。实现与 M2 复验是
+下一轮的第一件事。
