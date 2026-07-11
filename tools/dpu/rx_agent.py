@@ -558,7 +558,16 @@ def main():
                   if v.get("mac") and v["host"] == local_host}
     vnic_host = {v["vnic_id"]: v["host"] for v in reg["vnics"]}
 
-    v_full = ep["v_periods"] * period * line * ep["headroom"]
+    # V is a FIXED bit quantity (the excess-integral tolerated before the
+    # mark saturates), so it must NOT scale with the control period: the
+    # VQ accumulates the time integral of (r - e), which over a given
+    # wall-clock window is the same no matter how finely it is ticked.
+    # Scaling V with period (the earlier formula) made the VQ 50x more
+    # sensitive at 1ms - a few measurement spikes above the cap saturated
+    # it and fired spurious marks, pinning the flow ~20% below its cap.
+    # Anchor V to the reference period instead.
+    ref_period = ep.get("ref_period_ms", 50) / 1e3
+    v_full = ep["v_periods"] * ref_period * line * ep["headroom"]
     v_max = ep["vmax_over_v"] * v_full
 
     added = install_class_rules(args.bridge)
