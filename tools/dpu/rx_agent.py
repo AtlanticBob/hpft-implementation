@@ -217,6 +217,15 @@ class HybridRates:
         self.mix_shares = {}              # fsid -> fraction of its dst total
         self.by_dst = {}                  # dst vnic -> set(fsid)
         self.unattributed = 0.0
+        # receiver-host kernel byte reports (rate exporter, 2026-07-11):
+        # (t_host_ns, rx_bytes) pairs are stamped together AT READ TIME on
+        # the host, so unlike the local loop they cannot decouple bytes
+        # from time (the +-60% bug family). RoCE bypasses the kernel
+        # netdev counter entirely (measured: 16.4GB of RDMA moved it by
+        # 2386 bytes), so this is a fresh kernel-path(TCP+ip)-only source.
+        self.host_ring = {}               # vnic -> [(t_host_ns, rx_bytes)]
+        self.host_seen = {}               # vnic -> local monotonic of report
+        self.attr_host = set()            # dsts host-attributed this tick
 
     def _rep_tx_bytes(self, dev):
         fd = self._fd.get(dev)
@@ -281,10 +290,46 @@ class HybridRates:
             if dt > 0 and v >= v0:
                 self.r_d[vnic] = (v - v0) * 8 / dt
 
-    def rates(self):
-        """Compute r_f from the last sample() x cached class-mix."""
+    def host_update(self, vnic, t_host_ns, rx_bytes, now):
+        """Ingest one receiver-host counter snapshot for a local dst VF."""
+        ring = self.host_ring.setdefault(vnic, [])
+        if ring and t_host_ns <= ring[-1][0]:
+            return                        # stale/reordered datagram
+        ring.append((t_host_ns, rx_bytes))
+        horizon = t_host_ns - int(self.rate_window * 2e9)
+        while len(ring) > 2 and ring[0][0] < horizon:
+            ring.pop(0)
+        self.host_seen[vnic] = now
+
+    def _host_kernel_rate(self, vnic, now):
+        """Fresh kernel-path (tcp+ip) arrival rate for a dst VF from the
+        host counter; None when the exporter is absent/stale (>0.1s) so
+        the caller falls back to the megaflow mix."""
+        if now - self.host_seen.get(vnic, -1e9) > 0.1:
+            return None
+        ring = self.host_ring.get(vnic)
+        if not ring or len(ring) < 2:
+            return None
+        (t0, b0), (t1, b1) = ring[0], ring[-1]
+        if t1 <= t0 or b1 < b0:
+            return None
+        return (b1 - b0) * 8 / ((t1 - t0) / 1e9)
+
+    def rates(self, now=None):
+        """Compute r_f from the last sample() x class attribution.
+
+        Class-level split prefers the receiver-host kernel counter:
+        r_kernel from the host, r_rdma = vport total - r_kernel. The
+        megaflow mix (1s HW cache, 2s window) cannot track second-scale
+        contention - it split every instant ~50/50 and mis-marked both
+        classes (M2, 2026-07-11: rx read rdma at 2.7x its true rate).
+        The mix remains the intra-class splitter for multi-sender
+        flow-sets and the whole-VF fallback when the exporter is stale."""
         rates = {}
         self.unattributed = 0.0
+        self.attr_host = set()
+        if now is None:
+            now = time.monotonic()
         for dst, total in self.r_d.items():
             if total <= 0:
                 continue
@@ -292,10 +337,33 @@ class HybridRates:
             if not members:
                 self.unattributed += total
                 continue
+            kern = self._host_kernel_rate(dst, now)
+            if kern is None:
+                for f in members:
+                    share = self.mix_shares.get(f, 1.0 / len(members))
+                    if share > 0:
+                        rates[f] = total * share
+                continue
+            self.attr_host.add(dst)
+            pools = {"kern": min(kern, total)}
+            pools["rdma"] = max(total - pools["kern"], 0.0)
+            groups = {"kern": [], "rdma": []}
             for f in members:
-                share = self.mix_shares.get(f, 1.0 / len(members))
-                if share > 0:
-                    rates[f] = total * share
+                cls = f.rsplit("|", 1)[1]
+                groups["rdma" if cls == "rdma" else "kern"].append(f)
+            for g, fs in groups.items():
+                pool = pools[g]
+                if pool <= 0:
+                    continue
+                if not fs:
+                    self.unattributed += pool
+                    continue
+                wsum = sum(self.mix_shares.get(f, 0.0) for f in fs)
+                for f in fs:
+                    share = (self.mix_shares.get(f, 0.0) / wsum) \
+                        if wsum > 0 else 1.0 / len(fs)
+                    if share > 0:
+                        rates[f] = pool * share
         return rates
 
 
@@ -474,6 +542,13 @@ class VQMarker:
         return marks
 
 
+# receiver-host rate exporter wire format (hpft_rate_exporter.py):
+#   header '<HH' = (seq_lo16, n_records)
+#   record '<16sQQ' = (vnic_id[16], rx_bytes, t_host_monotonic_ns)
+RATE_HDR = struct.Struct("<HH")
+RATE_REC = struct.Struct("<16sQQ")
+
+
 class Telemetry:
     """One binary datagram per destination per tick. At a 1ms period, JSON
     encode/decode of a per-flow-set dict is a real cost; a fixed struct is
@@ -490,7 +565,12 @@ class Telemetry:
     control.pace_shim (host)."""
 
     HDR = struct.Struct("<HH")
-    REC = struct.Struct("<64sfQQ")
+    # record carries ceil_f (fair-share ceiling) besides the demand-capped
+    # e_f: the sender's AI/HAI probe bound must anchor to ceil, not e -
+    # e = min(fair, r*1.15) is self-referential through the sender's own
+    # rate and traps a crushed flow below its share (same lesson as the
+    # Q22 VQ-drain fix; observed as a 0.27G no-marks deadlock, 2026-07-11)
+    REC = struct.Struct("<64sfQQQ")
 
     def __init__(self, vnic_host, telemetry_ip, port, shim_ip=None,
                  shim_port=None):
@@ -504,18 +584,20 @@ class Telemetry:
 
     def _pack(self, recs):
         out = [self.HDR.pack(self.seq & 0xffff, len(recs))]
-        for fsid, s, r, e in recs:
-            out.append(self.REC.pack(fsid.encode()[:64], s, int(r), int(e)))
+        for fsid, s, r, e, c in recs:
+            out.append(self.REC.pack(fsid.encode()[:64], s, int(r), int(e),
+                                     int(c)))
         return b"".join(out)
 
-    def send(self, marks, rates, ents):
+    def send(self, marks, rates, ents, ceils):
         self.seq += 1
         per_dpu = {}     # dpu ip -> [records]
         per_shim = {}    # (shim ip, port) -> [tcp records]
         for f, s in marks.items():
             src, cls = f.split(">")[0], f.rsplit("|", 1)[1]
             host = self.vnic_host.get(src)
-            rec = (f, s, rates.get(f, 0), ents.get(f, 0))
+            rec = (f, s, rates.get(f, 0), ents.get(f, 0),
+                   ceils.get(f, ents.get(f, 0)))
             ip = self.telemetry_ip.get(host)
             if ip is not None:
                 per_dpu.setdefault(ip, []).append(rec)
@@ -590,6 +672,10 @@ def main():
     telem = Telemetry(vnic_host, ctl["telemetry_ip"], ep["telemetry_port"],
                       shim_ip=ctl.get("shim_ip"),
                       shim_port=ctl.get("shim_telemetry_port"))
+    hsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    hsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    hsock.bind(("0.0.0.0", ctl.get("rate_export_port", 9712)))
+    hsock.setblocking(False)
     logf = open(args.log, "a", buffering=1)
 
     # The slow work (megaflow dump for class-mix, policy reload, downlink
@@ -618,6 +704,23 @@ def main():
         # ---- sample vport counters FIRST, before any slow work, so the
         # sampling cadence is regular (set by the sleep schedule) ----
         hybrid.sample(now, period)
+
+        # drain receiver-host kernel byte reports (class-attribution truth)
+        while True:
+            try:
+                data, _ = hsock.recvfrom(2048)
+            except (BlockingIOError, OSError):
+                break
+            try:
+                _, n = RATE_HDR.unpack_from(data, 0)
+                off = RATE_HDR.size
+                for _ in range(n):
+                    vb, bts, tns = RATE_REC.unpack_from(data, off)
+                    off += RATE_REC.size
+                    hybrid.host_update(vb.rstrip(b"\0").decode(),
+                                       tns, bts, now)
+            except (struct.error, UnicodeDecodeError):
+                pass
 
         # ---- slow work, inline, every slow_every ticks ----
         if nticks_total % slow_every == 0:
@@ -654,7 +757,7 @@ def main():
                 pass
 
         # ---- fast loop: rates -> waterfill -> VQ -> telemetry ----
-        rates = hybrid.rates()
+        rates = hybrid.rates(now)
         dt = period
         sched_rates = {f: r for f, r in rates.items()
                        if f.rsplit("|", 1)[1] in SCHED_CLASSES}
@@ -693,12 +796,13 @@ def main():
                           for f, r in active.items()}
             ents, ceils = sched.entitlements(active, demand)
             marks = marker.step(sched_rates, ents, ceils, dt)
-            telem.send(marks, sched_rates, ents)
+            telem.send(marks, sched_rates, ents, ceils)
 
         # throttled logging (default ~50 Hz), never every 1ms tick
         if nticks_total % log_every == 0 and nticks_total:
             rec = {"ts": round(time.time(), 4), "dt_s": round(dt, 6),
                    "read_ms": round(dump_ms, 3), "nfs": len(sched_rates),
+                   "ha": len(hybrid.attr_host),
                    "r": {f: int(v) for f, v in rates.items()},
                    "e": {f: int(v) for f, v in ents.items()},
                    "s": {f: round(v, 4) for f, v in marks.items()},
