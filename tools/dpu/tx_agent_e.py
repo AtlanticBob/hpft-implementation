@@ -31,7 +31,7 @@ FIFO = "/tmp/rp_fifo"   # PCC RP mailbox (batched: 0xb47c000N ft bud rate ...)
 # binary telemetry (must match rx_agent.Telemetry): header (seq16, n) then
 # n x (fsid[64], s float, r_bps u32, e_bps u32)
 _THDR = struct.Struct("<HH")
-_TREC = struct.Struct("<64sfQQ")
+_TREC = struct.Struct("<64sfQQQ")   # + ceil_f (see rx Telemetry.REC)
 
 
 def parse_telemetry(data):
@@ -44,16 +44,17 @@ def parse_telemetry(data):
     for _ in range(n):
         if off + _TREC.size > len(data):
             break
-        fb, s, r, e = _TREC.unpack_from(data, off)
+        fb, s, r, e, c = _TREC.unpack_from(data, off)
         off += _TREC.size
         recs[fb.rstrip(b"\x00").decode("ascii", "ignore")] = {
-            "s": s, "r": r, "e": e}
+            "s": s, "r": r, "e": e, "c": c}
     return seq, recs
 
 
 class FlowState:
     __slots__ = ("R", "al_count", "last_rx", "last_seq", "mode", "pace", "r",
-                 "log_R", "log_age", "log_mode", "R_good", "fr", "ai_run", "e_last")
+                 "log_R", "log_age", "log_mode", "R_good", "fr", "ai_run",
+                 "e_last", "ceil_last")
 
     def __init__(self, tree, now):
         self.R = tree          # Q20: optimistic start at the tree share
@@ -70,6 +71,7 @@ class FlowState:
         self.fr = False        # F2: fast-recovery active
         self.ai_run = 0        # F2: consecutive unmarked AI ticks (HAI)
         self.e_last = 0.0      # last granted e_f from telemetry
+        self.ceil_last = 0.0   # last fair-share ceiling from telemetry
 
 
 def waterfill(capacity, items):
@@ -320,6 +322,7 @@ def main():
     fast_rec = bool(ep.get("fast_recovery", False))
     hai_after = int(round(ep.get("hai_after", 0) * n_scale))
     hai_max = int(ep.get("hai_max", 8))
+    probe_over = ep.get("probe_over_grant", 1.05)
     floor = ctl["pace_floor_bps"]
     shim = PaceShim(ctl["pace_shim"][local_host])
     mailbox = RpMailbox(line)
@@ -409,6 +412,7 @@ def main():
                 st.last_seq = seq if seq is not None else -1
                 s, r = rec.get("s", 0.0), rec.get("r", 0)
                 st.e_last = rec.get("e", st.e_last)
+                st.ceil_last = rec.get("c", st.ceil_last)
                 # app-limited detection: the app is app-limited only if it
                 # is not filling its GRANT e_f - compare r to min(R, e_f),
                 # not to R alone. With Q20's optimistic start R begins far
@@ -475,7 +479,22 @@ def main():
                     mult = 1
                     if hai_after and st.ai_run > hai_after:
                         mult = min(st.ai_run - hai_after + 1, hai_max)
-                    st.R = min(st.R + A_of(fsid) * mult, tree_of(fsid))
+                    # AI/HAI probes at most probe_over above the fair-share
+                    # CEILING. Unbounded HAI (16G/s wall-clock at any
+                    # period) blew straight through the cap after every
+                    # mark-free 0.5s: dip -> HAI to 14G in 1s -> VQ
+                    # saturates -> MD crash -> repeat, a 15-25s relaxation
+                    # oscillation that was THE class-contention instability
+                    # (M2 2026-07-11). The anchor must be ceil_f, NOT the
+                    # demand-capped e_f: e = min(fair, r*1.15) is
+                    # self-referential through the sender's own rate and
+                    # trapped a crushed flow at 0.27G with zero marks
+                    # (same lesson as the Q22 VQ-drain fix).
+                    cap = tree_of(fsid)
+                    anchor = st.ceil_last or st.e_last
+                    if anchor > 0:
+                        cap = min(cap, anchor * probe_over)
+                    st.R = min(st.R + A_of(fsid) * mult, cap)
                     if st.al_count == 0:
                         st.R_good = max(st.R_good, st.R)
                     st.mode = "ai" if mult == 1 else "hai"

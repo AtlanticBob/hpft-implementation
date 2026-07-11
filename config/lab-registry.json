@@ -177,7 +177,7 @@
     "per_sender_weights": {}
   },
   "control": {
-    "comment": "Scheme-E control plane addressing. telemetry: host -> its DPU's in-band ctl IP (PF1 SF on underlay-p1, rides the p1/switch data path per design_e \u00a73.4 user note). pace_shim: sender host -> shim addr as reachable from that host's DPU (tmfifo). tree_stub_bps = static Tree_f until M5's sender tree.",
+    "comment": "Scheme-E control plane addressing. telemetry: host -> its DPU's in-band ctl IP (PF1 SF on underlay-p1, rides the p1/switch data path per design_e \u00a73.4 user note). pace_shim: sender host -> shim addr as reachable from that host's DPU (tmfifo). tree_stub_bps = static Tree_f until M5's sender tree. rate_export: receiver host -> its DPU rx_agent (tmfifo), fresh kernel-path byte counter for class attribution (2026-07-11).",
     "telemetry_ip": {
       "sgpu01": "10.1.9.1",
       "sgpu02": "10.1.9.2"
@@ -186,7 +186,12 @@
       "sgpu01": "192.168.102.1:9711"
     },
     "tree_stub_bps": 50000000000,
-    "pace_floor_bps": 50000000
+    "pace_floor_bps": 50000000,
+    "rate_export": {
+      "sgpu02": "192.168.102.2:9712"
+    },
+    "rate_export_port": 9712,
+    "rate_export_ms": 5
   },
   "e_params": {
     "comment": "design_e 5.4 + 1ms retrofit (2026-07-11). Params calibrated at ref_period_ms; A and the MD exponent scale by period/ref, N1/N2/m_al/hai by ref/period, V is a fixed bit quantity anchored at ref (NOT period-scaled). period_ms is the control period.",
@@ -217,6 +222,7 @@
     "log_every_ms": 20,
     "rdma_push_ms": 13,
     "rate_window_s": 0.02,
-    "policy": null
+    "policy": null,
+    "probe_over_grant": 1.05
   }
 }
