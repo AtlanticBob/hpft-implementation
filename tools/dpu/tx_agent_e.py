@@ -328,6 +328,13 @@ def main():
     mailbox = RpMailbox(line)
     flowtags = {v["vnic_id"]: int(v["flowtag"], 16)
                 for v in reg["vnics"] if "flowtag" in v}
+    # per-(src,dst) flowtags for cross-pair RDMA: the tag is a stable hash of
+    # (src function, dst function) - NOT per-src - so a src VF talking to
+    # several dsts needs one budget entry per pair (registry rdma_flowtags,
+    # probed via 0xdea 2026-07-11). Falls back to the per-src tag, which keeps
+    # the four straight pairs byte-identical to the old behaviour.
+    pair_ft = {k: int(v, 16)
+               for k, v in reg.get("rdma_flowtags", {}).items() if ">" in k}
     stree = SenderTree(reg["policy"], line, ep["headroom"],
                        ep["delta_demand"], floor)
     trees = {}   # fsid -> Tree_f, recomputed on telemetry / ticker
@@ -355,7 +362,7 @@ def main():
             if pace != st.pace:
                 shim.set_rate(src, dst, pace)
         elif cls == "rdma":
-            ft = flowtags.get(src)
+            ft = pair_ft.get(src_dst, flowtags.get(src))
             if ft is not None:
                 rdma_batch.append((ft, pace, r_bps))
         st.pace = pace
@@ -369,6 +376,7 @@ def main():
     # freshest snapshot at the mailbox rate. The RDMA congestion response
     # stays event-speed on the DPA; only the policy target is rate-limited.
     latest_rdma = {}    # flowtag -> (budget_bps, rx_rate_bps)
+    rdma_sent_budget = {}   # flowtag -> last budget written (hysteresis)
     rdma_push_s = ep.get("rdma_push_ms", 13) / 1e3
     last_rdma_push = time.monotonic()
     # The RP device code takes a control step only when the FED rate
@@ -536,17 +544,35 @@ def main():
                         {"ts": round(time.time(), 4), "fs": fsid,
                          "R": int(st.R), "mode": st.mode}) + "\n")
         # coalesce RDMA budgets: keep the latest per flowtag, flush the
-        # freshest snapshot to the FIFO only at the mailbox rate
+        # freshest snapshot to the FIFO only at the mailbox rate.
+        # Budget hysteresis (stress D1, 2026-07-11): the RP treats ANY budget
+        # change as a cap change - it re-arms the settle-hold and marks the
+        # rate sample used, so its integral level control never steps while
+        # the budget keeps moving. At 1ms the hai probe cap tracks a ceil
+        # that jitters with the whole dst's rate vector, so a crushed pair's
+        # budget changed on every flush and its level stayed proportionally
+        # crushed forever (0.27G wire under a 4.3G budget, self-sustaining:
+        # the probing that should recover the flow froze the executor).
+        # Re-sending the same budget while the drift is <3% keeps the budget
+        # quasi-static (the 20Hz-era semantics the RP was built against);
+        # the rate field stays fresh every flush, so hold expires after 3
+        # samples and the integral climbs the level back (~12.5%/step).
         for ft, bud, rate in rdma_batch:
             latest_rdma[ft] = (bud, rate)
         if latest_rdma and now - last_rdma_push >= rdma_push_s:
             mailbox.ensure_open()
             rp_dither_flip = not rp_dither_flip
-            mailbox.write_batch(
-                [(ft, bud,
-                  max(rate + (1 if rp_dither_flip else -1)
-                      * max(0.03 * rate, 2e5), 2e5))
-                 for ft, (bud, rate) in latest_rdma.items()])
+            entries = []
+            for ft, (bud, rate) in latest_rdma.items():
+                sent = rdma_sent_budget.get(ft)
+                if sent is None or bud == 0 or abs(bud - sent) > 0.03 * sent:
+                    rdma_sent_budget[ft] = bud
+                    sent = bud
+                entries.append(
+                    (ft, sent,
+                     max(rate + (1 if rp_dither_flip else -1)
+                         * max(0.03 * rate, 2e5), 2e5)))
+            mailbox.write_batch(entries)
             last_rdma_push = now
         shim.drain_acks()
         if now - last_print >= 5.0:
