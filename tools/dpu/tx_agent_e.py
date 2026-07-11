@@ -326,6 +326,7 @@ def main():
     hai_max = int(ep.get("hai_max", 8))
     probe_over = ep.get("probe_over_grant", 1.05)
     probe_gain = ep.get("probe_gain", 2.0)
+    bud_slew_per_s = ep.get("rdma_bud_slew_per_s", 1.0)   # 1.0 = no slew
 
     def probe_cap(ceil_f, r_now):
         """Probe ceiling with a realization-aware margin (stress D2/D3,
@@ -621,12 +622,31 @@ def main():
         if latest_rdma and now - last_rdma_push >= rdma_push_s:
             mailbox.ensure_open()
             rp_dither_flip = not rp_dither_flip
+            # Budget DESCENT slew limit (three-loop limit cycle, E1
+            # 2026-07-11): the law's R sawtooth swings the budget +-50% at
+            # ~1s period; the RP's integral chases it through a ~100ms
+            # measure+apply loop delay and undershoots the level to near
+            # zero (0.09G under a 1.38G budget) - a coupled VQ/AIMD/RP
+            # limit cycle. Descending budget writes are slew-limited so
+            # the RP's target moves slower than its loop delay; ascent
+            # stays free (recovery must be fast). slew_per_s = fraction
+            # of the budget surviving one second of continuous descent.
+            dt_flush = now - last_rdma_push
+            decay = bud_slew_per_s ** dt_flush
             entries = []
             for ft, (bud, rate) in latest_rdma.items():
                 sent = rdma_sent_budget.get(ft)
-                if sent is None or bud == 0 or abs(bud - sent) > 0.03 * sent:
-                    rdma_sent_budget[ft] = bud
-                    sent = bud
+                if sent is None or bud == 0 or bud >= sent:
+                    if (sent is None or bud == 0
+                            or bud - sent > 0.03 * sent):
+                        sent = bud
+                else:
+                    # slewed descent writes every flush: each write's
+                    # settle-hold freezes the RP integral while the
+                    # proportional feed-forward walks the level down
+                    # smoothly - exactly the wanted descent behaviour.
+                    sent = max(bud, sent * decay)
+                rdma_sent_budget[ft] = sent
                 entries.append(
                     (ft, sent,
                      max(rate + (1 if rp_dither_flip else -1)
