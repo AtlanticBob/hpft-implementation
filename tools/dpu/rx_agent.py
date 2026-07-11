@@ -31,10 +31,11 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
+import time
 
 from fastfill import waterfill_ceilings
-import time
 
 CLASS_RULES = [
     (50, "udp,tp_dst=4791"),   # RoCEv2
@@ -194,20 +195,28 @@ class FlowSetMeter:
 
 class HybridRates:
     """r_f = fresh per-dst-VF vport rate x windowed megaflow byte share
-    (see module docstring)."""
+    (see module docstring).
 
-    MIN_DT = 0.03   # s; short ticks (sampling jitter after a slow read)
-                    # produce garbage delta/dt spikes -> phantom vq charges
+    Fast/slow split for the 1ms control period (2026-07-11): the vport
+    counters are read every tick (the fast path, ~6us for 4 VFs), but the
+    per-VF-total rate is measured over a sliding window that looks back a
+    few milliseconds so the ~0.87ms counter-refresh quantum does not turn
+    single ticks into zero/spike noise. The megaflow class-mix is refreshed
+    only on the slow loop (update_mix, ~5 Hz) because the mix source is
+    itself 1s-stale; between refreshes the fast path reuses cached shares.
+    """
 
-    def __init__(self, rep_of_vnic, mix_window_s):
+    def __init__(self, rep_of_vnic, mix_window_s, rate_window_s=0.006):
         self.rep_of_vnic = rep_of_vnic    # local vnic_id -> representor dev
         self.window = mix_window_s
-        self.hist = []                    # (t, fs_delta_bytes)
-        self.prev = {}                    # vnic -> (bytes, t)
+        self.rate_window = rate_window_s
+        self.hist = []                    # (t, fs_delta_bytes) for the mix
+        self.ring = {}                    # vnic -> deque of (t, bytes)
         self._fd = {}
-        self.unattributed = 0.0           # bps seen on vports w/o any fs key
-        self.last_rates = {}
-        self.last_t = 0.0
+        self.r_d = {}                     # vnic -> fresh vport rate
+        self.mix_shares = {}              # fsid -> fraction of its dst total
+        self.by_dst = {}                  # dst vnic -> set(fsid)
+        self.unattributed = 0.0
 
     def _rep_tx_bytes(self, dev):
         fd = self._fd.get(dev)
@@ -224,25 +233,9 @@ class HybridRates:
             self._fd.pop(dev, None)
             return None
 
-    def tick(self, fs_deltas, fs_present, now):
-        if now - self.last_t < self.MIN_DT:
-            # jittery short tick: keep counters unsampled (deltas roll into
-            # the next tick) and reuse the previous rates
-            self.hist.append((now, fs_deltas))
-            return self.last_rates
-        self.last_t = now
-        # fresh totals per dst vnic
-        r_d = {}
-        for vnic, dev in self.rep_of_vnic.items():
-            v = self._rep_tx_bytes(dev)
-            if v is None:
-                continue
-            pv, pt = self.prev.get(vnic, (v, now))
-            self.prev[vnic] = (v, now)
-            dt = now - pt
-            if dt > 0:
-                r_d[vnic] = (v - pv) * 8 / dt if v >= pv else 0.0
-        # windowed mix
+    def update_mix(self, fs_deltas, fs_present, now):
+        """Slow path (~5 Hz): recompute per-dst class-mix shares from the
+        windowed megaflow byte deltas."""
         self.hist.append((now, fs_deltas))
         while self.hist and self.hist[0][0] < now - self.window:
             self.hist.pop(0)
@@ -254,22 +247,55 @@ class HybridRates:
         for f in set(fs_present) | set(win):
             dst = f.rsplit("|", 1)[0].split(">")[1]
             by_dst.setdefault(dst, set()).add(f)
+        shares = {}
+        for dst, members in by_dst.items():
+            wtot = sum(win.get(f, 0) for f in members)
+            for f in members:
+                shares[f] = (win.get(f, 0) / wtot) if wtot > 0 \
+                    else 1.0 / len(members)
+        self.mix_shares = shares
+        self.by_dst = by_dst
+
+    def sample(self, now, period):
+        """Read every dst-VF vport counter and update its rate estimate.
+        MUST be called at the very top of the loop, before any slow work,
+        so the sampling cadence is set purely by the loop's sleep schedule
+        and never perturbed by a dump landing between two samples - that
+        perturbation decoupled the byte count from the timestamp and turned
+        a clean 6G into +-60% noise (2026-07-11). Rate is over a FIXED
+        NUMBER of samples (not a time window, which is not jitter-robust):
+        N spans ~rate_window at a 1ms period (smoothing the 0.87ms counter
+        quantum) and is exactly 2 (tick-to-tick) at 50ms."""
+        nkeep = max(2, round(self.rate_window / period) + 1)
+        self.r_d = {}
+        for vnic, dev in self.rep_of_vnic.items():
+            v = self._rep_tx_bytes(dev)
+            if v is None:
+                continue
+            ring = self.ring.setdefault(vnic, [])
+            ring.append((now, v))
+            while len(ring) > nkeep:
+                ring.pop(0)
+            t0, v0 = ring[0]
+            dt = now - t0
+            if dt > 0 and v >= v0:
+                self.r_d[vnic] = (v - v0) * 8 / dt
+
+    def rates(self):
+        """Compute r_f from the last sample() x cached class-mix."""
         rates = {}
         self.unattributed = 0.0
-        for dst, total in r_d.items():
+        for dst, total in self.r_d.items():
             if total <= 0:
                 continue
-            members = by_dst.get(dst)
+            members = self.by_dst.get(dst)
             if not members:
                 self.unattributed += total
                 continue
-            wtot = sum(win.get(f, 0) for f in members)
             for f in members:
-                share = (win.get(f, 0) / wtot) if wtot > 0 \
-                    else 1.0 / len(members)
+                share = self.mix_shares.get(f, 1.0 / len(members))
                 if share > 0:
                     rates[f] = total * share
-        self.last_rates = rates
         return rates
 
 
@@ -449,32 +475,61 @@ class VQMarker:
 
 
 class Telemetry:
-    """One datagram per sender DPU per tick: {seq, ts, fs:{fsid:{s,r,e}}}."""
+    """One binary datagram per destination per tick. At a 1ms period, JSON
+    encode/decode of a per-flow-set dict is a real cost; a fixed struct is
+    an order of magnitude cheaper and smaller on the wire. Wire format:
+      header  '<HH'  = (seq_lo16, n_records)
+      record  '<64s f Q Q'  = (fsid[64], s, r_bps, e_bps)
+    fsid strings are short ('sgpu01/vf0>sgpu02/vf0|tcp' ~ 26 B); r/e use
+    uint64 because bps at 200G line rate overflows uint32.
 
-    def __init__(self, vnic_host, telemetry_ip, port):
+    Dual-cast (2026-07-11): each record goes both to the sender DPU (which
+    runs the RDMA response law + mailbox) and, for the tcp class, to the
+    sender host's pace shim, so the TCP law runs one hop closer to its
+    actuator. Destinations resolved from control.telemetry_ip (DPU) and
+    control.pace_shim (host)."""
+
+    HDR = struct.Struct("<HH")
+    REC = struct.Struct("<64sfQQ")
+
+    def __init__(self, vnic_host, telemetry_ip, port, shim_ip=None,
+                 shim_port=None):
         self.vnic_host = vnic_host        # vnic_id -> host
         self.telemetry_ip = telemetry_ip  # host -> its DPU ctl IP
         self.port = port
+        self.shim_ip = shim_ip or {}      # host -> host-side shim IP
+        self.shim_port = shim_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.seq = 0
 
+    def _pack(self, recs):
+        out = [self.HDR.pack(self.seq & 0xffff, len(recs))]
+        for fsid, s, r, e in recs:
+            out.append(self.REC.pack(fsid.encode()[:64], s, int(r), int(e)))
+        return b"".join(out)
+
     def send(self, marks, rates, ents):
         self.seq += 1
-        per_dpu = {}
+        per_dpu = {}     # dpu ip -> [records]
+        per_shim = {}    # (shim ip, port) -> [tcp records]
         for f, s in marks.items():
-            src = f.split(">")[0]
-            ip = self.telemetry_ip.get(self.vnic_host.get(src))
-            if ip is None:
-                continue
-            per_dpu.setdefault(ip, {})[f] = {
-                "s": round(s, 4),
-                "r": int(rates.get(f, 0)),
-                "e": int(ents.get(f, 0))}
-        now = time.time()
-        for ip, fs in per_dpu.items():
-            msg = {"seq": self.seq, "ts": round(now, 4), "fs": fs}
+            src, cls = f.split(">")[0], f.rsplit("|", 1)[1]
+            host = self.vnic_host.get(src)
+            rec = (f, s, rates.get(f, 0), ents.get(f, 0))
+            ip = self.telemetry_ip.get(host)
+            if ip is not None:
+                per_dpu.setdefault(ip, []).append(rec)
+            if cls == "tcp" and self.shim_port and host in self.shim_ip:
+                per_shim.setdefault((self.shim_ip[host], self.shim_port),
+                                    []).append(rec)
+        for ip, recs in per_dpu.items():
             try:
-                self.sock.sendto(json.dumps(msg).encode(), (ip, self.port))
+                self.sock.sendto(self._pack(recs), (ip, self.port))
+            except OSError:
+                pass
+        for (ip, port), recs in per_shim.items():
+            try:
+                self.sock.sendto(self._pack(recs), (ip, port))
             except OSError:
                 pass
 
@@ -517,57 +572,98 @@ def main():
     hybrid = HybridRates(
         {v["vnic_id"]: v["representor"] for v in reg["vnics"]
          if v["host"] == local_host},
-        ep.get("mix_window_s", 2.0))
+        ep.get("mix_window_s", 2.0),
+        rate_window_s=ep.get("rate_window_s", 0.006))
     sched = Scheduler(reg["policy"], line, ep["headroom"], ep["delta_demand"])
     last_seen = {}
     marker = VQMarker(v_full, v_max)
-    telem = Telemetry(vnic_host, reg["control"]["telemetry_ip"],
-                      ep["telemetry_port"])
+    ctl = reg["control"]
+    telem = Telemetry(vnic_host, ctl["telemetry_ip"], ep["telemetry_port"],
+                      shim_ip=ctl.get("shim_ip"),
+                      shim_port=ctl.get("shim_telemetry_port"))
     logf = open(args.log, "a", buffering=1)
 
+    # The slow work (megaflow dump for class-mix, policy reload, downlink
+    # speed) runs INLINE every slow_every ticks, not in a thread. A thread
+    # does NOT help: the dump's cost is CPU-bound megaflow parsing that
+    # holds the GIL, so a "background" thread still starves the fast loop
+    # AND jitters its vport sampling (measured: r_f went from a clean 6G
+    # to +-60% noise). Inline every ~200ms it costs ~1ms once per 200
+    # ticks (0.5% duty) and leaves the fast-loop cadence regular in
+    # between. The mix source is 1s-stale anyway.
+    log_every = max(1, int(ep.get("log_every_ms", 20) / (period * 1e3)))
+    slow_every = max(1, round(ep.get("slow_loop_ms", 200) / (period * 1e3)))
+    dump_ms = 0.0
+
     t_start = time.monotonic()
-    t_prev = t_start
     next_tick = t_start
-    read_ms_acc, read_ms_max, nticks = 0.0, 0.0, 0
     last_print = t_start
-    first_tick = True
     nticks_total = 0
-    last_speed = line * 1.0
+    last_speed = line
 
     while True:
         now = time.monotonic()
         if args.duration and now - t_start >= args.duration:
             break
-        r0 = time.monotonic()
-        try:
-            txt = uc.call("dpctl/dump-flows", ["type=offloaded"])
-        except (OSError, RuntimeError) as e:
-            print("rx_agent: unixctl failed (%s), fallback ovs-appctl" % e,
-                  flush=True)
-            txt = subprocess.run(
-                ["ovs-appctl", "dpctl/dump-flows", "type=offloaded"],
-                capture_output=True, text=True, check=True).stdout
-        read_ms = (time.monotonic() - r0) * 1e3
-        dt = time.monotonic() - t_prev
-        t_prev = time.monotonic()
 
-        fs_deltas, fs_present = meter.tick(txt)
-        rates = hybrid.tick(fs_deltas, fs_present, time.monotonic())
+        # ---- sample vport counters FIRST, before any slow work, so the
+        # sampling cadence is regular (set by the sleep schedule) ----
+        hybrid.sample(now, period)
+
+        # ---- slow work, inline, every slow_every ticks ----
+        if nticks_total % slow_every == 0:
+            t0 = time.monotonic()
+            try:
+                txt = uc.call("dpctl/dump-flows", ["type=offloaded"])
+            except (OSError, RuntimeError):
+                try:
+                    txt = subprocess.run(
+                        ["ovs-appctl", "dpctl/dump-flows", "type=offloaded"],
+                        capture_output=True, text=True, check=True).stdout
+                except Exception:  # noqa: BLE001
+                    txt = ""
+            if txt:
+                fs_deltas, fs_present = meter.tick(txt)
+                hybrid.update_mix(fs_deltas, fs_present, time.monotonic())
+            dump_ms = (time.monotonic() - t0) * 1e3
+            try:
+                mt = os.stat(args.registry).st_mtime
+                if mt != reg_mtime:
+                    reg_mtime = mt
+                    sched.policy = json.load(open(args.registry))["policy"]
+                    print("rx_agent: policy reloaded", flush=True)
+            except (OSError, ValueError) as e:
+                print("rx_agent: policy reload failed: %s" % e, flush=True)
+            try:
+                spd = int(open("/sys/class/net/%s/speed" % args.uplink).read())
+                if spd > 0 and spd * 1e6 != last_speed:
+                    last_speed = spd * 1e6
+                    sched.set_downlink(spd * 1e6)
+                    print("rx_agent: downlink %d Mbps -> C_root %.1fG"
+                          % (spd, sched.c_root / 1e9), flush=True)
+            except (OSError, ValueError):
+                pass
+
+        # ---- fast loop: rates -> waterfill -> VQ -> telemetry ----
+        rates = hybrid.rates()
+        dt = period
         sched_rates = {f: r for f, r in rates.items()
                        if f.rsplit("|", 1)[1] in SCHED_CLASSES}
+        # keep every PRESENT scheduled flow-set in the report even when its
+        # rate momentarily reads 0, so the sender gets a continuous s=0
+        # "fresh permit" (design §3.4) and never flaps into fail-open. The
+        # present set is the megaflow keys (by_dst), which persist across a
+        # brief zero-rate tick; without this a 1ms loop dropped cap-limited
+        # flows on RP burst gaps and death-spiralled into fail-open.
+        for members in hybrid.by_dst.values():
+            for f in members:
+                if (f.rsplit("|", 1)[1] in SCHED_CLASSES
+                        and f not in sched_rates):
+                    sched_rates[f] = 0.0
         if args.meter_only:
             ents, marks = {}, {}
-            stage_us = (0, 0)
         else:
-            _i0 = time.monotonic()
-            # share-floored demand (2026-07-10, user-approved direction
-            # after F3's zero-sum lesson): D = max(r(1+delta), s_hat) -
-            # a dipping flow's recovery headroom is funded by its OWN
-            # entitled share s_hat (all-active-infinite fill), never by
-            # siblings' usable share; bounded by the share, so no
-            # F1-style lock-in. Idle > grace drops the floor so
-            # borrowing opens as before.
-            nowm = time.monotonic()
+            nowm = now
             for f in sched_rates:
                 last_seen[f] = nowm
             active = dict(sched_rates)
@@ -587,65 +683,30 @@ def main():
                 demand = {f: r * (1.0 + ep["delta_demand"])
                           for f, r in active.items()}
             ents, ceils = sched.entitlements(active, demand)
-            _i1 = time.monotonic()
             marks = marker.step(sched_rates, ents, ceils, dt)
             telem.send(marks, sched_rates, ents)
-            _i2 = time.monotonic()
-            stage_us = (int((_i1 - _i0) * 1e6), int((_i2 - _i1) * 1e6))
 
-        if not first_tick:
+        # throttled logging (default ~50 Hz), never every 1ms tick
+        if nticks_total % log_every == 0 and nticks_total:
             rec = {"ts": round(time.time(), 4), "dt_s": round(dt, 6),
-                   "read_ms": round(read_ms, 3),
-                   "nfs": len(sched_rates),
-                   "us": stage_us if not args.meter_only else (0, 0),
+                   "read_ms": round(dump_ms, 3), "nfs": len(sched_rates),
                    "r": {f: int(v) for f, v in rates.items()},
                    "e": {f: int(v) for f, v in ents.items()},
                    "s": {f: round(v, 4) for f, v in marks.items()},
                    "vq": {f: int(v) for f, v in marker.vq.items()}}
             logf.write(json.dumps(rec) + "\n")
-        first_tick = False
 
-        # policy hot-reload on registry mtime change
-        try:
-            mt = os.stat(args.registry).st_mtime
-            if mt != reg_mtime:
-                reg_mtime = mt
-                reg = json.load(open(args.registry))
-                sched.policy = reg["policy"]
-                print("rx_agent: policy reloaded", flush=True)
-        except (OSError, ValueError) as e:
-            print("rx_agent: policy reload failed: %s" % e, flush=True)
-
-        # live downlink speed (~1 Hz): root capacity follows renegotiation
         nticks_total += 1
-        if nticks_total % 20 == 1:
-            try:
-                spd = int(open("/sys/class/net/%s/speed" % args.uplink).read())
-                if spd > 0 and spd * 1e6 != last_speed:
-                    last_speed = spd * 1e6
-                    sched.set_downlink(last_speed)
-                    print("rx_agent: downlink %d Mbps -> C_root %.1fG"
-                          % (spd, sched.c_root / 1e9), flush=True)
-            except (OSError, ValueError):
-                pass
-
-        nticks += 1
-        read_ms_acc += read_ms
-        read_ms_max = max(read_ms_max, read_ms)
-        if time.monotonic() - last_print >= 1.0:
+        if now - last_print >= 1.0:
             act = " ".join("%s r=%.2fG e=%.2fG s=%.2f"
                            % (f, rates.get(f, 0) / 1e9,
                               ents.get(f, 0) / 1e9, marks.get(f, 0))
                            for f in sorted(marks) if rates.get(f, 0) > 0)
-            print("tick=%d read_ms avg=%.1f max=%.1f | %s"
-                  % (nticks, read_ms_acc / max(nticks, 1), read_ms_max,
-                     act or "idle"), flush=True)
-            if meter.unknown_macs:
-                print("  unknown_macs=%s" % sorted(meter.unknown_macs),
-                      flush=True)
-                meter.unknown_macs.clear()
-            last_print = time.monotonic()
-            read_ms_acc, read_ms_max, nticks = 0.0, 0.0, 0
+            print("t=%.0fs ticks/s=%d dump_ms=%.1f | %s"
+                  % (now - t_start, nticks_total // max(int(now - t_start), 1),
+                     dump_ms, act or "idle"), flush=True)
+            last_print = now
+
         next_tick += period
         sleep = next_tick - time.monotonic()
         if sleep > 0:

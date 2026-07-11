@@ -21,11 +21,34 @@ import argparse
 import json
 import os
 import socket
+import struct
 import time
 
 from fastfill import waterfill_ceilings
 
 FIFO = "/tmp/rp_fifo"   # PCC RP mailbox (batched: 0xb47c000N ft bud rate ...)
+
+# binary telemetry (must match rx_agent.Telemetry): header (seq16, n) then
+# n x (fsid[64], s float, r_bps u32, e_bps u32)
+_THDR = struct.Struct("<HH")
+_TREC = struct.Struct("<64sfQQ")
+
+
+def parse_telemetry(data):
+    """bytes -> (seq, {fsid: {'s','r','e'}}); tolerant of short buffers."""
+    if len(data) < _THDR.size:
+        return None, {}
+    seq, n = _THDR.unpack_from(data, 0)
+    recs = {}
+    off = _THDR.size
+    for _ in range(n):
+        if off + _TREC.size > len(data):
+            break
+        fb, s, r, e = _TREC.unpack_from(data, off)
+        off += _TREC.size
+        recs[fb.rstrip(b"\x00").decode("ascii", "ignore")] = {
+            "s": s, "r": r, "e": e}
+    return seq, recs
 
 
 class FlowState:
@@ -264,20 +287,32 @@ def main():
     local_host = args.local_host or reg["sender_host"]
     line = reg["line_rate_bps"]
     period = ep["period_ms"] / 1e3
+    # Period-scaling (2026-07-11): all parameters were calibrated at a 50ms
+    # reference period. To keep the SAME wall-clock behaviour at any period:
+    #   - per-period increments (A) scale by period/ref (same rate per second)
+    #   - period-count timeouts (N1/N2/m_al) scale by ref/period (same
+    #     wall-clock timeout regardless of how many ticks fit in it)
+    ref = ep.get("ref_period_ms", 50) / 1e3
+    a_scale = period / ref
+    n_scale = ref / period
     # A: same law form for both classes, per-class rate constant permitted
     # (design_e §3.5 v2.1 / Q24; M4 calibration)
     a_by_cls = ep.get("a_frac_linerate_by_class", {})
-    a_default = ep.get("a_frac_linerate", 0.0005) * line
+    a_default = ep.get("a_frac_linerate", 0.0005) * line * a_scale
 
     def A_of(fsid):
         cls = fsid.rsplit("|", 1)[1]
-        return a_by_cls.get(cls, ep.get("a_frac_linerate", 0.0005)) * line \
-            if cls in a_by_cls else a_default
+        frac = a_by_cls.get(cls) if cls in a_by_cls \
+            else ep.get("a_frac_linerate", 0.0005)
+        return frac * line * a_scale if cls in a_by_cls else a_default
     beta = ep["beta"]
-    theta_al, m_al, eps_al = ep["theta_al"], ep["m_al"], ep["eps_al"]
-    n1, n2 = ep["n1_freeze"], ep["n2_failopen"]
+    theta_al = ep["theta_al"]
+    m_al = max(1, round(ep["m_al"] * n_scale))
+    eps_al = ep["eps_al"]
+    n1 = ep["n1_freeze"] * n_scale
+    n2 = ep["n2_failopen"] * n_scale
     fast_rec = bool(ep.get("fast_recovery", False))
-    hai_after = int(ep.get("hai_after", 0))
+    hai_after = int(round(ep.get("hai_after", 0) * n_scale))
     hai_max = int(ep.get("hai_max", 8))
     floor = ctl["pace_floor_bps"]
     shim = PaceShim(ctl["pace_shim"][local_host])
@@ -313,26 +348,34 @@ def main():
         elif cls == "rdma":
             ft = flowtags.get(src)
             if ft is not None:
-                # write every tick: the RP inner loop wants a fresh rate
                 rdma_batch.append((ft, pace, r_bps))
         st.pace = pace
 
     last_print = time.monotonic()
     last_ticker = time.monotonic()
+    # RDMA FIFO write coalescing: the mailbox behind the FIFO absorbs only
+    # ~75 batches/s (13ms each, a firmware floor), so at a 1ms control period
+    # we must NOT write the FIFO every tick or it backs up with stale
+    # budgets. Instead keep the latest budget per flowtag and flush the
+    # freshest snapshot at the mailbox rate. The RDMA congestion response
+    # stays event-speed on the DPA; only the policy target is rate-limited.
+    latest_rdma = {}    # flowtag -> (budget_bps, rx_rate_bps)
+    rdma_push_s = ep.get("rdma_push_ms", 13) / 1e3
+    last_rdma_push = time.monotonic()
     while True:
         # --- telemetry-driven law ---
         try:
             data, _ = sock.recvfrom(65536)
-            msg = json.loads(data)
+            seq, recs_all = parse_telemetry(data)
         except socket.timeout:
-            msg = None
-        except (ValueError, OSError) as e:
+            seq, recs_all = None, {}
+        except OSError as e:
             print("tx_agent_e: bad telemetry: %s" % e, flush=True)
-            msg = None
+            seq, recs_all = None, {}
         now = time.monotonic()
         rdma_batch = []
-        if msg:
-            recs = {f: rec for f, rec in msg.get("fs", {}).items()
+        if recs_all:
+            recs = {f: rec for f, rec in recs_all.items()
                     if f.split(">")[0].startswith(local_host + "/")}
             fresh = []
             for fsid, rec in recs.items():
@@ -349,11 +392,19 @@ def main():
             for fsid, rec in recs.items():
                 st = flows[fsid]
                 st.last_rx = now
-                st.last_seq = msg.get("seq", -1)
+                st.last_seq = seq if seq is not None else -1
                 s, r = rec.get("s", 0.0), rec.get("r", 0)
                 st.e_last = rec.get("e", st.e_last)
-                # app-limited detection
-                if r < theta_al * st.R:
+                # app-limited detection: the app is app-limited only if it
+                # is not filling its GRANT e_f - compare r to min(R, e_f),
+                # not to R alone. With Q20's optimistic start R begins far
+                # above the grant, and (worse at 1ms) the 13ms budget-push
+                # coalescing keeps r lagging R; comparing to R alone then
+                # misfires and clamps a cap-limited flow down to r*1.1,
+                # pinning it below its cap. A transient r~0 also must not
+                # count (it would clamp R to the floor).
+                ref = min(st.R, st.e_last) if st.e_last > 0 else st.R
+                if 0 < r < theta_al * ref:
                     st.al_count += 1
                 else:
                     st.al_count = 0
@@ -442,7 +493,15 @@ def main():
                     logf.write(json.dumps(
                         {"ts": round(time.time(), 4), "fs": fsid,
                          "R": int(st.R), "mode": st.mode}) + "\n")
-        mailbox.write_batch(rdma_batch)
+        # coalesce RDMA budgets: keep the latest per flowtag, flush the
+        # freshest snapshot to the FIFO only at the mailbox rate
+        for ft, bud, rate in rdma_batch:
+            latest_rdma[ft] = (bud, rate)
+        if latest_rdma and now - last_rdma_push >= rdma_push_s:
+            mailbox.ensure_open()
+            mailbox.write_batch([(ft, bud, rate)
+                                 for ft, (bud, rate) in latest_rdma.items()])
+            last_rdma_push = now
         shim.drain_acks()
         if now - last_print >= 5.0:
             act = " ".join("%s R=%.2fG %s" % (f, st.R / 1e9, st.mode)
