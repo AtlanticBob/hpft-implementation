@@ -325,6 +325,26 @@ def main():
     hai_after = int(round(ep.get("hai_after", 0) * n_scale))
     hai_max = int(ep.get("hai_max", 8))
     probe_over = ep.get("probe_over_grant", 1.05)
+    probe_gain = ep.get("probe_gain", 2.0)
+
+    def probe_cap(ceil_f, r_now):
+        """Probe ceiling with a realization-aware margin (stress D2/D3,
+        2026-07-11). A fixed ceil*probe_over cap makes any executor that
+        realizes >1/probe_over of its pace (>95.2% at 1.05) sit above the
+        grant FOREVER: the VQ integrates the overshoot, saturates in
+        seconds and fires a periodic marking storm (3/30 D2 reps
+        collapsed; every D3c hold window was punctured). The margin only
+        exists to compensate executor under-realization (wire/budget
+        0.92-0.95 observed), so scale it by how far the wire actually is
+        from the ceiling: full margin while the flow is well below ceil,
+        linearly to zero as r reaches ceil. Fixed points (r = rho * pace):
+        rho=1.0 -> r = ceil exactly (no sustained overshoot, VQ empty);
+        rho=0.92 -> 0.966*ceil (identical to the old anchor); rho=0.95 ->
+        0.983*ceil (-1.5% vs old); rho=0.98 -> 0.993*ceil where the old
+        anchor overshot by 2.9% and stormed."""
+        margin = ceil_f * (probe_over - 1.0)
+        boost = probe_gain * max(0.0, ceil_f - r_now)
+        return ceil_f + min(margin, boost)
     floor = ctl["pace_floor_bps"]
     shim = PaceShim(ctl["pace_shim"][local_host])
     mailbox = RpMailbox(line)
@@ -474,6 +494,17 @@ def main():
                     # but geometrically, never 50x below reality in one storm.
                     if r > 0:
                         st.R = max(st.R, 0.3 * r)
+                    # policy-anchored floor: the 0.3*r bound rides a
+                    # collapsing wire down (r falls -> floor falls) and
+                    # parked budgets at 0.9-0.95G, exactly the <~1G region
+                    # where a deep-paced QP wedges into its RC stall (V1
+                    # trace t+109-113). ceil is policy-side and does not
+                    # collapse with the wire, so 0.3*ceil keeps the pace
+                    # out of the stall region no matter how long the
+                    # marking persists; policy changes move the floor
+                    # within one telemetry tick.
+                    if st.ceil_last > 0:
+                        st.R = max(st.R, 0.3 * st.ceil_last)
                     st.mode = "md"
                 elif st.al_count >= m_al:
                     if fast_rec and st.R_good < st.R:
@@ -489,8 +520,14 @@ def main():
                     # grant self-marks and starves (observed f12): fast
                     # into the grant, AI beyond it.
                     tgt = st.R_good
-                    if st.e_last > 0:
-                        tgt = min(tgt, st.e_last * 1.15)
+                    # cap the bounce with the same realization-aware margin
+                    # as AI/HAI: e*1.15 sanctioned a 15% overshoot whenever
+                    # e sat at the fair share, and the post-collapse
+                    # bounce -> overmark -> re-cut cycle rode exactly that
+                    # (stress fix validation V1, t+108 re-crush trace)
+                    anchor = st.ceil_last or st.e_last
+                    if anchor > 0:
+                        tgt = min(tgt, probe_cap(anchor, r))
                     if st.R < 0.95 * tgt:
                         st.R = min((st.R + tgt) / 2.0, tree_of(fsid))
                         # the FR jump itself makes r lag R for a tick or
@@ -523,7 +560,7 @@ def main():
                     cap = tree_of(fsid)
                     anchor = st.ceil_last or st.e_last
                     if anchor > 0:
-                        cap = min(cap, anchor * probe_over)
+                        cap = min(cap, probe_cap(anchor, r))
                     st.R = min(st.R + A_of(fsid) * mult, cap)
                     if st.al_count == 0:
                         st.R_good = max(st.R_good, st.R)

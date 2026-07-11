@@ -1,0 +1,8 @@
+Jul 11 15:02:28 localhost.localdomain python3[495445]: pace-escape sgpu01/vf0>sgpu02/vf0|rdma r=3.37G pace=1.02G dur=1s
+Jul 11 15:02:29 localhost.localdomain python3[495445]: pace-escape clear sgpu01/vf0>sgpu02/vf0|rdma r=1.60G pace=1.07G
+Jul 11 15:02:32 localhost.localdomain python3[495445]: pace-escape sgpu01/vf0>sgpu02/vf0|rdma r=2.54G pace=0.76G dur=1s
+Jul 11 15:02:33 localhost.localdomain python3[495445]: pace-escape clear sgpu01/vf0>sgpu02/vf0|rdma r=1.11G pace=0.76G
+Jul 11 15:02:39 localhost.localdomain python3[495445]: pace-escape sgpu01/vf0>sgpu02/vf0|rdma r=3.48G pace=1.08G dur=1s
+Jul 11 15:02:40 localhost.localdomain python3[495445]: pace-escape clear sgpu01/vf0>sgpu02/vf0|rdma r=1.24G pace=0.86G
+Jul 11 15:02:46 localhost.localdomain python3[495445]: pace-escape sgpu01/vf0>sgpu02/vf0|rdma r=3.02G pace=1.12G dur=1s
+Jul 11 15:02:47 localhost.localdomain python3[495445]: pace-escape clear sgpu01/vf0>sgpu02/vf0|rdma r=1.39G pace=1.00G
