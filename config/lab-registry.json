@@ -189,7 +189,7 @@
     "pace_floor_bps": 50000000
   },
   "e_params": {
-    "comment": "design_e §5.4 initial values; M4 sensitivity analysis produces the recommended set. V = v_periods * T * line_rate * headroom; V_max = vmax_over_v * V; A = a_frac_linerate * line_rate per period.",
+    "comment": "design_e 5.4 + 1ms retrofit (2026-07-11). Params calibrated at ref_period_ms; A scales by period/ref, N1/N2/m_al/hai by ref/period, V by period. period_ms is the control period.",
     "period_ms": 50,
     "delta_demand": 0.15,
     "headroom": 0.03,
@@ -211,6 +211,12 @@
     "delta_boost": 0.0,
     "peak_ref_s": 0.0,
     "share_floor": false,
-    "share_floor_grace_s": 0.5
+    "share_floor_grace_s": 0.5,
+    "ref_period_ms": 50,
+    "slow_loop_ms": 200,
+    "log_every_ms": 20,
+    "rdma_push_ms": 13,
+    "rate_window_s": 0.006,
+    "policy": null
   }
 }
