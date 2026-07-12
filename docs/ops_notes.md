@@ -123,3 +123,14 @@ sgpu02/vf0 到 50G、忘了 sgpu01/vf0（仍 20G），把流限在 20G 却误判
 流的限速：先停 tx，再删预算 `echo "0xb47c0001 <flowtag> 0 0" > rp_fifo`
 （budget=0 删除 pair），0xdeb 确认 bud=0，此后流跑裸 DCQCN（单 QP vf0
 实测 185G）。要恢复：重启 tx 即自动重下预算。
+
+## 多 VF 并发 TCP 必须用 %dev 强绑定（2026-07-12，大规模 L2）
+
+持续 4 对 RDMA+TCP 满载下，iperf3 用 `-B 10.1.N.1`（仅绑源 IP）会让
+TCP 间歇性走错 VF egress（源地址路由 + 跨对 rp_filter=2/arp_ignore=1
+的交互），接收端 per-VF netdev 计数器错记 → rx 类拆分把某 VF 的 TCP
+误记成 0（nfs 掉到 4）→ 该 TCP 遥测"断流"触发 fail-open → TCP 失控
+冲到线速。修复：`-B 10.1.N.1%dpu1vfN`（SO_BINDTODEVICE，iperf3 3.7+）
+把流钉死在指定 VF。规则：任何多 VF 并发 TCP 实验一律 %dev 强绑定。
+（这也提示一个真实加固点：混合流量下 TCP 从非零突然归零应回退 megaflow
+归因而非直接 fail-open——记为设计待议。）
