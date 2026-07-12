@@ -1,0 +1,27 @@
+Conflicting CPU frequency values detected: 2100.000000 != 799.384000. CPU Frequency is not max.
+ WARNING: BW peak won't be measured in this run.
+---------------------------------------------------------------------------------------
+                    RDMA_Write BW Test
+ Dual-port       : OFF		Device         : mlx5_6
+ Number of qps   : 1		Transport type : IB
+ Connection type : RC		Using SRQ      : OFF
+ PCIe relax order: ON		Lock-free      : OFF
+ ibv_wr* API     : ON		Using Enhanced Reorder      : OFF
+ TX depth        : 128
+ CQ Moderation   : 1
+ CQE Poll Batch  : Dynamic
+ Mtu             : 1024[B]
+ Link type       : Ethernet
+ GID index       : 3
+ Max inline data : 0[B]
+ rdma_cm QPs	 : OFF
+ Data ex. method : Ethernet
+---------------------------------------------------------------------------------------
+ local address: LID 0000 QPN 0x0356 PSN 0x672dfe RKey 0x054400 VAddr 0x007f0534640000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:01
+ remote address: LID 0000 QPN 0x0352 PSN 0x23d6ae RKey 0x054400 VAddr 0x007fb7601d3000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:02
+---------------------------------------------------------------------------------------
+ #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
+ 65536      1289032          0.00               22.53  		     0.042967
+---------------------------------------------------------------------------------------
