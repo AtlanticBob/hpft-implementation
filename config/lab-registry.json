@@ -244,6 +244,9 @@
     "policy": null,
     "probe_over_grant": 1.05,
     "probe_gain": 2.0,
-    "rdma_bud_slew_per_s": 0.35
+    "rdma_bud_slew_per_s": 0.35,
+    "law_skeleton": "miad",
+    "mi_alpha": 0.1,
+    "ad_beta": 0.01
   }
 }
