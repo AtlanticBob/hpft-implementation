@@ -130,10 +130,10 @@
     "vms": {
       "sgpu01/vf0": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 6000000000,
         "class_weights": {
-          "tcp": 1,
-          "rdma": 1
+          "rdma": 1,
+          "tcp": 1
         }
       },
       "sgpu01/vf1": {
@@ -162,10 +162,10 @@
       },
       "sgpu02/vf0": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 6000000000,
         "class_weights": {
-          "tcp": 1,
-          "rdma": 1
+          "rdma": 1,
+          "tcp": 1
         }
       },
       "sgpu02/vf1": {
@@ -245,7 +245,7 @@
     "probe_over_grant": 1.05,
     "probe_gain": 2.0,
     "rdma_bud_slew_per_s": 0.35,
-    "law_skeleton": "miad",
+    "law_skeleton": "aimd",
     "mi_alpha": 0.1,
     "ad_beta": 0.01
   }
