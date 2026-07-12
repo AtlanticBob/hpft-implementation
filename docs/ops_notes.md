@@ -110,3 +110,16 @@ rx_agent 的三条分类 OpenFlow 规则。恢复：重加 IP + 重启 rx_agent
 下发链的语义 bug（曾出现 slew=1.0 边界把下降路径短路）。速查：手写一
 条 0xb47c 批量到 rp_fifo 后再查 0xdeb——若手写也"无效"，先怀疑 tx
 每 13ms 的覆盖写，而不是 RP。
+
+## cap 变更的两个陷阱（2026-07-12，压测战役追加）
+
+**改 cap 必须两端一起改。** 发送端树 Tree_f=min(MaxRate_src, 需求)，
+所以只抬接收端 MaxRate 不生效——流被发送端 MaxRate 锁死。曾因只抬
+sgpu02/vf0 到 50G、忘了 sgpu01/vf0（仍 20G），把流限在 20G 却误判成
+"18.3G 硬件天花板"。改 cap 的脚本必须同时改 {src, dst} 两侧的 vnic。
+
+**"杀 tx_agent" 不等于"无限速"。** RP（doca_pcc）在 device 内存里保留
+每个 flowtag 上一次的预算，tx 停了它继续按旧预算 pacing。要真正取消某
+流的限速：先停 tx，再删预算 `echo "0xb47c0001 <flowtag> 0 0" > rp_fifo`
+（budget=0 删除 pair），0xdeb 确认 bud=0，此后流跑裸 DCQCN（单 QP vf0
+实测 185G）。要恢复：重启 tx 即自动重下预算。
