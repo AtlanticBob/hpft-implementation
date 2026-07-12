@@ -17,11 +17,11 @@ Conflicting CPU frequency values detected: 2100.000000 != 2700.000000. CPU Frequ
  rdma_cm QPs	 : OFF
  Data ex. method : Ethernet
 ---------------------------------------------------------------------------------------
- local address: LID 0000 QPN 0x010b PSN 0xd420b5 RKey 0x00c400 VAddr 0x007f0bdb207000
+ local address: LID 0000 QPN 0x0118 PSN 0x7a594f RKey 0x00c400 VAddr 0x007fd491087000
  GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:03:01
- remote address: LID 0000 QPN 0x0295 PSN 0x7a0db3 RKey 0x054600 VAddr 0x007f9be5401000
+ remote address: LID 0000 QPN 0x0330 PSN 0x8006a5 RKey 0x054600 VAddr 0x007f3a2477b000
  GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:02
 ---------------------------------------------------------------------------------------
  #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
- 65536      215955           0.00               1.72   		     0.003272
+ 65536      285548           0.00               2.27   		     0.004326
 ---------------------------------------------------------------------------------------

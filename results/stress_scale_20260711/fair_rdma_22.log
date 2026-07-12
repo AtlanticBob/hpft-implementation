@@ -1,4 +1,4 @@
-Conflicting CPU frequency values detected: 958.733000 != 2100.000000. CPU Frequency is not max.
+Conflicting CPU frequency values detected: 2100.000000 != 2700.000000. CPU Frequency is not max.
  WARNING: BW peak won't be measured in this run.
 ---------------------------------------------------------------------------------------
                     RDMA_Write BW Test
@@ -17,11 +17,11 @@ Conflicting CPU frequency values detected: 958.733000 != 2100.000000. CPU Freque
  rdma_cm QPs	 : OFF
  Data ex. method : Ethernet
 ---------------------------------------------------------------------------------------
- local address: LID 0000 QPN 0x02a5 PSN 0x948ac4 RKey 0x074400 VAddr 0x007f4338664000
+ local address: LID 0000 QPN 0x02af PSN 0xac6cf1 RKey 0x074400 VAddr 0x007fa9f5b12000
  GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:01
- remote address: LID 0000 QPN 0x02a9 PSN 0x5a42ba RKey 0x074500 VAddr 0x007fe147735000
+ remote address: LID 0000 QPN 0x02b5 PSN 0x191076 RKey 0x074500 VAddr 0x007f5101b6a000
  GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:02
 ---------------------------------------------------------------------------------------
  #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
- 65536      532812           0.00               4.23   		     0.008073
+ 65536      511838           0.00               4.07   		     0.007755
 ---------------------------------------------------------------------------------------
