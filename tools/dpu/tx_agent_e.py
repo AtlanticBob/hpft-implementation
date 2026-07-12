@@ -483,20 +483,29 @@ def main():
                 # misfires and clamps a cap-limited flow down to r*1.1,
                 # pinning it below its cap. A transient r~0 also must not
                 # count (it would clamp R to the floor).
-                if law_skeleton == "miad":
-                    # ---- simple MIAD skeleton (miad-experiment) ----
+                if law_skeleton in ("miad", "mimd"):
+                    # ---- simple MI-based skeletons (miad-experiment) ----
+                    # Both do multiplicative increase, HARD-capped at the
+                    # fair-share ceiling e_hat: MI is a rate-invariant ramp
+                    # and the e_hat cap is mandatory (unbounded MI is
+                    # geometric runaway) - and, unlike AIMD's ceil*1.05,
+                    # the no-margin hard cap makes R never sit above the
+                    # ceiling, so the episodic-collapse mechanism cannot
+                    # arise (collapse-immune by construction). They differ
+                    # only in the decrease:
+                    #   miad: additive, mark-proportional (R -= ad_beta*
+                    #         line*s), line-anchored absolute step;
+                    #   mimd: multiplicative (R *= (1-beta*s)**a_scale),
+                    #         the same graded, period-scaled dose as AIMD's
+                    #         MD - rate-invariant DOWN as well as up.
                     if s > 0:
-                        # additive decrease, modulated by the graded mark
-                        # s_f (0..1): barely-over-share steps down gently,
-                        # badly-over-share (s->1) decisively. Line-anchored
-                        # absolute step (like A), period-scaled by a_scale.
-                        st.R -= ad_beta * line * a_scale * s
-                        st.mode = "ad"
+                        if law_skeleton == "mimd":
+                            st.R *= (1.0 - beta * s) ** a_scale
+                            st.mode = "md"
+                        else:
+                            st.R -= ad_beta * line * a_scale * s
+                            st.mode = "ad"
                     else:
-                        # multiplicative increase, HARD-capped at the fair-
-                        # share ceiling e_hat (simplest form, no probe
-                        # margin). MI = rate-invariant ramp; the e_hat cap
-                        # is mandatory (unbounded MI is geometric runaway).
                         cap = st.ceil_last or st.e_last or tree_of(fsid)
                         st.R = min(st.R * (1.0 + mi_alpha * a_scale), cap)
                         st.mode = "mi"
