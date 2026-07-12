@@ -622,21 +622,28 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 						adj = lim;
 					if (adj < -lim)
 						adj = -lim;
+					/* aggregate dig-guard (replaces the per-QP floor
+					 * bud>>2). level is PER-QP: results->rate =
+					 * min(cc,level) is applied to each of the pair's N
+					 * QPs, so the aggregate wire ~= N x level and the
+					 * equilibrium level is budget/N. A fixed per-QP floor
+					 * is multiplied by N, so bud>>2 let a 1024-QP flow
+					 * escape to line rate under a 20G cap (stress L3
+					 * 2026-07-12: 1024 QP -> 197G). The collapse the floor
+					 * must prevent is the AGGREGATE wire digging to near
+					 * zero in apply-lag; guard on the measured aggregate rs
+					 * instead: only dig while rs is still above bud>>2.
+					 * This floors the AGGREGATE at bud>>2 for any QP count,
+					 * so a 1024-QP flow converges to budget/1024 per QP
+					 * instead of being pinned at bud>>2 per QP, while a
+					 * single flow (aggregate == level) still stops digging
+					 * at ~25% of budget as before. */
+					if (adj < 0 && rs <= (bud >> 2))
+						adj = 0;
 					int64_t nl = (int64_t)lvl + adj;
 
-					int64_t floor_lvl = (int64_t)(bud >> 2) + HPFT_MIN_LEVEL;
-
-					if (nl < floor_lvl)
-						nl = floor_lvl; /* dig floor: level below budget
-								 * exists to squeeze an overshooting
-								 * wire back to budget; digging past
-								 * ~25% only ever happened inside
-								 * apply-lag windows and every such
-								 * dig ended in a wire collapse, never
-								 * in convergence (stress 2026-07-11:
-								 * lvl/bud 0.05-0.09 preceded every
-								 * residual episode; budget already
-								 * has the law-side 0.3*ceil floor) */
+					if (nl < (int64_t)HPFT_MIN_LEVEL)
+						nl = HPFT_MIN_LEVEL;
 					if (nl > (int64_t)bud)
 						nl = bud;
 					c->level = (uint32_t)nl;
