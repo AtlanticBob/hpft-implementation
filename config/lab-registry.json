@@ -213,13 +213,13 @@
     "rate_export_ms": 5
   },
   "e_params": {
-    "comment": "design_e 5.4 + 1ms retrofit (2026-07-11). Params calibrated at ref_period_ms; A and the MD exponent scale by period/ref, N1/N2/m_al/hai by ref/period, V is a fixed bit quantity anchored at ref (NOT period-scaled). period_ms is the control period.",
+    "comment": "design_e 5.4 + 1ms retrofit (2026-07-11). Params calibrated at ref_period_ms; A and the MD exponent scale by period/ref, N1/N2/m_al/hai by ref/period, V is a fixed bit quantity anchored at ref (NOT period-scaled). period_ms is the control period. v_periods raised 2->4 2026-07-12 (D7 W2: fixes incast root-regime synchronized oscillation 48%->98%; confirmed no reclaim/cliff/collapse regression, sole cost is high-flow-count steady-state noise on the heaviest flow).",
     "period_ms": 1,
     "delta_demand": 0.15,
     "headroom": 0.03,
     "a_frac_linerate": 0.0005,
     "beta": 0.3,
-    "v_periods": 2,
+    "v_periods": 4,
     "vmax_over_v": 1.0,
     "theta_al": 0.85,
     "m_al": 10,
