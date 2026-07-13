@@ -337,6 +337,7 @@ def main():
     law_skeleton = ep.get("law_skeleton", "aimd")
     mi_alpha = ep.get("mi_alpha", 0.1)
     ad_beta = ep.get("ad_beta", 0.01)
+    ad_mode = ep.get("ad_mode", "line")   # "line" (absolute) | "ceil" (share-rel)
 
     def probe_cap(ceil_f, r_now):
         """Probe ceiling with a realization-aware margin (stress D2/D3,
@@ -503,7 +504,16 @@ def main():
                             st.R *= (1.0 - beta * s) ** a_scale
                             st.mode = "md"
                         else:
-                            st.R -= ad_beta * line * a_scale * s
+                            # MIAD additive decrease. ad_mode="line" anchors
+                            # the step to line rate (absolute) - fine at
+                            # large shares but too coarse at small ones (28fs
+                            # ~2.5G shares oscillate 0<->10G, 2026-07-13).
+                            # ad_mode="ceil" anchors it to the fair-share
+                            # ceiling so the step is scale-invariant (a
+                            # fixed fraction of the flow's own share).
+                            anchor = (st.ceil_last if ad_mode == "ceil"
+                                      and st.ceil_last > 0 else line)
+                            st.R -= ad_beta * anchor * a_scale * s
                             st.mode = "ad"
                     else:
                         cap = st.ceil_last or st.e_last or tree_of(fsid)
