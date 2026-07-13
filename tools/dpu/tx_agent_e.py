@@ -327,17 +327,22 @@ def main():
     probe_over = ep.get("probe_over_grant", 1.05)
     probe_gain = ep.get("probe_gain", 2.0)
     bud_slew_per_s = ep.get("rdma_bud_slew_per_s", 1.0)   # 1.0 = no slew
-    # MIAD experiment (branch miad-experiment). law_skeleton: "aimd" (default,
-    # the tuned production law) or "miad" (simple multiplicative-increase /
-    # additive-decrease: s=0 -> R*=(1+mi_alpha), hard-capped at e_hat; s>0 ->
-    # R-=ad_beta*line*s, additive step modulated by the graded mark. Both
-    # per-tick constants period-scale by a_scale like A. No HAI/FR/app-limited
-    # /probe-margin - the bare skeleton, to test whether MI's rate-invariant
-    # ramp fits a rate CEILING better than A's absolute step.)
-    law_skeleton = ep.get("law_skeleton", "aimd")
-    mi_alpha = ep.get("mi_alpha", 0.1)
-    ad_beta = ep.get("ad_beta", 0.01)
-    ad_mode = ep.get("ad_mode", "line")   # "line" (absolute) | "ceil" (share-rel)
+    # law_skeleton selects the response-law skeleton (fairness is set by the
+    # receiver's marking, not here, so this does not affect shares):
+    #   "mimd" (PRODUCTION, 2026-07-13): multiplicative increase hard-capped at
+    #     e_hat (s=0 -> R*=(1+mi_alpha), <= e_hat) + multiplicative
+    #     mark-proportional decrease (s>0 -> R*=(1-beta*s)^a_scale). The hard
+    #     cap gives structural collapse-immunity (R never exceeds the ceiling)
+    #     and no parameter cliff; no HAI/FR/app-limited/probe-margin needed.
+    #   "aimd" / "miad": retained runnable for comparison ONLY (see §12 of the
+    #     design doc). aimd is the former production law with its 5 refinements;
+    #     miad swaps MIMD's MD for an additive mark-proportional decrease
+    #     (ad_mode="ceil": R-=ad_beta*e_hat*a_scale*s). Comparison runs are
+    #     driven per-run by results/miad_experiment/* runners.
+    law_skeleton = ep.get("law_skeleton", "mimd")
+    mi_alpha = ep.get("mi_alpha", 0.05)
+    ad_beta = ep.get("ad_beta", 0.1)      # miad comparison only
+    ad_mode = ep.get("ad_mode", "ceil")   # miad comparison: "line"|"ceil"(share-rel)
 
     def probe_cap(ceil_f, r_now):
         """Probe ceiling with a realization-aware margin (stress D2/D3,
@@ -485,7 +490,7 @@ def main():
                 # pinning it below its cap. A transient r~0 also must not
                 # count (it would clamp R to the floor).
                 if law_skeleton in ("miad", "mimd"):
-                    # ---- simple MI-based skeletons (miad-experiment) ----
+                    # ---- MI-based skeletons: mimd=PRODUCTION, miad=comparison
                     # Both do multiplicative increase, HARD-capped at the
                     # fair-share ceiling e_hat: MI is a rate-invariant ramp
                     # and the e_hat cap is mandatory (unbounded MI is
@@ -494,11 +499,12 @@ def main():
                     # ceiling, so the episodic-collapse mechanism cannot
                     # arise (collapse-immune by construction). They differ
                     # only in the decrease:
-                    #   miad: additive, mark-proportional (R -= ad_beta*
-                    #         line*s), line-anchored absolute step;
-                    #   mimd: multiplicative (R *= (1-beta*s)**a_scale),
-                    #         the same graded, period-scaled dose as AIMD's
-                    #         MD - rate-invariant DOWN as well as up.
+                    #   mimd (production): multiplicative (R *= (1-beta*s)
+                    #         **a_scale), rate-invariant DOWN as well as up -
+                    #         scale-invariant at every share (matches AIMD at
+                    #         28fs where miad's absolute step fails);
+                    #   miad (comparison): additive, mark-proportional
+                    #         (R -= ad_beta*anchor*a_scale*s).
                     if s > 0:
                         if law_skeleton == "mimd":
                             st.R *= (1.0 - beta * s) ** a_scale
