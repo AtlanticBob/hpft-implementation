@@ -249,6 +249,10 @@
     "probe_over_grant": 1.05,
     "probe_gain": 2.0,
     "ad_beta": 0.1,
-    "ad_mode": "ceil"
+    "ad_mode": "line",
+    "md_anchor": "zero",
+    "md_floor_frac": 0.3,
+    "backlog_floor": true,
+    "backlog_theta": 0.5
   }
 }

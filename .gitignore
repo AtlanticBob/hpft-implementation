@@ -11,3 +11,15 @@ backup/
 
 # bulky raw captures kept out of history
 results/*/raw/
+
+# soak logs churn constantly; soak is disabled (no production plans)
+results/soak_20260710/*.log
+# bulk experiment data (jsonl/perftest logs); runners+analyzers+summaries are tracked
+results/*/*_rx.jsonl
+results/*/*_tx.jsonl
+results/*/*_t0.txt
+results/*/*rdma*.log
+results/*/*vf[0-9].log
+# per-run raw dumps under paper experiments (figures/CSV/scripts/docs are tracked)
+paper/*/*/runs/
+results/*/*iperf*.json
