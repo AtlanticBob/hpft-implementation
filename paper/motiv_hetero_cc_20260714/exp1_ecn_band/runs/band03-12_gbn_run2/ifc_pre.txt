@@ -1,0 +1,229 @@
+                     operational
+-------------------  -----------
+carrier-transitions  124        
+
+
+
+Detailed Counters
+====================
+    Counter            Receive        Transmit       
+    -----------------  -------------  ---------------
+    Broadcast Packets  7983           8523           
+    Multicast Packets  129854         1962983        
+    Total Octets       1587560004799  320063170601041
+    Total Packets      8303515328     251305833854   
+    Unicast Packets    8303377491     251303862348   
+
+
+
+Drop Counters
+================
+    Counter          Receive  Transmit  
+    ---------------  -------  ----------
+    ACL Drops        0        n/a       
+    Buffer Drops     45       n/a       
+    Non-Queue Drops  n/a      0         
+    Queue Drops      n/a      2180119929
+    Total Drops      8085     0         
+
+
+
+Error Counters
+=================
+    Counter           Receive  Transmit
+    ----------------  -------  --------
+    Alignment Errors  0        n/a     
+    FCS Errors        0        n/a     
+    Jabber Errors     0        n/a     
+    Length Errors     0        n/a     
+    Oversize Errors   0        n/a     
+    Symbol Errors     0        n/a     
+    Total Errors      0        0       
+    Undersize Errors  0        n/a     
+
+
+
+Packet Size Statistics
+=========================
+    Counter     Receive     Transmit    
+    ----------  ----------  ------------
+    64          166813      1839425     
+    65-127      8014975561  23364053    
+    128-255     97575111    156313528   
+    256-511     3373511     2332038     
+    512-1023    4985933     15320588    
+    1024-1518   3034037     248387055198
+    1519-2047   13517       401662      
+    2048-4095   57380       1809946     
+    4096-16383  179333680   2717397416  
+
+
+
+Ingress Buffer Statistics
+============================
+    priority-group  rx-frames   rx-buffer-discards  rx-shared-buffer-discards
+    --------------  ----------  ------------------  -------------------------
+    0               8209392784  43 Bytes            0 Bytes                  
+    1               94122544    0 Bytes             0 Bytes                  
+    2               0           0 Bytes             0 Bytes                  
+    3               0           0 Bytes             0 Bytes                  
+    4               0           0 Bytes             0 Bytes                  
+    5               0           0 Bytes             0 Bytes                  
+    6               0           0 Bytes             0 Bytes                  
+    7               0           0 Bytes             0 Bytes                  
+
+
+
+Egress Queue Statistics
+==========================
+    traffic-class  tx-frames     tx-bytes      tx-uc-buffer-discards  ecn-marked-frames  wred-discards
+    -------------  ------------  ------------  ---------------------  -----------------  -------------
+    0              238277875900  280612.27 GB  1.75 GB                9975365853         8930190286   
+    1              0             0 Bytes       0 Bytes                0                  0            
+    2              0             0 Bytes       0 Bytes                0                  0            
+    3              1631514889    1791.24 GB    224.74 MB              1574437290         0            
+    4              0             0 Bytes       0 Bytes                0                  0            
+    5              11394478187   15678.40 GB   60.69 MB               84857330           0            
+    6              1101          219.06 KB     0 Bytes                0                  0            
+    7              1963777       146.24 MB     0 Bytes                0                  0            
+
+
+
+PFC Statistics
+=================
+    switch-priority  rx-pause-frames  rx-pause-duration  tx-pause-frames  tx-pause-duration
+    ---------------  ---------------  -----------------  ---------------  -----------------
+    0                0                0                  0                0                
+    1                0                0                  0                0                
+    2                0                0                  0                0                
+    3                0                0                  0                0                
+    4                0                0                  0                0                
+    5                0                0                  0                0                
+    6                0                0                  0                0                
+    7                0                0                  0                0                
+
+
+
+Qos Port Statistics
+======================
+    Counter             Receive  Transmit   
+    ------------------  -------  -----------
+    ECN Marked Packets  n/a      11634660473
+    MC Buffer Discards  n/a      0          
+    Pause Frames        0        0          
+    Tx Wait             n/a      0          
+----
+                     operational
+-------------------  -----------
+carrier-transitions  38         
+
+
+
+Detailed Counters
+====================
+    Counter            Receive          Transmit     
+    -----------------  ---------------  -------------
+    Broadcast Packets  8527             7982         
+    Multicast Packets  129972           1962478      
+    Total Octets       332132625990661  1587696053328
+    Total Packets      262414450990     8305347894   
+    Unicast Packets    262414312491     8303377434   
+
+
+
+Drop Counters
+================
+    Counter          Receive  Transmit
+    ---------------  -------  --------
+    ACL Drops        0        n/a     
+    Buffer Drops     3        n/a     
+    Non-Queue Drops  n/a      0       
+    Queue Drops      n/a      0       
+    Total Drops      7965     0       
+
+
+
+Error Counters
+=================
+    Counter           Receive  Transmit
+    ----------------  -------  --------
+    Alignment Errors  0        n/a     
+    FCS Errors        0        n/a     
+    Jabber Errors     0        n/a     
+    Length Errors     0        n/a     
+    Oversize Errors   0        n/a     
+    Symbol Errors     0        n/a     
+    Total Errors      0        0       
+    Undersize Errors  0        n/a     
+
+
+
+Packet Size Statistics
+=========================
+    Counter     Receive       Transmit  
+    ----------  ------------  ----------
+    64          6777          1999315   
+    65-127      23451752      8014885493
+    128-255     156437138     97542879  
+    256-511     2209899       3495660   
+    512-1023    15320635      4985933   
+    1024-1518   259497415796  3034037   
+    1519-2047   401662        13517     
+    2048-4095   1809946       57380     
+    4096-16383  2717397416    179333680 
+
+
+
+Ingress Buffer Statistics
+============================
+    priority-group  rx-frames     rx-buffer-discards  rx-shared-buffer-discards
+    --------------  ------------  ------------------  -------------------------
+    0               262357386998  1 Byte              0 Bytes                  
+    1               57063992      0 Bytes             0 Bytes                  
+    2               0             0 Bytes             0 Bytes                  
+    3               0             0 Bytes             0 Bytes                  
+    4               0             0 Bytes             0 Bytes                  
+    5               0             0 Bytes             0 Bytes                  
+    6               0             0 Bytes             0 Bytes                  
+    7               0             0 Bytes             0 Bytes                  
+
+
+
+Egress Queue Statistics
+==========================
+    traffic-class  tx-frames   tx-bytes    tx-uc-buffer-discards  ecn-marked-frames  wred-discards
+    -------------  ----------  ----------  ---------------------  -----------------  -------------
+    0              7155940369  1052.47 GB  0 Bytes                0                  0            
+    1              0           0 Bytes     0 Bytes                0                  0            
+    2              0           0 Bytes     0 Bytes                0                  0            
+    3              118426827   353.31 GB   0 Bytes                0                  0            
+    4              0           0 Bytes     0 Bytes                0                  0            
+    5              271282962   17.69 GB    0 Bytes                0                  0            
+    6              757734173   55.04 GB    0 Bytes                0                  0            
+    7              1963563     146.22 MB   0 Bytes                0                  0            
+
+
+
+PFC Statistics
+=================
+    switch-priority  rx-pause-frames  rx-pause-duration  tx-pause-frames  tx-pause-duration
+    ---------------  ---------------  -----------------  ---------------  -----------------
+    0                0                0                  0                0                
+    1                0                0                  0                0                
+    2                0                0                  0                0                
+    3                0                0                  0                0                
+    4                0                0                  0                0                
+    5                0                0                  0                0                
+    6                0                0                  0                0                
+    7                0                0                  0                0                
+
+
+
+Qos Port Statistics
+======================
+    Counter             Receive  Transmit
+    ------------------  -------  --------
+    ECN Marked Packets  n/a      0       
+    MC Buffer Discards  n/a      0       
+    Pause Frames        0        0       
+    Tx Wait             n/a      0       

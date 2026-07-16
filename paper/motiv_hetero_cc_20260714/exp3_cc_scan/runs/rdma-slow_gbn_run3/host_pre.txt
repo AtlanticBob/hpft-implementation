@@ -1,0 +1,14 @@
+mlx5_6.packet_seq_err=123560
+mlx5_6.out_of_sequence=0
+mlx5_6.local_ack_timeout_err=253
+mlx5_7.packet_seq_err=136005
+mlx5_7.out_of_sequence=0
+mlx5_7.local_ack_timeout_err=204
+mlx5_8.packet_seq_err=127333
+mlx5_8.out_of_sequence=0
+mlx5_8.local_ack_timeout_err=256
+mlx5_9.packet_seq_err=129897
+mlx5_9.out_of_sequence=0
+mlx5_9.local_ack_timeout_err=252
+mlx5_3.rp_cnp_handled=33148285
+mlx5_3.rp_cnp_ignored=0

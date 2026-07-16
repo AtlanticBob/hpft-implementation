@@ -1,0 +1,14 @@
+mlx5_6.out_of_buffer=0
+mlx5_6.duplicate_request=0
+mlx5_6.implied_nak_seq_err=0
+mlx5_7.out_of_buffer=0
+mlx5_7.duplicate_request=0
+mlx5_7.implied_nak_seq_err=0
+mlx5_8.out_of_buffer=0
+mlx5_8.duplicate_request=0
+mlx5_8.implied_nak_seq_err=0
+mlx5_9.out_of_buffer=0
+mlx5_9.duplicate_request=0
+mlx5_9.implied_nak_seq_err=0
+mlx5_3.np_cnp_sent=24147450
+mlx5_3.np_ecn_marked_roce_packets=274154265
