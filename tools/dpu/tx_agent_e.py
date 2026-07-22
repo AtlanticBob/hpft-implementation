@@ -327,6 +327,22 @@ def main():
     probe_over = ep.get("probe_over_grant", 1.05)
     probe_gain = ep.get("probe_gain", 2.0)
     bud_slew_per_s = ep.get("rdma_bud_slew_per_s", 1.0)   # 1.0 = no slew
+    # law_skeleton selects the response-law skeleton (fairness is set by the
+    # receiver's marking, not here, so this does not affect shares):
+    #   "mimd" (PRODUCTION, 2026-07-13): multiplicative increase hard-capped at
+    #     e_hat (s=0 -> R*=(1+mi_alpha), <= e_hat) + multiplicative
+    #     mark-proportional decrease (s>0 -> R*=(1-beta*s)^a_scale). The hard
+    #     cap gives structural collapse-immunity (R never exceeds the ceiling)
+    #     and no parameter cliff; no HAI/FR/app-limited/probe-margin needed.
+    #   "aimd" / "miad": retained runnable for comparison ONLY (see §12 of the
+    #     design doc). aimd is the former production law with its 5 refinements;
+    #     miad swaps MIMD's MD for an additive mark-proportional decrease
+    #     (ad_mode="ceil": R-=ad_beta*e_hat*a_scale*s). Comparison runs are
+    #     driven per-run by results/miad_experiment/* runners.
+    law_skeleton = ep.get("law_skeleton", "mimd")
+    mi_alpha = ep.get("mi_alpha", 0.05)
+    ad_beta = ep.get("ad_beta", 0.1)      # miad comparison only
+    ad_mode = ep.get("ad_mode", "ceil")   # miad comparison: "line"|"ceil"(share-rel)
 
     def probe_cap(ceil_f, r_now):
         """Probe ceiling with a realization-aware margin (stress D2/D3,
@@ -372,10 +388,11 @@ def main():
 
     flows = {}   # fsid -> FlowState
     logf = open(args.log, "a", buffering=1)
-    print("tx_agent_e: local=%s T=%.0fms A=cls%s beta=%.2f tree=dynamic(§3.6) "
-          "shim=%s log=%s" % (local_host, period * 1e3, a_by_cls or a_default, beta,
-                              ctl["pace_shim"][local_host],
-                              args.log), flush=True)
+    print("tx_agent_e: local=%s T=%.0fms law=%s A=cls%s beta=%.2f "
+          "mi_alpha=%.3f ad_beta=%.3f tree=dynamic(§3.6) shim=%s log=%s"
+          % (local_host, period * 1e3, law_skeleton, a_by_cls or a_default,
+             beta, mi_alpha, ad_beta, ctl["pace_shim"][local_host],
+             args.log), flush=True)
 
     def actuate(fsid, st, r_bps, rdma_batch):
         pace = max(min(st.R, tree_of(fsid)), floor)
@@ -472,6 +489,64 @@ def main():
                 # misfires and clamps a cap-limited flow down to r*1.1,
                 # pinning it below its cap. A transient r~0 also must not
                 # count (it would clamp R to the floor).
+                if law_skeleton in ("miad", "mimd"):
+                    # ---- MI-based skeletons: mimd=PRODUCTION, miad=comparison
+                    # Both do multiplicative increase, HARD-capped at the
+                    # fair-share ceiling e_hat: MI is a rate-invariant ramp
+                    # and the e_hat cap is mandatory (unbounded MI is
+                    # geometric runaway) - and, unlike AIMD's ceil*1.05,
+                    # the no-margin hard cap makes R never sit above the
+                    # ceiling, so the episodic-collapse mechanism cannot
+                    # arise (collapse-immune by construction). They differ
+                    # only in the decrease:
+                    #   mimd (production): multiplicative (R *= (1-beta*s)
+                    #         **a_scale), rate-invariant DOWN as well as up -
+                    #         scale-invariant at every share (matches AIMD at
+                    #         28fs where miad's absolute step fails);
+                    #   miad (comparison): additive, mark-proportional
+                    #         (R -= ad_beta*anchor*a_scale*s).
+                    if s > 0:
+                        if law_skeleton == "mimd":
+                            st.R *= (1.0 - beta * s) ** a_scale
+                            st.mode = "md"
+                        else:
+                            # MIAD additive decrease. ad_mode="line" anchors
+                            # the step to line rate (absolute) - fine at
+                            # large shares but too coarse at small ones (28fs
+                            # ~2.5G shares oscillate 0<->10G, 2026-07-13).
+                            # ad_mode="ceil" anchors it to the fair-share
+                            # ceiling so the step is scale-invariant (a
+                            # fixed fraction of the flow's own share).
+                            anchor = (st.ceil_last if ad_mode == "ceil"
+                                      and st.ceil_last > 0 else line)
+                            st.R -= ad_beta * anchor * a_scale * s
+                            st.mode = "ad"
+                    else:
+                        cap = st.ceil_last or st.e_last or tree_of(fsid)
+                        st.R = min(st.R * (1.0 + mi_alpha * a_scale), cap)
+                        st.mode = "mi"
+                    # protective floor (executor anti-wedge; orthogonal to
+                    # the increase/decrease law) - keep pace out of the RP
+                    # stall region even under a persistent mark
+                    if st.ceil_last > 0:
+                        st.R = max(st.R, 0.3 * st.ceil_last)
+                    st.R = max(st.R, floor)
+                    actuate(fsid, st, r, rdma_batch)
+                    st.log_age += 1
+                    changed = (st.mode != st.log_mode or st.log_R < 0
+                               or abs(st.R - st.log_R) > 0.01 * st.log_R)
+                    if changed or st.log_age >= 20:
+                        st.log_R = st.R
+                        st.log_age = 0
+                        st.log_mode = st.mode
+                        logf.write(json.dumps(
+                            {"ts": round(time.time(), 4), "fs": fsid,
+                             "seq": st.last_seq, "s": s, "r": r,
+                             "R": int(st.R), "pace": int(st.pace),
+                             "tree": int(tree_of(fsid)), "tus": tree_us,
+                             "mode": st.mode}) + "\n")
+                    continue
+                # ---- AIMD skeleton (production default) ----
                 ref = min(st.R, st.e_last) if st.e_last > 0 else st.R
                 if 0 < r < theta_al * ref:
                     st.al_count += 1

@@ -20,6 +20,21 @@ flow-sets split equally until counters land (<=1 s). Single-class-per-VF
 scenarios (M1/M1b/M3) are exact; class-mix transitions (M2) carry <=1 s
 attribution lag - reported with M2 results.
 
+Direct class-split source (2026-07-13, --vport-meter): a DPU-local helper
+(vport_meter.c) publishes per-VF vport counters - received_ib (RoCE) and
+received_eth (kernel-path TCP+ip) octets, live in FW with no caching
+quantum, stamped by the writer in this DPU's own monotonic clock - into an
+mmap'd tmpfs file. When fresh, it replaces both the receiver-host rate
+exporter AND the total-minus-TCP subtraction: RDMA is read directly, not
+inferred, and both classes come from one point and one clock. Validated
+against host ground truth (results/measure_v2_20260713): byte-exact
+totals, incast8 steady mae 0.36% (1s bins), and it kills the subtraction
+residual that mis-reported 0.7-2G of phantom RDMA whenever TCP flowed
+while RDMA was silent. Attribution preference: vport meter > host
+exporter > megaflow mix (each stage falls back on staleness, so the
+agent runs unchanged without the helper; the helper runs as the
+hpft-vport-meter systemd unit on the receiver DPU).
+
 Implementation choice (design silent on r_f = 0): an idle flow-set's vq
 drains fast (V per period). Frozen marks would otherwise pin the sender at
 the floor after the app pauses, which contradicts fail-open intent.
@@ -28,6 +43,7 @@ Policy (weights/MaxRate) hot-reloads when the registry file mtime changes.
 """
 import argparse
 import json
+import mmap
 import os
 import re
 import socket
@@ -193,6 +209,114 @@ class FlowSetMeter:
         return fs_bytes, fs_present
 
 
+class VportMeter:
+    """Reader for the vport_meter.c shared-memory file: per-VF vport
+    counters with the ib(RoCE)/eth(kernel-path) class split, queried from
+    FW by a local helper at ~1ms and published under a per-record seqlock.
+    (t_ns, bytes) are stamped together BY THE WRITER, so like the host
+    exporter they cannot decouple bytes from time (the +-60% bug family);
+    unlike it they live in this DPU's own CLOCK_MONOTONIC domain, so no
+    cross-host, cross-clock subtraction is involved. Validated byte-exact
+    against host port_rcv_data / netdev rx_bytes (2026-07-13).
+
+    Fail-safe: a record older than STALE_S (helper dead/wedged) drops its
+    vnic out of self.fresh and the caller falls back to the old
+    attribution chain; if nothing has been fresh for >1s the mmap is
+    reopened (helper restart = new file)."""
+
+    HDR = struct.Struct("<8sII8H")
+    STALE_S = 0.1
+
+    def __init__(self, path, vport_of_vnic):
+        self.path = path
+        self.vport_of_vnic = vport_of_vnic   # local vnic_id -> esw vport
+        self.mm = None
+        self.slot_of_vnic = {}
+        self.ring = {}                       # vnic -> [(t_s, ib, eth)]
+        self.last_t = {}                     # vnic -> t_ns last ingested
+        self.fresh = set()
+        self._next_open = 0.0
+        self._last_any_fresh = 0.0
+
+    def _open(self, now):
+        if now < self._next_open:
+            return False
+        self._next_open = now + 1.0
+        self._close()
+        try:
+            f = open(self.path, "rb")
+        except OSError:
+            return False
+        try:
+            self.mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+        except (OSError, ValueError):
+            return False
+        finally:
+            f.close()
+        hdr = self.HDR.unpack_from(self.mm, 0)
+        if hdr[0] != b"HPFTVPM1":
+            self._close()
+            return False
+        slot = {hdr[3 + i]: i for i in range(hdr[1])}
+        self.slot_of_vnic = {vn: slot[vp]
+                             for vn, vp in self.vport_of_vnic.items()
+                             if vp in slot}
+        self._last_any_fresh = now
+        return True
+
+    def _close(self):
+        if self.mm is not None:
+            try:
+                self.mm.close()
+            except OSError:
+                pass
+        self.mm = None
+        self.slot_of_vnic = {}
+
+    def sample(self, now, nkeep):
+        """Ingest the newest record per local vnic; sets self.fresh."""
+        self.fresh = set()
+        if self.mm is None and not self._open(now):
+            return self.fresh
+        for vnic, slot in self.slot_of_vnic.items():
+            off = 64 + 64 * slot
+            ok = False
+            for _ in range(3):
+                s1 = struct.unpack_from("<Q", self.mm, off)[0]
+                if s1 & 1:
+                    continue        # writer mid-update
+                t_ns, rx_ib, rx_eth = struct.unpack_from(
+                    "<3Q", self.mm, off + 8)
+                if s1 == struct.unpack_from("<Q", self.mm, off)[0]:
+                    ok = True
+                    break
+            if not ok or t_ns == 0 or now - t_ns / 1e9 > self.STALE_S:
+                continue
+            self.fresh.add(vnic)
+            if t_ns != self.last_t.get(vnic):
+                self.last_t[vnic] = t_ns
+                ring = self.ring.setdefault(vnic, [])
+                ring.append((t_ns / 1e9, rx_ib, rx_eth))
+                while len(ring) > nkeep:
+                    ring.pop(0)
+        if self.fresh:
+            self._last_any_fresh = now
+        elif self.mm is not None and now - self._last_any_fresh > 1.0:
+            self._close()           # helper restarted? force reopen
+        return self.fresh
+
+    def rates(self, vnic):
+        """(rdma_bps, kern_bps) over the sample window, or None."""
+        ring = self.ring.get(vnic)
+        if not ring or len(ring) < 2:
+            return None
+        (t0, ib0, e0), (t1, ib1, e1) = ring[0], ring[-1]
+        dt = t1 - t0
+        if dt <= 0 or ib1 < ib0 or e1 < e0:
+            return None
+        return ((ib1 - ib0) * 8 / dt, (e1 - e0) * 8 / dt)
+
+
 class HybridRates:
     """r_f = fresh per-dst-VF vport rate x windowed megaflow byte share
     (see module docstring).
@@ -206,10 +330,13 @@ class HybridRates:
     itself 1s-stale; between refreshes the fast path reuses cached shares.
     """
 
-    def __init__(self, rep_of_vnic, mix_window_s, rate_window_s=0.006):
+    def __init__(self, rep_of_vnic, mix_window_s, rate_window_s=0.006,
+                 meter=None):
         self.rep_of_vnic = rep_of_vnic    # local vnic_id -> representor dev
         self.window = mix_window_s
         self.rate_window = rate_window_s
+        self.meter = meter                # VportMeter or None
+        self.attr_meter = set()           # dsts meter-attributed this tick
         self.hist = []                    # (t, fs_delta_bytes) for the mix
         self.ring = {}                    # vnic -> deque of (t, bytes)
         self._fd = {}
@@ -289,6 +416,16 @@ class HybridRates:
             dt = now - t0
             if dt > 0 and v >= v0:
                 self.r_d[vnic] = (v - v0) * 8 / dt
+        # vport meter (direct class split): when fresh, its ib+eth sum
+        # replaces the sysfs total for the same vnic - one source, one
+        # clock, so class rates and the total can never disagree. The
+        # sysfs ring above is still maintained every tick, so a meter
+        # death fails over with a warm window.
+        if self.meter is not None:
+            for vnic in self.meter.sample(now, nkeep):
+                mr = self.meter.rates(vnic)
+                if mr is not None:
+                    self.r_d[vnic] = mr[0] + mr[1]
 
     def host_update(self, vnic, t_host_ns, rx_bytes, now):
         """Ingest one receiver-host counter snapshot for a local dst VF."""
@@ -318,16 +455,19 @@ class HybridRates:
     def rates(self, now=None):
         """Compute r_f from the last sample() x class attribution.
 
-        Class-level split prefers the receiver-host kernel counter:
-        r_kernel from the host, r_rdma = vport total - r_kernel. The
-        megaflow mix (1s HW cache, 2s window) cannot track second-scale
-        contention - it split every instant ~50/50 and mis-marked both
-        classes (M2, 2026-07-11: rx read rdma at 2.7x its true rate).
-        The mix remains the intra-class splitter for multi-sender
-        flow-sets and the whole-VF fallback when the exporter is stale."""
+        Class-level split preference: (1) vport meter - both classes read
+        directly from the per-VF ib/eth hardware buckets, no subtraction;
+        (2) receiver-host kernel counter - r_kernel from the host,
+        r_rdma = vport total - r_kernel (any TCP error pollutes RDMA);
+        (3) megaflow mix. The mix (1s HW cache, 2s window) cannot track
+        second-scale contention - it split every instant ~50/50 and
+        mis-marked both classes (M2, 2026-07-11: rx read rdma at 2.7x its
+        true rate). The mix remains the intra-class splitter for
+        multi-sender flow-sets whichever class source is active."""
         rates = {}
         self.unattributed = 0.0
         self.attr_host = set()
+        self.attr_meter = set()
         if now is None:
             now = time.monotonic()
         for dst, total in self.r_d.items():
@@ -337,16 +477,24 @@ class HybridRates:
             if not members:
                 self.unattributed += total
                 continue
-            kern = self._host_kernel_rate(dst, now)
-            if kern is None:
+            pools = None
+            if self.meter is not None and dst in self.meter.fresh:
+                mr = self.meter.rates(dst)
+                if mr is not None:
+                    pools = {"rdma": mr[0], "kern": mr[1]}
+                    self.attr_meter.add(dst)
+            if pools is None:
+                kern = self._host_kernel_rate(dst, now)
+                if kern is not None:
+                    self.attr_host.add(dst)
+                    pools = {"kern": min(kern, total)}
+                    pools["rdma"] = max(total - pools["kern"], 0.0)
+            if pools is None:
                 for f in members:
                     share = self.mix_shares.get(f, 1.0 / len(members))
                     if share > 0:
                         rates[f] = total * share
                 continue
-            self.attr_host.add(dst)
-            pools = {"kern": min(kern, total)}
-            pools["rdma"] = max(total - pools["kern"], 0.0)
             groups = {"kern": [], "rdma": []}
             for f in members:
                 cls = f.rsplit("|", 1)[1]
@@ -627,6 +775,14 @@ def main():
     ap.add_argument("--duration", type=float, default=0)
     ap.add_argument("--meter-only", action="store_true",
                     help="M0 mode: no scheduler/marks/telemetry")
+    ap.add_argument("--vport-meter", default="/dev/shm/hpft_vpm",
+                    metavar="PATH",
+                    help="vport_meter.c mmap file: direct per-VF ib/eth "
+                         "class-split counters, preferred over the host "
+                         "rate exporter when fresh (default on; the "
+                         "attribution chain degrades cleanly when the "
+                         "file is absent/stale, so no helper = old "
+                         "behavior; pass '' to disable explicitly)")
     args = ap.parse_args()
 
     reg = json.load(open(args.registry))
@@ -654,9 +810,21 @@ def main():
 
     added = install_class_rules(args.bridge)
     print("rx_agent[E]: bridge=%s rules_added=%s T=%.0fms local=%s "
-          "V=%.0fMbit log=%s meter_only=%s"
+          "V=%.0fMbit log=%s meter_only=%s vport_meter=%s"
           % (args.bridge, added or "none", period * 1e3, local_host,
-             v_full / 1e6, args.log, args.meter_only), flush=True)
+             v_full / 1e6, args.log, args.meter_only,
+             args.vport_meter or "off"), flush=True)
+
+    vpm = None
+    if args.vport_meter:
+        # esw vport number for pf<P>vf<N> is N+1 (host PF is vport 0)
+        vport_of_vnic = {}
+        for v in reg["vnics"]:
+            if v["host"] == local_host and v.get("representor"):
+                m = re.search(r"vf(\d+)$", v["representor"])
+                if m:
+                    vport_of_vnic[v["vnic_id"]] = int(m.group(1)) + 1
+        vpm = VportMeter(args.vport_meter, vport_of_vnic)
 
     uc = Unixctl()
     meter = FlowSetMeter(mac2vnic, local_macs)
@@ -664,7 +832,8 @@ def main():
         {v["vnic_id"]: v["representor"] for v in reg["vnics"]
          if v["host"] == local_host},
         ep.get("mix_window_s", 2.0),
-        rate_window_s=ep.get("rate_window_s", 0.006))
+        rate_window_s=ep.get("rate_window_s", 0.006),
+        meter=vpm)
     sched = Scheduler(reg["policy"], line, ep["headroom"], ep["delta_demand"])
     last_seen = {}
     marker = VQMarker(v_full, v_max)
@@ -791,6 +960,29 @@ def main():
                 demand = {f: max(r * (1.0 + ep["delta_demand"]),
                                  shat.get(f, 0.0))
                           for f, r in active.items()}
+            elif ep.get("backlog_floor", False):
+                # backlog-aware share floor (2026-07-13): the r*(1+delta)
+                # demand estimate caps a class at sum(per-flow demands), so a
+                # BACKLOGGED class with fewer flows (or a lower realize rate)
+                # is capped below its weighted share and the sibling class
+                # borrows the surplus -> class ratio drifts off the policy
+                # weight (28fs 3v4: RDMA/TCP 0.75). Fix: a flow realizing
+                # >= theta of its weighted share (shat, the all-backlogged
+                # fill) is backlogged -> demand=inf so it claims its full
+                # weighted class share; a genuinely idle flow (r << shat)
+                # keeps r*(1+delta) so work-conserving borrowing survives.
+                # This is the naive share_floor (which floors ALL flows and
+                # kills borrowing, sec 9 tradeoff 3) made backlog-selective.
+                shat = sched._fill({f: float("inf") for f in active})
+                theta = ep.get("backlog_theta", 0.5)
+                # a finite "big" (root capacity), NOT inf: it saturates the
+                # class demand cap exactly like inf but survives int(ceil_f)
+                # in the telemetry pack (inf overflows).
+                big = sched.c_root
+                demand = {f: (big
+                              if shat.get(f, 0.0) > 0 and r >= theta * shat[f]
+                              else r * (1.0 + ep["delta_demand"]))
+                          for f, r in active.items()}
             else:
                 demand = {f: r * (1.0 + ep["delta_demand"])
                           for f, r in active.items()}
@@ -803,6 +995,12 @@ def main():
             rec = {"ts": round(time.time(), 4), "dt_s": round(dt, 6),
                    "read_ms": round(dump_ms, 3), "nfs": len(sched_rates),
                    "ha": len(hybrid.attr_host),
+                   "ma": len(hybrid.attr_meter),
+                   # raw meter class rates per dst VF [rdma, kern]: the
+                   # direct-read numbers before any megaflow sub-split,
+                   # for offline old-vs-new attribution reconciliation
+                   "rv": {d: [int(x) for x in (vpm.rates(d) or (0, 0))]
+                          for d in hybrid.attr_meter},
                    "r": {f: int(v) for f, v in rates.items()},
                    "e": {f: int(v) for f, v in ents.items()},
                    "s": {f: round(v, 4) for f, v in marks.items()},
