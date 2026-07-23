@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Plan or apply the HPFT TCP EDT/BPF shaper."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Sequence
+
+from tcp_shaper_lib import (
+    DEFAULT_BPF_OBJECT,
+    DEFAULT_BPF_SOURCE,
+    DEFAULT_EGRESS_DEV,
+    DEFAULT_MQ_LEAF_COUNT,
+    DEFAULT_PIN_DIR,
+    DEFAULT_QDISC_MODE,
+    DEFAULT_RULES_SECTION,
+    DEFAULT_SECTION,
+    TcpShaperError,
+    apply_plan,
+    build_map_updates,
+    build_plan,
+    load_registry,
+    local_host,
+    make_generation,
+    select_rules,
+    set_bpftool_bin,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="HPFT TCP EDT/BPF shaper planner and loader")
+    parser.add_argument("--registry", required=True, help="registry JSON path")
+    parser.add_argument("--backend", default="edt-bpf", help="only edt-bpf is supported")
+    parser.add_argument("--rules-section", default=DEFAULT_RULES_SECTION, help="tcp_rules, rdma_rules, or auto")
+    parser.add_argument("--local-host", help="override registry local_host")
+    parser.add_argument("--netdev-preference", default="pf,dpu", help="accepted for DPU CLI compatibility")
+    parser.add_argument("--egress-dev", default=DEFAULT_EGRESS_DEV, help="DPU egress device to shape")
+    parser.add_argument("--bridge", help="accepted for old CLI compatibility; ignored")
+    parser.add_argument("--egress-ofport", type=int, help="accepted for old CLI compatibility; ignored")
+    parser.add_argument("--default-rate-bps", type=int, help="accepted for old CLI compatibility; ignored")
+    parser.add_argument("--pin-dir", type=Path, default=DEFAULT_PIN_DIR)
+    parser.add_argument("--bpf-source", type=Path, default=DEFAULT_BPF_SOURCE)
+    parser.add_argument("--bpf-object", type=Path, default=DEFAULT_BPF_OBJECT)
+    parser.add_argument("--bpftool", help="bpftool binary name/path; defaults to HPFT_BPFTOOL or bpftool")
+    parser.add_argument("--section", default=DEFAULT_SECTION)
+    parser.add_argument("--qdisc-mode", choices=("mq-leaf-fq", "root-fq"), default=DEFAULT_QDISC_MODE)
+    parser.add_argument("--mq-leaf-count", type=int, default=DEFAULT_MQ_LEAF_COUNT)
+    parser.add_argument("--generation", type=int, help="rate generation; defaults to time_ns when applying")
+    parser.add_argument("--json", "--plan-json", dest="json_output", action="store_true")
+    parser.add_argument("--resolve-ifindex", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compile", action="store_true", help="compile the BPF object before loading")
+    parser.add_argument("--force-compile", action="store_true", help="compile even if the object is newer")
+    parser.add_argument("--apply", action="store_true", help="change qdisc/BPF state")
+    parser.add_argument("--clear", action="store_true", help="remove qdisc/filter state for this egress device")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    set_bpftool_bin(args.bpftool)
+    if args.backend != "edt-bpf":
+        parser.error("only backend=edt-bpf is supported in the new TCP shaper")
+    if args.mq_leaf_count <= 0:
+        parser.error("--mq-leaf-count must be > 0")
+
+    registry_path = Path(args.registry)
+    try:
+        registry = load_registry(registry_path)
+        host = local_host(registry, args.local_host)
+        generation = make_generation(args.generation if args.generation is not None else (None if args.apply else 1))
+        plan = build_plan(
+            registry_path=registry_path,
+            registry=registry,
+            rules_section=args.rules_section,
+            local_host_name=host,
+            egress_dev=args.egress_dev,
+            pin_dir=args.pin_dir,
+            bpf_object=args.bpf_object,
+            section=args.section,
+            qdisc_mode=args.qdisc_mode,
+            mq_leaf_count=args.mq_leaf_count,
+            generation=generation,
+            resolve_live_ifindex=args.resolve_ifindex or args.apply,
+            clear=args.clear,
+        )
+        map_updates = []
+        if not args.clear:
+            map_updates = build_map_updates(
+                registry,
+                select_rules(registry, args.rules_section),
+                host,
+                generation,
+                args.resolve_ifindex or args.apply,
+            )
+        if args.apply or args.clear:
+            results = apply_plan(
+                plan,
+                map_updates,
+                compile_source=args.bpf_source,
+                compile_output=args.bpf_object,
+                compile_bpf=args.compile,
+                force_compile=args.force_compile,
+                clear=args.clear,
+            )
+            plan["applied"] = True
+            plan["apply_results"] = [result.as_dict() for result in results]
+        else:
+            plan["applied"] = False
+    except TcpShaperError as exc:
+        print(f"tcp-shaper-apply: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json_output:
+        print(json.dumps(plan, indent=2, sort_keys=True))
+    else:
+        print_human(plan)
+    return 0
+
+
+def print_human(plan: dict[str, object]) -> None:
+    print(f"backend={plan['backend']} egress_dev={plan['egress_dev']} applied={plan['applied']}")
+    print(f"pin_dir={plan['pin_dir']}")
+    for rule in plan.get("rules", []):
+        assert isinstance(rule, dict)
+        print(
+            "rule "
+            f"{rule['src_vnic']} -> {rule['dst_vnic']} "
+            f"rate_bps={rule['rate_bps']} burst_bytes={rule['burst_bytes']} "
+            f"generation={rule['generation']}"
+        )
+    print("commands:")
+    for command in plan.get("commands", []):
+        assert isinstance(command, dict)
+        print(f"  [{command['purpose']}] {' '.join(command['argv'])}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

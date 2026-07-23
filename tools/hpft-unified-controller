@@ -36,7 +36,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-exp-deprecated/tcp_shaper/tools")
+sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-implementation/tools/tcp_shaper/tools")
 from tcp_shaper_lib import (  # noqa: E402
     DirectBpfMapWriter,
     build_pair_cfg_update,
@@ -48,7 +48,7 @@ CAPS_PATH = "/tmp/hpft_caps.conf"
 TCP_PIN_DIR = Path("/sys/fs/bpf/hpft_tcp_edt")
 TCP_BURST_BYTES = 262_144
 DEFAULT_TCP_OBJECT = "/home/zhaoxiang/hyperfront/hpft-implementation/tcp/bpf-opt3/hpft_tcp_edt_kern.o"
-TCP_APPLY = "/home/zhaoxiang/hyperfront/hpft-exp-deprecated/tcp_shaper/tools/tcp-shaper-apply"
+TCP_APPLY = "/home/zhaoxiang/hyperfront/hpft-implementation/tools/tcp_shaper/tools/tcp-shaper-apply"
 
 
 def ssh(host, cmd):

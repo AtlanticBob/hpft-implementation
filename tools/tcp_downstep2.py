@@ -4,7 +4,7 @@ bpf() map writer (no fork, ~48us/update) so the tool overhead is excluded.
 Run as root. Only down-steps are measured (up = TCP cwnd, not the shaper)."""
 import json, sys, time, threading
 from pathlib import Path
-sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-exp-deprecated/tcp_shaper/tools")
+sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-implementation/tools/tcp_shaper/tools")
 from tcp_shaper_lib import build_pair_cfg_update, DirectBpfMapWriter, make_generation
 
 REG = "/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-tcp-registry.json"

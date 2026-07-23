@@ -19,14 +19,12 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
 `~/hyperfront/perftest-26015`、`~/hyperfront/bfb` 等外部依赖，挪动父目录
 结构会破坏这些引用。
 
-**`~/hyperfront/hpft-exp-deprecated`（第一代实现，已废弃）也是个硬依赖**，
-不只是历史存档：`tools/host/hpft_pace_shim.py`（生产在跑的 systemd 服务）、
-`tools/hpft-unified-controller`、以及几个 `tools/tcp_*` 脚本在 import 时从
-它的 `tcp_shaper/tools/tcp_shaper_lib.py` 拉库、调 `tcp-shaper-apply`。
-2026-07-23 把它从 `hpft-exp` 改名成 `hpft-exp-deprecated` 时这条依赖曾被
-路径改动打断（`hpft-pace-shim` 崩溃重启到 systemd 限流硬失败），已修复。
-**不要删除或再改名 `hpft-exp-deprecated`，除非先把 `tcp_shaper_lib.py` 和
-`tcp-shaper-apply` 迁移/vendor 进本仓库。**
+`~/hyperfront/hpft-exp-deprecated`（第一代实现，已废弃）**不再是依赖**。
+2026-07-23 改名成 `hpft-exp-deprecated` 时一度打断了 `hpft-pace-shim` 等
+几处对它的 `tcp_shaper_lib.py`/`tcp-shaper-apply` 的运行时 import——发现后
+没有只修路径，而是把这套 TCP shaper 库+CLI 完整搬进了本仓库
+`tools/tcp_shaper/`（源码原样保留，只改了引用它的几处调用点），本仓库现在
+对 `hpft-exp-deprecated` 没有任何引用，它可以被安全删除。
 
 ## 先读什么
 
@@ -82,6 +80,11 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
   采样常驻进程（`hpft-vport-meter` systemd unit）。
 - `tools/dpu/pcc/` —— DOCA PCC device 代码（RDMA 执行面，跑在 DPA 上）。
 - `tools/host/hpft_pace_shim.py` —— host 侧 BPF 写入桥（sgpu01）。
+- `tools/tcp_shaper/` —— TCP shaper 库+CLI（`tcp_shaper_lib.py`、
+  `tcp-shaper-apply`/`-controller`/`-update-rate`），`hpft_pace_shim.py`、
+  `hpft-unified-controller`、几个 `tools/tcp_*` 脚本都从这里 import；
+  原是第一代实现（`hpft-exp-deprecated`）的一部分，2026-07-23 完整迁移
+  进本仓库，源码原样保留。
 - `tools/lab-infra/vf_setup.sh` —— VF 重建脚本（`cc_mode.sh` 的
   `post_recover` 调用）。
 - `tools/cc_mode.sh` —— lab CC 模式切换（DCQCN ↔ PCC+HPFT，GBN ↔ SR）。

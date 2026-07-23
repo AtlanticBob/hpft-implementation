@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Update one active HPFT TCP EDT/BPF rate entry."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import sys
+import time
+from pathlib import Path
+from typing import Sequence
+
+from tcp_shaper_lib import (
+    DEFAULT_PIN_DIR,
+    DirectBpfMapWriter,
+    TcpShaperError,
+    build_pair_cfg_update,
+    load_registry,
+    make_generation,
+    normalize_positive_int,
+    set_bpftool_bin,
+    update_one_pair,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Update one HPFT TCP EDT/BPF pair rate")
+    parser.add_argument("--registry", required=True, help="registry JSON path")
+    parser.add_argument("--src-vnic", required=True)
+    parser.add_argument("--dst-vnic", required=True)
+    parser.add_argument("--rate-bps")
+    parser.add_argument("--burst-bytes", default=262144)
+    parser.add_argument("--generation", type=int, help="generation; defaults to time_ns")
+    parser.add_argument("--pin-dir", type=Path, default=DEFAULT_PIN_DIR)
+    parser.add_argument("--bpftool", help="bpftool binary name/path; defaults to HPFT_BPFTOOL or bpftool")
+    parser.add_argument("--update-backend", choices=("bpftool", "direct"), default="bpftool")
+    parser.add_argument("--apply", action="store_true", help="write pinned BPF maps")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--loop-count", type=int, default=0, help="perform N scheduled updates in this process")
+    parser.add_argument("--loop-hz", type=float, default=10.0, help="target update frequency for --loop-count")
+    parser.add_argument("--loop-rates-bps", help="comma-separated rates for --loop-count; defaults to --rate-bps")
+    return parser
+
+
+def update_one_pair_direct(
+    *,
+    registry: dict[str, object],
+    src_vnic: str,
+    dst_vnic: str,
+    rate_bps: int,
+    burst_bytes: int,
+    generation: int,
+    pin_dir: Path,
+    apply: bool,
+    writer: DirectBpfMapWriter | None = None,
+) -> dict[str, object]:
+    cfg_update = build_pair_cfg_update(
+        registry=registry,
+        src_vnic=src_vnic,
+        dst_vnic=dst_vnic,
+        rate_bps=rate_bps,
+        burst_bytes=burst_bytes,
+        generation=generation,
+    )
+    result: dict[str, object] = {
+        "backend": "edt-bpf",
+        "update_backend": "direct",
+        "pin_dir": str(pin_dir),
+        "updates": [cfg_update.as_dict()],
+        "applied": False,
+        "apply_results": [],
+    }
+    if not apply:
+        return result
+
+    if writer is None:
+        with DirectBpfMapWriter(pin_dir) as direct_writer:
+            latency_ns = direct_writer.update(cfg_update)
+    else:
+        latency_ns = writer.update(cfg_update)
+    result["update_latency_ns"] = latency_ns
+    result["update_done_monotonic_ns"] = time.monotonic_ns()
+    result["applied"] = True
+    return result
+
+
+def update_one_pair_selected(
+    *,
+    args: argparse.Namespace,
+    registry: dict[str, object],
+    rate_bps: int,
+    generation: int,
+    writer: DirectBpfMapWriter | None = None,
+) -> dict[str, object]:
+    burst_bytes = normalize_positive_int(args.burst_bytes, "burst_bytes")
+    if args.update_backend == "direct":
+        return update_one_pair_direct(
+            registry=registry,
+            src_vnic=args.src_vnic,
+            dst_vnic=args.dst_vnic,
+            rate_bps=rate_bps,
+            burst_bytes=burst_bytes,
+            generation=generation,
+            pin_dir=args.pin_dir,
+            apply=args.apply,
+            writer=writer,
+        )
+    result = update_one_pair(
+        registry=registry,
+        src_vnic=args.src_vnic,
+        dst_vnic=args.dst_vnic,
+        rate_bps=rate_bps,
+        burst_bytes=burst_bytes,
+        generation=generation,
+        pin_dir=args.pin_dir,
+        apply=args.apply,
+    )
+    result["update_backend"] = "bpftool"
+    return result
+
+
+def parse_loop_rates(text: str | None, fallback: str | None) -> list[int]:
+    source = text if text is not None else fallback
+    if source is None:
+        raise TcpShaperError("--rate-bps is required unless --loop-rates-bps is set")
+    rates: list[int] = []
+    for raw in source.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        rates.append(normalize_positive_int(item, "loop_rate_bps"))
+    if not rates:
+        raise TcpShaperError("at least one loop rate is required")
+    return rates
+
+
+def percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = math.ceil((pct / 100.0) * len(ordered)) - 1
+    index = max(0, min(index, len(ordered) - 1))
+    return ordered[index]
+
+
+def summarize_loop(records: list[dict[str, object]], target_interval_sec: float) -> dict[str, object]:
+    completed = [record for record in records if record["returncode"] == 0]
+    total_ms = [float(record["total_latency_ns"]) / 1_000_000 for record in completed]
+    map_ms = [
+        float(record["update_latency_ns"]) / 1_000_000
+        for record in completed
+        if record.get("update_latency_ns") is not None
+    ]
+    lateness_ms = [float(record["lateness_ns"]) / 1_000_000 for record in completed]
+    if len(completed) >= 2:
+        span_ns = int(completed[-1]["end_monotonic_ns"]) - int(completed[0]["start_monotonic_ns"])
+        achieved_hz = (len(completed) - 1) / (span_ns / 1_000_000_000) if span_ns > 0 else None
+    else:
+        achieved_hz = None
+    deadline_misses = sum(1 for record in completed if int(record["lateness_ns"]) > target_interval_sec * 1_000_000_000)
+    return {
+        "attempted": len(records),
+        "completed": len(completed),
+        "failed": len(records) - len(completed),
+        "achieved_hz": achieved_hz,
+        "target_interval_ms": target_interval_sec * 1000,
+        "deadline_misses_over_one_interval": deadline_misses,
+        "total_latency_ms": {
+            "min": min(total_ms) if total_ms else None,
+            "mean": statistics.fmean(total_ms) if total_ms else None,
+            "p50": percentile(total_ms, 50),
+            "p95": percentile(total_ms, 95),
+            "p99": percentile(total_ms, 99),
+            "max": max(total_ms) if total_ms else None,
+        },
+        "tool_update_latency_ms": {
+            "min": min(map_ms) if map_ms else None,
+            "mean": statistics.fmean(map_ms) if map_ms else None,
+            "p50": percentile(map_ms, 50),
+            "p95": percentile(map_ms, 95),
+            "p99": percentile(map_ms, 99),
+            "max": max(map_ms) if map_ms else None,
+        },
+        "lateness_ms": {
+            "min": min(lateness_ms) if lateness_ms else None,
+            "mean": statistics.fmean(lateness_ms) if lateness_ms else None,
+            "p50": percentile(lateness_ms, 50),
+            "p95": percentile(lateness_ms, 95),
+            "p99": percentile(lateness_ms, 99),
+            "max": max(lateness_ms) if lateness_ms else None,
+        },
+    }
+
+
+def loop_update(args: argparse.Namespace, registry: dict[str, object]) -> dict[str, object]:
+    if not args.apply:
+        raise TcpShaperError("--loop-count requires --apply")
+    if args.loop_count <= 0:
+        raise TcpShaperError("--loop-count must be > 0")
+    if args.loop_hz <= 0:
+        raise TcpShaperError("--loop-hz must be > 0")
+    rates = parse_loop_rates(args.loop_rates_bps, args.rate_bps)
+    interval_ns = int(1_000_000_000 / args.loop_hz)
+    start_ns = time.monotonic_ns()
+    records: list[dict[str, object]] = []
+    writer_cm = DirectBpfMapWriter(args.pin_dir) if args.update_backend == "direct" else None
+    try:
+        writer = writer_cm.__enter__() if writer_cm is not None else None
+        for index in range(args.loop_count):
+            target_ns = start_ns + index * interval_ns
+            sleep_ns = target_ns - time.monotonic_ns()
+            if sleep_ns > 0:
+                time.sleep(sleep_ns / 1_000_000_000)
+            rate_bps = rates[index % len(rates)]
+            generation = time.time_ns()
+            before = time.monotonic_ns()
+            try:
+                result = update_one_pair_selected(
+                    args=args,
+                    registry=registry,
+                    rate_bps=rate_bps,
+                    generation=generation,
+                    writer=writer,
+                )
+                returncode = 0
+                error = ""
+            except TcpShaperError as exc:
+                result = {}
+                returncode = 2
+                error = str(exc)
+            after = time.monotonic_ns()
+            records.append(
+                {
+                    "index": index,
+                    "rate_bps": rate_bps,
+                    "generation": generation,
+                    "target_monotonic_ns": target_ns,
+                    "start_monotonic_ns": before,
+                    "end_monotonic_ns": after,
+                    "target_offset_ns": target_ns - start_ns,
+                    "start_offset_ns": before - start_ns,
+                    "end_offset_ns": after - start_ns,
+                    "lateness_ns": max(0, before - target_ns),
+                    "total_latency_ns": after - before,
+                    "update_latency_ns": result.get("update_latency_ns"),
+                    "returncode": returncode,
+                    "error": error,
+                }
+            )
+            if returncode != 0:
+                break
+    finally:
+        if writer_cm is not None:
+            writer_cm.__exit__(None, None, None)
+    summary = summarize_loop(records, interval_ns / 1_000_000_000)
+    if args.update_backend == "direct":
+        summary["direct_update_latency_ms"] = summary.get("tool_update_latency_ms")
+    return {
+        "backend": "edt-bpf",
+        "update_backend": args.update_backend,
+        "loop": True,
+        "applied": True,
+        "pin_dir": str(args.pin_dir),
+        "src_vnic": args.src_vnic,
+        "dst_vnic": args.dst_vnic,
+        "loop_hz": args.loop_hz,
+        "loop_count": args.loop_count,
+        "rates_bps": rates,
+        "updates": records,
+        "summary": summary,
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    set_bpftool_bin(args.bpftool)
+    try:
+        registry = load_registry(Path(args.registry))
+        if args.loop_count:
+            result = loop_update(args, registry)
+        else:
+            if args.rate_bps is None:
+                raise TcpShaperError("--rate-bps is required")
+            result = update_one_pair_selected(
+                args=args,
+                registry=registry,
+                rate_bps=normalize_positive_int(args.rate_bps, "rate_bps"),
+                generation=make_generation(args.generation),
+            )
+    except TcpShaperError as exc:
+        print(f"tcp-shaper-update-rate: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        if result.get("loop"):
+            summary = result["summary"]
+            print(
+                f"loop updates={summary['completed']}/{summary['attempted']} "
+                f"target_hz={result['loop_hz']} achieved_hz={summary['achieved_hz']} "
+                f"applied={result['applied']}"
+            )
+        else:
+            update = result["updates"][0]["summary"]
+            print(
+                f"{update['src_vnic']} -> {update['dst_vnic']} "
+                f"rate_bps={update['rate_bps']} generation={update['generation']} "
+                f"applied={result['applied']}"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

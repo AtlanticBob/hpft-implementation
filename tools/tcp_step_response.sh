@@ -3,7 +3,7 @@
 # step the cap mid-run and measure settle time.
 set -u
 export PATH=/usr/sbin:$PATH
-cd /home/zhaoxiang/hyperfront/hpft-exp-deprecated/tcp_shaper
+cd /home/zhaoxiang/hyperfront/hpft-implementation/tools/tcp_shaper
 REG=/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-tcp-registry.json
 SRC="sgpu01/0000:38:00.1/vf0"; DST="sgpu02/0000:38:00.1/vf0"; PIN=/sys/fs/bpf/hpft_tcp_edt
 DEV=dpu1vf0
