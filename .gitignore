@@ -23,3 +23,7 @@ results/*/*vf[0-9].log
 # per-run raw dumps under paper experiments (figures/CSV/scripts/docs are tracked)
 paper/*/*/runs/
 results/*/*iperf*.json
+results/*/*_ctr.txt
+results/*/*_a.log
+results/*/*_b.log
+results/*/*_vpm.csv
