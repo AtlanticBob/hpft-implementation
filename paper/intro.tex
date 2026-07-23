@@ -1,0 +1,120 @@
+% Introduction (English draft v1, LaTeX)
+% Requires in preamble:
+%   \usepackage{xspace}
+%   \newcommand{\sys}{HyperFront\xspace}
+% Citation keys are placeholders; replace with your .bib entries.
+
+\section{Introduction}
+\label{sec:intro}
+
+In recent years, driven by the rapid growth of AI, RDMA has been widely
+deployed to serve AI/ML applications for its high bandwidth, low latency,
+and low CPU overhead. These performance benefits are now prompting cloud
+providers to bring RDMA into their public cloud networks
+\cite{azure-rdma,alibaba-erdma}.
+
+Compared with building a dedicated RDMA network, deploying RDMA inside
+the existing VPC network has obvious appeal: it adds no extra equipment
+or management overhead, and it retains full flexibility for the diverse
+needs of tenant applications. The price, however, is that RDMA traffic
+must compete for bandwidth and other network resources with the TCP
+traffic that already lives in the VPC---a competition RDMA is poorly
+equipped for. RDMA was originally designed for single-tenant
+environments with homogeneous traffic (e.g., HPC), typically assuming
+shallow-buffered fabrics where packet loss is rare; in a multi-tenant
+VPC carrying complex traffic mixes, RDMA turns out to be remarkably
+fragile. Hardware Traffic Classes (HW TCs) do support traffic isolation,
+but their scarcity means they can at best separate traffic
+\emph{types}, falling short of the dual goal of isolating both tenants
+and traffic classes; moreover, their static bandwidth weights are a poor
+match for the complex and rapidly shifting traffic patterns of a VPC.
+
+Unfair bandwidth competition with TCP arises both at the end hosts and
+at the switches. At the sending side, the bottleneck's owner and all of
+its competitors reside on the same host, so local scheduling suffices to
+resolve the contention. The genuinely hard cases are the last-hop switch
+and the receiving end, where the competing flows originate from many
+different machines.
+
+When incast occurs, TCP and RDMA compete for the egress bandwidth of the
+last-hop switch, and the heterogeneous congestion control of the two
+classes amplifies the unfairness. Take RDMA-DCQCN~\cite{dcqcn} and
+TCP-Cubic~\cite{cubic} as an example: switches typically start marking
+ECN at a queue depth well below the egress buffer limit, triggering
+DCQCN's rate reduction, whereas Cubic backs off only upon packet loss.
+RDMA thus yields far earlier than TCP, and after convergence RDMA is
+left with a very small share of the bandwidth.
+
+The bottleneck can also sit at the receiving VM: cloud providers sell
+VMs with a downlink bandwidth cap below the physical line rate. The
+common receiver-side policing practice is simply dropping excess
+packets. This bottleneck is peculiar: from the network's perspective
+there is no congestion at all---the scarcity is contractual rather than
+physical---so the policer emits none of the congestion signals that
+DCQCN depends on (in our measurements, senders received zero CNPs;
+\S\ref{sec:motivation}). RDMA is then left with only loss recovery to
+fall back on, and even lossy RDMA is far more sensitive to packet loss
+than TCP, so RDMA again converges to a very low bandwidth. ByteDance's
+JAKIRO~\cite{jakiro} proposes DHTB to address this problem, bringing
+receiver-side congestion back into the scope of congestion control. Yet,
+owing to the same CC heterogeneity, the fairness JAKIRO provides is
+neither accurate nor stable: in our experiments, the very same
+configuration randomly converges either to the fair share or to a
+runaway state in which RDMA grabs 2--3$\times$ the purchased cap, and
+whether it converges at all is dictated by how aggressive the sender's
+DCQCN recovery parameters happen to be (\S\ref{sec:motivation}). In
+other words, JAKIRO manufactures the missing signal, but outsources
+fairness to the cooperation of the tenants' congestion control.
+
+Putting the two venues of competition together, the crux of the
+unfairness problem is that each protocol's design is blind to the other
+class. When the two classes of traffic run side by side, the bandwidth
+each ends up with is merely the by-product of independently designed
+congestion-control algorithms colliding with each other---shaped by
+algorithm design and parameters, network queueing, and more---and the
+convergence point is unpredictable. EQDS~\cite{eqds} recognizes this as
+well, and therefore wraps all traffic into a unified datagram layer,
+moving queueing to the sender and having the receiver issue credits so
+that all traffic is scheduled uniformly at the end hosts. However, EQDS
+is too heavy to deploy in a VPC network to be realistic; and for
+fairness as the sole objective, its full design is far more than what is
+needed.
+
+Reflecting on the limitations of existing solutions, we argue that a
+good solution must satisfy the following requirements:
+
+\begin{itemize}
+  \item \textbf{[R1] Inter-class fairness with dual isolation:} resolve
+  the bandwidth fairness problem between RDMA and TCP in cloud networks,
+  providing both tenant-level and class-level isolation.
+  \item \textbf{[R2] (Scalability) High-performance and accurate:} must
+  not become a bottleneck on the data plane under large numbers of
+  concurrent flows, while enforcing rate limits accurately and stably.
+  \item \textbf{[R3] Deployment ready:} transparent to tenants and
+  applications---no modification to application APIs---and compatible
+  with commodity NICs and switches; in particular, for RDMA, it must
+  support diverse RDMA operations.
+\end{itemize}
+
+To this end, we present \sys, a solution focused on TCP/RDMA fairness
+that is deployable in VPC networks. Our key insight is that although the
+competition may arise either in the network or at the end host, the
+receiving end has sufficient visibility to distinguish the two, and can
+characterize the overall state of both kinds of competition---accurately
+and stably---through one unified signal. The system consists of three
+modules: the Traffic Shaper, the Traffic Meter, and the TX/RX Agents.
+The Traffic Meter runs on the receiving end and continuously measures
+the arrival rate of each \emph{flow-set} (all traffic of one class from
+one source VM to one destination VM), metering TCP and RDMA separately;
+the Traffic Shaper enforces rate limits at the sending end---driving the
+NIC's hardware scheduler for RDMA and kernel EDT pacing for TCP---both
+sitting in the infrastructure domain, invisible to tenant applications.
+On top of them, the RX Agent uses the Meter's data to quantify the
+degree of unfairness along the entire network path and feeds this signal
+back to the TX Agent; the TX Agent underpins all protocols with a
+single, CC-agnostic MIMD rate-control law that caps the sending rate of
+each flow-set and installs the caps into the Shaper.
+
+% ------------------------------------------------------------------
+% TODO (author): implementation, results, and contributions paragraphs.
+% ------------------------------------------------------------------
