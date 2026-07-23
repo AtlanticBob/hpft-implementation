@@ -9,7 +9,7 @@
 # rx_agent's OpenFlow classification rules on the receiver DPU.
 #
 # Requires the EDT program already loaded and pinned by the v1 apply tool
-# (hpft-exp tcp-shaper-apply); this script only repairs attachment drift.
+# (hpft-exp-deprecated tcp-shaper-apply); this script only repairs attachment drift.
 # pair_state seeding lives in hpft_pace_shim.py startup (restart the shim
 # after a full EDT re-apply). Idempotent; run on the sender host as root.
 set -u

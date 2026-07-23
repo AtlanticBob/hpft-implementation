@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-exp/tcp_shaper/tools")
+sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-exp-deprecated/tcp_shaper/tools")
 from tcp_shaper_lib import (  # noqa: E402
     DirectBpfMapWriter,
     build_pair_cfg_update,

@@ -4,7 +4,7 @@ minimal (4ms) smoothing to remove window-induced lag, and report the true time
 for the wire rate to cross from HIGH down to the new cap. Run as root."""
 import json, sys, time, threading
 from pathlib import Path
-sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-exp/tcp_shaper/tools")
+sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-exp-deprecated/tcp_shaper/tools")
 from tcp_shaper_lib import build_pair_cfg_update, DirectBpfMapWriter, make_generation
 REG="/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-tcp-registry.json"
 SRC="sgpu01/0000:38:00.1/vf0"; DST="sgpu02/0000:38:00.1/vf0"
