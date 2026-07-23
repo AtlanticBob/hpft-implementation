@@ -1,7 +1,9 @@
 # T3.2 — DPU-transparent TCP shaping via custom DOCA Flow app (feasibility study)
 
 Status (2026-07-06): **paused / consolidated**. This is the reference implementation
-from the T3.2 exploration. Full analysis in [`../../docs/t32_dpu_tcp_design.md`](../../docs/t32_dpu_tcp_design.md).
+from the T3.2 exploration. Full analysis (condensed) archived in
+[`../../docs/archive/superseded-designs.md`](../../docs/archive/superseded-designs.md)
+(see the "T3.2" section).
 
 ## What it is
 A standalone DOCA Flow switch-mode app that selectively punts vf0 TCP to the Arm

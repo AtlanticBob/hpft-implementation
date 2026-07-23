@@ -124,6 +124,22 @@ sgpu02/vf0 到 50G、忘了 sgpu01/vf0（仍 20G），把流限在 20G 却误判
 （budget=0 删除 pair），0xdeb 确认 bud=0，此后流跑裸 DCQCN（单 QP vf0
 实测 185G）。要恢复：重启 tx 即自动重下预算。
 
+## 常驻进程的运行环境坑（2026-07-04，来自 C1 统一 controller 交付）
+
+**需要 SSH 的进程必须在登录用户环境跑。** `qpn_resolver` 这类需要发起
+SSH 连接的组件放进 systemd 裸环境会失败——没有 `HOME`/`.ssh`，ssh 直接
+报错退出。只做 ethtool+UDP+FIFO 这类本地操作的进程（tx_agent2/rx_agent
+一类）可以正常 systemd 托管。
+
+**转瞬重启的 bind 冲突。** 常驻进程若短时间内被反复重启（调参批次），
+会撞上端口 TIME_WAIT 导致 bind 失败；修法是 `SO_REUSEADDR` + 重启前
+`systemctl reset-failed`。
+
+**当前最稳的托管方式是 keepalive wrapper（while 循环裸跑），不是
+systemd unit**——生产化时应该统一改成带正确 `Environment=` 的 systemd
+unit，但直到那一步做完之前，遇到需要 SSH 的常驻进程报"莫名其妙连不上"，
+先检查是不是登录环境缺失，而不是先怀疑网络。
+
 ## 多 VF 并发 TCP 必须用 %dev 强绑定（2026-07-12，大规模 L2）
 
 持续 4 对 RDMA+TCP 满载下，iperf3 用 `-B 10.1.N.1`（仅绑源 IP）会让

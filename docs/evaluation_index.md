@@ -64,7 +64,7 @@ B0（无隔离：TCP 37G/RDMA 147G，政策完全失效）、B1（静态半分�
 
 **a_rescan_20260710 — 全局 A 初扫。** 五档 A 值下利用率对 A 不敏感的
 首次证据，引出了"驻留欠账"的诊断（后被 grant 塌陷诊断取代，过程见
-standing_deficit_analysis.md）。
+docs/archive/tuning-and-diagnostics-log.md）。
 
 **scale_overhead_20260710 — 控制面开销与规模。** 2/8/20 个流集合下的
 分段计时：优化前调度段 1.9ms、优化后 448µs（单遍 ceiling 算法，等价性
@@ -76,8 +76,9 @@ standing_deficit_analysis.md）。
 
 ## 诊断与分析文档（docs/ 下）
 
-`standing_deficit_analysis.md` 记录了利用率缺口的诊断全过程：从"驻留
-标记"假说被数据推翻，到 grant 塌陷机理确立，再到三个候选修正的提出。
+`docs/archive/tuning-and-diagnostics-log.md`（"双类利用率欠账机理"节）
+记录了利用率缺口的诊断全过程：从"驻留标记"假说被数据推翻，到 grant
+塌陷机理确立，再到三个候选修正的提出。
 `ops_notes.md`（另见）收录全部平台缺陷与实验卫生规则。
 
 ## 与验收标准的对照

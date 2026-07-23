@@ -12,8 +12,9 @@
 公平上限 ê_f（§3.3）；②发送端两层模型（§3.6 重写）；③"统一律式"+
 per-class 速率常数（§3.5）；④收敛双指标（§5.3）。v2.2 增加：⑤响应律的
 三段式恢复行为（Q26，§3.5）；⑥参数终裁与三条实测权衡（Q27，§5.4 重写）。
-本文档是实现的唯一设计依据；实现交接见 `../HANDOFF_IMPL_E.md`。
-历史文档：方案 A（`rd_fairness_design.md`，已归档）；方案 C
+本文档是实现的唯一设计依据；实现交接记录已归档见
+`docs/archive/handoff-history.md`。
+历史文档：方案 A（已归档见 `docs/archive/superseded-designs.md`）；方案 C
 （`rd_fairness_design_c.md`，其 §4 控制律被本方案 §4.6 扩展引用、§10 EQDS
 分析被 §7 引用）。
 

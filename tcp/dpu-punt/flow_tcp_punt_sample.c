@@ -8,7 +8,7 @@
  * to the wire via a CPU doca_eth_txq (rx=tx, no loop, no crash). Bidirectional TCP
  * completes transparently at line rate when return traffic is not mis-punted.
  *
- * THE WALL (definitive, see docs/t32_dpu_tcp_design.md): under fdb_def_rule_en=1
+ * THE WALL (definitive, see docs/archive/superseded-designs.md): under fdb_def_rule_en=1
  * (needed for OVS coexistence) ONLY parser_meta type registers match at ANY pipe
  * level. Deep header fields (outer.ip4 src/dst, TCP ports, parser_meta.port_id
  * source vport) are NOT available: outer.ip4 silently matches 0 pkts (root AND

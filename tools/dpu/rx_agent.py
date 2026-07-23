@@ -540,7 +540,7 @@ def waterfill(capacity, items):
 class DemandHold:
     """F1 (standing-deficit fix, 2026-07-10): demand estimate holds the
     windowed peak so a tenant-CC dip does not instantly collapse the
-    grant (e_sum p5 was 2.4G of 6G; see standing_deficit_analysis.md).
+    grant (e_sum p5 was 2.4G of 6G; see docs/archive/tuning-and-diagnostics-log.md).
     Two half-window buckets -> peak decays within [hold/2, hold].
     Cost: borrowing reclaim is delayed by <= hold (~10 periods)."""
 
