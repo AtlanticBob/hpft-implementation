@@ -1,5 +1,0 @@
-p1.rx_bytes_phy=66562169133512
-p1.rx_packets_phy=46974754674
-p1.rx_discards_phy=0
-meter.byte_in=546456781505
-meter.pkt_in=407658171

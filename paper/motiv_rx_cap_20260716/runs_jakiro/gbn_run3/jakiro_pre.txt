@@ -1,8 +1,0 @@
-roce_to_leaf=408159744
-tcp_to_leaf=117184169
-from_leaf_green=245676865
-from_roce_borrow=265818484
-from_tcp_borrow=13848564
-ce_marked_roce_forward=187516987
-tcp_greedy_root_red_drop=3148803
-forward_to_jakiro=334678221

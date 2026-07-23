@@ -1,8 +1,0 @@
-roce_to_leaf=0
-tcp_to_leaf=0
-from_leaf_green=0
-from_roce_borrow=0
-from_tcp_borrow=0
-ce_marked_roce_forward=0
-tcp_greedy_root_red_drop=0
-forward_to_jakiro=0

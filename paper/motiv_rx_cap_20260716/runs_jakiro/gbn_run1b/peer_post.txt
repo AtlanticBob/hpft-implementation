@@ -1,6 +1,0 @@
-mlx5_3.np_cnp_sent=9260081
-mlx5_3.np_ecn_marked_roce_packets=0
-mlx5_6.out_of_sequence=3973
-mlx5_6.duplicate_request=0
-mlx5_6.packet_seq_err=0
-mlx5_6.port_rcv_data=322031798095

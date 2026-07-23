@@ -1,6 +1,0 @@
-0              13       DYNAMIC       960 Bytes      0 Bytes        61.27 MB   ALPHA_8       
-5              13       DYNAMIC       960 Bytes      42.30 MB       42.77 MB   ALPHA_1_4     
-0              13       DYNAMIC       960 Bytes      0 Bytes        61.27 MB   ALPHA_8       
-5              13       DYNAMIC       960 Bytes      41.29 MB       42.77 MB   ALPHA_1_4     
-0              13       DYNAMIC       960 Bytes      0 Bytes        61.27 MB   ALPHA_8       
-5              13       DYNAMIC       960 Bytes      41.80 MB       42.77 MB   ALPHA_1_4     
