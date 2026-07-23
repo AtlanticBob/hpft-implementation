@@ -19,13 +19,6 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
 `~/hyperfront/perftest-26015`、`~/hyperfront/bfb` 等外部依赖，挪动父目录
 结构会破坏这些引用。
 
-`~/hyperfront/hpft-exp-deprecated`（第一代实现，已废弃）**不再是依赖**。
-2026-07-23 改名成 `hpft-exp-deprecated` 时一度打断了 `hpft-pace-shim` 等
-几处对它的 `tcp_shaper_lib.py`/`tcp-shaper-apply` 的运行时 import——发现后
-没有只修路径，而是把这套 TCP shaper 库+CLI 完整搬进了本仓库
-`tools/tcp_shaper/`（源码原样保留，只改了引用它的几处调用点），本仓库现在
-对 `hpft-exp-deprecated` 没有任何引用，它可以被安全删除。
-
 ## 先读什么
 
 1. **系统设计、机制、为什么这样设计**：去 `hpft-design` 仓库的
