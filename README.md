@@ -1,51 +1,83 @@
-# HPFT Shaper v2
+# HPFT — implementation repo
 
-新一代发送端 shaper。目标与 v1(`hpft-exp`)一致,但执行点全部移到租户不可见的位置
-(VF 边界以下:NIC 调度器 / DPU),解决 v1 的透明性缺陷。
+HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟队列的
+差分标记实现云租户间/租户内 TCP-RDMA 类间的两层公平，租户透明、零数据面
+改动。这个仓库是**实现**——DPU/host agent 代码、lab 配置、工程验证数据。
 
-## 设计目标(不变)
+**2026-07-23 起项目拆成三个仓库**，各管一摊：
 
-1. 统一策略粒度 `{src_vnic_id, dst_vnic_id}`。
-2. 租户应用零修改,正常使用 RDMA verbs / TCP socket,且**感知不到 shaper 的存在**。
-3. Provider 侧发送端 shaping(pacing),不靠丢包 policing。
-4. 同一 pair 下多 QP、多进程、多 TCP flow 共享一个总 cap。
-5. 活跃长流可响应高频(≥100 Hz)限速值更新。
-
-## 架构决策(2026-07 调研结论)
-
-- **RDMA:DOCA PCC on DPA(SCR 路线)**。RNIC 的 QP scheduler 本身就是硬件
-  rate limiter;DPA 上的 PCC 算法为每个 flow 设置 dequeue rate,数据路径留在硬件。
-  参考:White-Boxing RDMA (SCR), NSDI'25。
-- **TCP:DPU Arm 用户态数据面 + EDT**(后续 phase)。被 shape 的 pair 走
-  OVS-DOCA/OVS-DPDK 例外路径进 Arm,软件 EDT pacing(移植 v1 已验证的逻辑);
-  未被 shape 的流量保持 eSwitch 硬件 offload 线速。
-- 两个 enforcer 之上是同一个 controller,键为 `{src_vnic, dst_vnic}`,沿用 v1 的
-  registry 与高频更新协议。
-
-## 当前阶段 / 接管入口
-
-> **新会话/新 agent 从 [`HANDOFF.md`](HANDOFF.md) 开始**——它是最新的单一入口
-> (状态、lab 事实、文档地图、阅读顺序、硬性规则)。本 README 记录的是初版设计意图
-> (Phase 1,DOCA 2.9/fw 32.47),已过时,仅作背景。
-
-当前:RDMA shaper(PCC/DPA)为主成果、近完成;TCP 用 host fq+edt;统一 controller 完成;
-T3.2(TCP 透明 DPU 卸载)已暂停(负结论)。细节见 HANDOFF.md。
-
-## 仓库布局
-
-- `docs/`:计划、设计、探测报告。
-- `pcc/`:PCC 探测与后续 RDMA shaper 代码(DPA device 侧 + Arm host 侧)。
-- `results/`:实验原始输出与 summary,目录名 `<probe>_<UTC日期>`。
-
-## 环境速查(2026-07-03 确认)
-
-| 项 | 值 |
+| 仓库 | 内容 |
 |---|---|
-| 本机 | sgpu01;VF `dpu1vf0..3` = 10.1.{0..3}.1/24,RDMA 设备 mlx5_6..9 |
-| 对端 | sgpu02(ssh 直达);VF 同构,10.1.{0..3}.2,vf0 = mlx5_6 |
-| DPU | `ssh hpft-dpu`(192.168.102.2,ubuntu,passwordless sudo) |
-| DOCA | 2.9.3008(Arm);PCC 参考应用 `/opt/mellanox/doca/applications/pcc/`(rp+np) |
-| DPA 工具链 | `/opt/mellanox/doca/tools/`:dpacc、dpa-clang、dpa-gdbserver、dpa-ps 等 |
-| 固件 | 32.47.2682;`USER_PROGRAMMABLE_CC=1` 已开启(无需扰动性 mlxconfig/fw reset) |
-| perftest | 两端都用 `~/hyperfront/perftest-26015/ib_write_bw`(系统 6.23 版会 crash) |
-| RDMA 基线 | vf0↔vf0 RDMA WRITE 196 Gb/s(65536B,单 QP) |
+| **hpft-v2**（本仓库） | 实现：`tools/`、`pcc/`、`tcp/`、`config/`，工程验证/回归数据（`results/`） |
+| [`hpft-design`](../hpft-design) | 设计文档：`docs/`，含系统设计的权威说明和历史决策记录 |
+| [`hpft-paper`](../hpft-paper) | 论文材料：草稿、motivation 实验包、论文评估章节引用的实验数据 |
+
+三个仓库都是从这个仓库的 git 历史用 `git filter-repo` 切出来的，各自保留了
+对应路径的完整提交历史（作者、日期、commit message 都在）。**约定放在同一个
+父目录下作兄弟目录**（`~/hyperfront/hpft-v2`、`~/hyperfront/hpft-design`、
+`~/hyperfront/hpft-paper`）——本仓库大量脚本用绝对路径引用同级的
+`~/hyperfront/perftest-26015`、`~/hyperfront/bfb` 等外部依赖，挪动父目录
+结构会破坏这些引用。
+
+## 先读什么
+
+1. **系统设计、机制、为什么这样设计**：去 `hpft-design` 仓库的
+   `docs/design_and_implementation.md`——这是唯一权威的设计文档，从头
+   讲清楚系统的样子、每个部件解决什么问题、以及为什么。
+2. **这个仓库怎么用**：往下看"现行系统"和"代码地图"两节。
+3. **动 lab 前必读**：`docs/ops_notes.md`（在 `hpft-design` 仓库）——
+   平台缺陷病历与实验卫生规则，每一条都有事故背书。
+4. **实验数据找什么、信不信得过**：`results/EXPERIMENT_STATUS.md`——
+   哪些实验是旧配置（2026-07-13/14 三个配置边界之前），结论按边界打折。
+
+## 现行系统
+
+三个服务，systemd 托管，配置来自 `config/lab-registry.json`（**repo
+副本是唯一真值**，改政策先改 repo 再下发到两台 DPU 的 `/opt/hpft/`，
+接收端 mtime 热加载 policy 段）：
+
+- 接收端 DPU（`ssh hpft-dpu2`，经 sgpu02 跳板）跑 `hpft-rxagent-e`
+  （`tools/dpu/rx_agent.py`）：vport 硬件计数器直读 → 三层 water-filling
+  → 虚拟队列标记 → 带内遥测。
+- 发送端 DPU（`ssh hpft-dpu`）跑 `hpft-txagent-e`
+  （`tools/dpu/tx_agent_e.py`）：MIMD 响应律（乘性增硬顶 ê + 乘性减，
+  MD 另有对称硬顶下限）→ 发送端树 → 执行（RDMA 走 PCC mailbox，TCP
+  经 UDP 发给 sgpu01 上的 `hpft-pace-shim` 写 BPF map）。
+- RDMA 侧执行面是 `tools/dpu/pcc/rp_rtt_template_dev_main.c`（DOCA PCC
+  device 代码，跑在 DPA 上），`rate = min(cc_rate, level)`；`cc_rate`
+  是 PCC 里自实现的 DCQCN 风格状态机（独立于 tx_agent 的 MIMD）。
+
+控制周期 1ms（`config/lab-registry.json` 的 `period_ms`）。生产参数：
+`mi_alpha=0.6`、`beta=0.15`、`v_periods=2`——具体数值和为什么这样调，
+见 `hpft-design` 仓库的 `docs/response_law_mimd_analysis.md` 和本仓库
+`results/convergence_opt_20260722/summary.md`。
+
+## 硬性规则
+
+- PCC device 码（`tools/dpu/pcc/`）改动前先备份（`backup/` 惯例）；改
+  完要 `meson setup --reconfigure build && ninja -C build pcc/doca_pcc`
+  （在 hpft-dpu 上）才会真正生效，改完不重编是常见坑。
+- TCP shaper 叫 "host fq+edt"，不叫 "opt3"；DPU 侧 TCP 卸载（原 T3.2）
+  已暂停（架构性负结论，见 `hpft-design` 仓库 `docs/archive/
+  superseded-designs.md`），除非用户重提不要重启。
+- dpu2 underlay-p1 上的分类 OpenFlow 规则、遥测通道等运行时状态，
+  重启会丢，`rx_agent`/`cc_mode.sh` 的恢复流程会自动重装，不要手工删。
+- lab 默认停留态、切换 CC 模式：`tools/cc_mode.sh status`/`dcqcn`/`pcc`
+  （用法见脚本头注释）。
+
+## 代码地图
+
+- `tools/dpu/rx_agent.py`、`tools/dpu/tx_agent_e.py` —— 现行两端 agent；
+  `tools/dpu/fastfill.py` —— 单遍 fair-share 上限算法（两端共用）；
+  `tools/dpu/vport_meter.c` —— 独立于 agent 之外的 1ms vport 计数器
+  采样常驻进程（`hpft-vport-meter` systemd unit）。
+- `tools/dpu/pcc/` —— DOCA PCC device 代码（RDMA 执行面，跑在 DPA 上）。
+- `tools/host/hpft_pace_shim.py` —— host 侧 BPF 写入桥（sgpu01）。
+- `tools/lab-infra/vf_setup.sh` —— VF 重建脚本（`cc_mode.sh` 的
+  `post_recover` 调用）。
+- `tools/cc_mode.sh` —— lab CC 模式切换（DCQCN ↔ PCC+HPFT，GBN ↔ SR）。
+- `tcp/bpf-opt3/` —— TCP 执行面（host fq+edt 的 BPF 实现）。
+- `config/lab-registry.json` —— 唯一真值配置。
+- `results/<experiment>_<UTC日期>/` —— 工程验证/回归实验产物；论文
+  评估章节引用的那部分实验已经搬到 `hpft-paper` 仓库，此处剩下的是
+  纯工程向的验证/压测数据，见 `results/EXPERIMENT_STATUS.md` 的分类。
