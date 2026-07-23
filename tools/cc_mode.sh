@@ -62,7 +62,10 @@ fw_reset_both() {
 
 post_recover() {
   echo "== VFs + MTU $VF_MTU + 100G bottleneck + lossy =="
-  bash /home/zhaoxiang/hyperfront/vf_setup.sh >/dev/null 2>&1 || true
+  bash "$REPO/tools/lab-infra/vf_setup.sh" >/dev/null 2>&1 || true
+  # sgpu02 keeps its own independent copy at this path (separate host,
+  # outside this repo's checkout) -- not touched by the local repo-relative
+  # path above.
   ssh sgpu02 'bash /home/zhaoxiang/hyperfront/vf_setup.sh >/dev/null 2>&1'
   sleep 4
   for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do sudo ip link set "$d" mtu "$VF_MTU" 2>/dev/null; done
