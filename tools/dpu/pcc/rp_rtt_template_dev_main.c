@@ -195,10 +195,19 @@ typedef struct {
 	volatile uint32_t cc_rate;		/* pair DCQCN-lite term, 2^20 units */
 	volatile uint32_t remote_cap;		/* from NP RTT response payload w2 */
 	volatile uint32_t qp_count;	/* QPs mapped to this pair (decrease norm) */
+	volatile uint32_t cnp_hits;	/* DIAG 2026-07-22: CNP events matched to THIS pair
+					 * (target>=0 && ev_type==ROCE_CNP), vs g_hpft_cnp_any
+					 * which counts CNP events reaching the callback at all -
+					 * cc_rate observed pinned at MAX under confirmed real
+					 * CNP traffic (dense-sampled, 25 queries/17s, zero
+					 * variance); splitting "seen" from "matched" isolates
+					 * whether the decrease is skipped at dispatch or at
+					 * pair lookup. */
 	volatile uint32_t b32_shard[HPFT_MAX_THREADS];
 } hpft_pair_t;
 
 static hpft_pair_t g_hpft_pairs[HPFT_PAIRS];
+static volatile uint32_t g_hpft_cnp_any;  /* DIAG: any ROCE_CNP event seen by the callback */
 #define HPFT_QPMAP_SIZE (8192)
 #define HPFT_QPMAP_PROBE (8)
 static volatile uint32_t g_qpn_key[HPFT_QPMAP_SIZE];  /* qpn+1; 0 = empty */
@@ -207,6 +216,13 @@ static volatile uint32_t g_qpn_map_active;
 static volatile uint32_t g_hpft_rtt_traces;
 static volatile uint32_t g_hpft_unknown_ft;
 static volatile uint32_t g_hpft_cc_freeze;
+static volatile uint32_t g_hpft_ccrate_only;  /* EXPERIMENT 2026-07-22: when set,
+	 * results->rate = cc_rate directly (bypass min(cc_rate,level)) -
+	 * isolates this PCC-reimplemented DCQCN-style cc_rate state machine's
+	 * own convergence behavior from the software budget (level/MIMD),
+	 * for a clean "software DCQCN" comparison point against plain
+	 * firmware DCQCN (UPCC=0) and the full HPFT system (production
+	 * min(cc_rate,level)). Default 0 = production behavior unchanged. */
 /* event-observed bytes per port (32B units, running totals, sharded).
  * The HW port counter gives exact TX bytes; the ratio port_true/port_ev is
  * the event-undersampling factor used to correct per-pair estimates. */
@@ -374,6 +390,12 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			}
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
+		if (ft == 0xb4a0u) {  /* EXPERIMENT 2026-07-22: 0xb4a0 <0|1> toggles
+					 * g_hpft_ccrate_only (rate=cc_rate directly vs
+					 * min(cc_rate,level)). Global, all pairs. */
+			g_hpft_ccrate_only = budget;
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
 		if (ft == 0xdeau) {
 			volatile uint32_t *rsp = (volatile uint32_t *)response;
 
@@ -395,6 +417,21 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[5] = c->cc_rate;
 			rsp[6] = c->dbg_epochs;
 			rsp[7] = c->remote_cap;
+			*response_size = 8 * sizeof(uint32_t);
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		if (ft == 0xdecu) {  /* DIAG 2026-07-22: CNP dispatch/match diagnostic */
+			hpft_pair_t *c = &g_hpft_pairs[budget % HPFT_PAIRS];
+			volatile uint32_t *rsp = (volatile uint32_t *)response;
+
+			rsp[0] = g_hpft_cnp_any;
+			rsp[1] = c->cnp_hits;
+			rsp[2] = c->qp_count;
+			rsp[3] = c->cc_rate;
+			rsp[4] = c->dbg_hits;
+			rsp[5] = c->flowtag;
+			rsp[6] = 0;
+			rsp[7] = 0;
 			*response_size = 8 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
@@ -444,6 +481,9 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 
 	uint32_t want_rtt = 0;
 
+	if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP)  /* DIAG 2026-07-22 */
+		g_hpft_cnp_any++;
+
 	(void)algo_ctxt;
 	(void)attr;
 	results->rtt_req = 0;
@@ -485,6 +525,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 
 		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
 			/* fabric congestion: multiplicative decrease (DCQCN-style) */
+			c->cnp_hits++;  /* DIAG 2026-07-22 */
 			uint32_t nqp = c->qp_count ? c->qp_count : 1;
 			uint32_t nr = c->cc_rate - ((c->cc_rate >> 6) / nqp);
 
@@ -666,7 +707,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		uint32_t cc = c->cc_rate;
 		uint32_t lvl = c->level;
 
-		results->rate = (cc < lvl) ? cc : lvl;
+		results->rate = g_hpft_ccrate_only ? cc : ((cc < lvl) ? cc : lvl);
 		results->rtt_req = want_rtt;
 		return;
 	}

@@ -341,6 +341,19 @@ def main():
     #     driven per-run by results/miad_experiment/* runners.
     law_skeleton = ep.get("law_skeleton", "mimd")
     mi_alpha = ep.get("mi_alpha", 0.05)
+    mi_bang = bool(ep.get("mi_bang", False))  # EXPERIMENTAL 2026-07-22: jump
+    # straight to the ceiling instead of the gradual multiplicative climb,
+    # mirroring the MD ceil_last floor. Unlike that fix (a one-sided clamp
+    # that never removed MD's own gradual decay), this removes MI's gradual
+    # approach entirely -- riskier, because e_hat/ceil_last is itself a
+    # lagging, cross-referenced water-filling output shared by every
+    # competing flow; if several flows bang-bang-jump to their own current
+    # ceil_last simultaneously (each computed assuming siblings stay put),
+    # they can jointly overshoot root capacity the instant they all move at
+    # once -- the same mechanism behind the AIMD-era relaxation oscillations.
+    # Default off; must clear an incast (multi-flow, sustained contention)
+    # check before a single-pair result is trusted (rdma_bud_slew_per_s=1.0
+    # looked clean 1:1 and starved RDMA to Jain=0.70 in incast8, same day).
     ad_beta = ep.get("ad_beta", 0.1)      # miad comparison only
     ad_mode = ep.get("ad_mode", "ceil")   # miad comparison: "line"|"ceil"(share-rel)
 
@@ -508,6 +521,20 @@ def main():
                     if s > 0:
                         if law_skeleton == "mimd":
                             st.R *= (1.0 - beta * s) ** a_scale
+                            # MD floor at the fair-share ceiling e_hat -
+                            # symmetric to MI's hard cap at e_hat from above.
+                            # Without this, a persistent mark (VQ hasn't
+                            # drained yet even after r has already fallen to
+                            # e_hat) keeps compounding R down past the
+                            # target, needing a slow MI climb back up
+                            # (2026-07-22 down-step decomposition: this
+                            # overshoot-then-recover leg was ~1s of the
+                            # ~1.3s residual). e_hat, not e_last, because
+                            # e_last is demand-capped by this flow's own r
+                            # and would reproduce the self-referential trap
+                            # MI's ceiling already avoids by the same choice.
+                            if st.ceil_last > 0:
+                                st.R = max(st.R, st.ceil_last)
                             st.mode = "md"
                         else:
                             # MIAD additive decrease. ad_mode="line" anchors
@@ -523,8 +550,12 @@ def main():
                             st.mode = "ad"
                     else:
                         cap = st.ceil_last or st.e_last or tree_of(fsid)
-                        st.R = min(st.R * (1.0 + mi_alpha * a_scale), cap)
-                        st.mode = "mi"
+                        if mi_bang and st.ceil_last > 0:
+                            st.R = cap
+                            st.mode = "mi_bang"
+                        else:
+                            st.R = min(st.R * (1.0 + mi_alpha * a_scale), cap)
+                            st.mode = "mi"
                     # protective floor (executor anti-wedge; orthogonal to
                     # the increase/decrease law) - keep pace out of the RP
                     # stall region even under a persistent mark
