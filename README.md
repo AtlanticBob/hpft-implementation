@@ -8,13 +8,13 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
 
 | 仓库 | 内容 |
 |---|---|
-| **hpft-v2**（本仓库） | 实现：`tools/`、`pcc/`、`tcp/`、`config/`，工程验证/回归数据（`results/`） |
+| **hpft-implementation**（本仓库） | 实现：`tools/`、`pcc/`、`tcp/`、`config/`，工程验证/回归数据（`results/`） |
 | [`hpft-design`](../hpft-design) | 设计文档：`docs/`，含系统设计的权威说明和历史决策记录 |
 | [`hpft-paper`](../hpft-paper) | 论文材料：草稿、motivation 实验包、论文评估章节引用的实验数据 |
 
 三个仓库都是从这个仓库的 git 历史用 `git filter-repo` 切出来的，各自保留了
 对应路径的完整提交历史（作者、日期、commit message 都在）。**约定放在同一个
-父目录下作兄弟目录**（`~/hyperfront/hpft-v2`、`~/hyperfront/hpft-design`、
+父目录下作兄弟目录**（`~/hyperfront/hpft-implementation`、`~/hyperfront/hpft-design`、
 `~/hyperfront/hpft-paper`）——本仓库大量脚本用绝对路径引用同级的
 `~/hyperfront/perftest-26015`、`~/hyperfront/bfb` 等外部依赖，挪动父目录
 结构会破坏这些引用。

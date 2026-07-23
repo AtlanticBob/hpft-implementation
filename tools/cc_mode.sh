@@ -25,7 +25,7 @@
 #  - after any fw reset the VFs, MTU, 100G bottleneck, pause/PFC must be
 #    re-applied -- this script does all of that.
 set -u
-REPO=/home/zhaoxiang/hyperfront/hpft-v2
+REPO=/home/zhaoxiang/hyperfront/hpft-implementation
 MST=/dev/mst/mt41692_pciconf0
 VF_MTU=${VF_MTU:-1500}
 

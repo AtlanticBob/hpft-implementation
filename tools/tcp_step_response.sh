@@ -4,7 +4,7 @@
 set -u
 export PATH=/usr/sbin:$PATH
 cd /home/zhaoxiang/hyperfront/hpft-exp/tcp_shaper
-REG=/home/zhaoxiang/hyperfront/hpft-v2/config/lab-tcp-registry.json
+REG=/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-tcp-registry.json
 SRC="sgpu01/0000:38:00.1/vf0"; DST="sgpu02/0000:38:00.1/vf0"; PIN=/sys/fs/bpf/hpft_tcp_edt
 DEV=dpu1vf0
 CNT=/sys/class/net/$DEV/statistics/tx_bytes

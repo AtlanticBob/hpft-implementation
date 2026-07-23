@@ -29,7 +29,7 @@ from tcp_shaper_lib import (  # noqa: E402
 )
 
 TCP_PIN_DIR = Path("/sys/fs/bpf/hpft_tcp_edt")
-TCP_REGISTRY = "/home/zhaoxiang/hyperfront/hpft-v2/config/lab-tcp-registry.json"
+TCP_REGISTRY = "/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-tcp-registry.json"
 BURST_BYTES = 262_144
 LISTEN = ("0.0.0.0", 9711)
 RE_EVNIC = re.compile(r"^(\w+)/vf(\d+)$")

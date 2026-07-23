@@ -47,7 +47,7 @@ LINE_BPS_DEFAULT = 200_000_000_000
 CAPS_PATH = "/tmp/hpft_caps.conf"
 TCP_PIN_DIR = Path("/sys/fs/bpf/hpft_tcp_edt")
 TCP_BURST_BYTES = 262_144
-DEFAULT_TCP_OBJECT = "/home/zhaoxiang/hyperfront/hpft-v2/tcp/bpf-opt3/hpft_tcp_edt_kern.o"
+DEFAULT_TCP_OBJECT = "/home/zhaoxiang/hyperfront/hpft-implementation/tcp/bpf-opt3/hpft_tcp_edt_kern.o"
 TCP_APPLY = "/home/zhaoxiang/hyperfront/hpft-exp/tcp_shaper/tools/tcp-shaper-apply"
 
 
@@ -183,8 +183,8 @@ def control_loop(rdma_reg, vnics, line, tcp):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rdma-registry", default="/home/zhaoxiang/hyperfront/hpft-v2/config/lab-registry.json")
-    ap.add_argument("--tcp-registry", default="/home/zhaoxiang/hyperfront/hpft-v2/config/lab-tcp-registry.json")
+    ap.add_argument("--rdma-registry", default="/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-registry.json")
+    ap.add_argument("--tcp-registry", default="/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-tcp-registry.json")
     ap.add_argument("--tcp-egress-dev", default="dpu1vf0")
     ap.add_argument("--tcp-bpf-object", default=DEFAULT_TCP_OBJECT)
     ap.add_argument("--apply", action="store_true")

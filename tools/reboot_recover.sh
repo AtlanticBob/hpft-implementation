@@ -16,7 +16,7 @@
 # back up. Idempotent. The per-experiment runners still restart rx/tx agents
 # and the RP themselves.
 set -u
-REPO=/home/zhaoxiang/hyperfront/hpft-v2
+REPO=/home/zhaoxiang/hyperfront/hpft-implementation
 VFS="dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3"
 
 echo "== 1/6 VFs on both hosts =="

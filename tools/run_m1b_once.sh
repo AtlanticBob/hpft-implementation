@@ -6,7 +6,7 @@ set -u
 LABEL=${1:?label}
 DUR=${2:-30}
 PT=$HOME/hyperfront/perftest-26015/ib_write_bw
-OUT=${OUT:-/home/zhaoxiang/hyperfront/hpft-v2/results/rw_sweep_20260711/runs.tsv}
+OUT=${OUT:-/home/zhaoxiang/hyperfront/hpft-implementation/results/rw_sweep_20260711/runs.tsv}
 mkdir -p "$(dirname "$OUT")"
 
 # pkill and server start in SEPARATE ssh commands (ops_notes pkill trap)
