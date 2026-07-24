@@ -28,6 +28,11 @@ set -u
 REPO=/home/zhaoxiang/hyperfront/hpft-implementation
 MST=/dev/mst/mt41692_pciconf0
 VF_MTU=${VF_MTU:-1500}
+# dpu2 p1 speed (Mb) applied by post_recover after a fw reset. Default is the
+# standing 100G bottleneck; experiments needing another speed (e.g. motiv 1.1
+# at 25G) pass P1_SPEED=25000 so the link lands there in ONE retrain instead
+# of 100G-then-flip (each extra flip risks the post-change RTT-spike disease).
+P1_SPEED=${P1_SPEED:-100000}
 
 q() { # q <host> -> "UPCC_cur SR_cur UPCC_next SR_next"
   ssh "$1" "sudo mlxconfig -e -d $MST q USER_PROGRAMMABLE_CC RDMA_SELECTIVE_REPEAT_EN 2>/dev/null" \
@@ -61,7 +66,7 @@ fw_reset_both() {
 }
 
 post_recover() {
-  echo "== VFs + MTU $VF_MTU + 100G bottleneck + lossy =="
+  echo "== VFs + MTU $VF_MTU + ${P1_SPEED}Mb bottleneck + lossy =="
   bash "$REPO/tools/lab-infra/vf_setup.sh" >/dev/null 2>&1 || true
   # sgpu02 keeps its own independent copy at this path (separate host,
   # outside this repo's checkout) -- not touched by the local repo-relative
@@ -70,7 +75,7 @@ post_recover() {
   sleep 4
   for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do sudo ip link set "$d" mtu "$VF_MTU" 2>/dev/null; done
   ssh sgpu02 "for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do sudo ip link set \$d mtu $VF_MTU 2>/dev/null; done"
-  ssh hpft-dpu2 'sudo ethtool -s p1 speed 100000 duplex full 2>/dev/null'
+  ssh hpft-dpu2 "sudo ethtool -s p1 speed $P1_SPEED duplex full 2>/dev/null"
   for h in hpft-dpu hpft-dpu2; do
     ssh $h 'for p in p0 p1; do sudo ethtool -A $p rx off tx off 2>/dev/null; sudo mlnx_qos -i $p --pfc 0,0,0,0,0,0,0,0 >/dev/null 2>&1; done'
   done
