@@ -927,7 +927,17 @@ def main():
     slow_every = max(1, round(ep.get("slow_loop_ms", 200) / (period * 1e3)))
     dump_ms = 0.0
 
-    t_start = time.monotonic()
+    # Per-tick cadence histogram. The scaling numbers say how much work a
+    # tick costs on average; they say nothing about the TAIL, and the tail
+    # is what corrupts measurement: the rate estimate is a difference over
+    # a timestamp, so a stalled loop does not merely delay a decision, it
+    # decouples bytes from time (2026-07-11: a clean 6G read as +-60%
+    # noise for exactly this reason). A GC pause would show here as a
+    # sparse population of multi-millisecond ticks that average away.
+    tick_us = []
+    tick_slow_us = []
+    tick_over = 0
+    tick_report = t_start = time.monotonic()
     next_tick = t_start
     last_print = t_start
     nticks_total = 0
@@ -1147,6 +1157,29 @@ def main():
                    "s": {f: round(v, 4) for f, v in marks.items()},
                    "vq": {f: int(v) for f, v in marker.vq.items()}}
             logf.write(json.dumps(rec) + "\n")
+
+        _tick_us = (time.monotonic() - now) * 1e6
+        # split the histogram: a tick that ran the slow loop is a
+        # different animal from one that did not, and conflating them is
+        # what makes a predictable, attributable cost look like jitter
+        (tick_slow_us if nticks_total % slow_every == 0
+         else tick_us).append(_tick_us)
+        if _tick_us > period * 1e6:
+            tick_over += 1
+        if now - tick_report >= 10.0 and tick_us:
+            q = sorted(tick_us)
+            n_ = len(q)
+            qs = sorted(tick_slow_us) or [0.0]
+            ns = len(qs)
+            print("tick_us fast n=%d p50=%.0f p90=%.0f p99=%.0f p999=%.0f "
+                  "max=%.0f | slow n=%d p50=%.0f max=%.0f | over_period=%d"
+                  % (n_, q[n_ // 2], q[int(n_ * 0.90)], q[int(n_ * 0.99)],
+                     q[min(int(n_ * 0.999), n_ - 1)], q[-1],
+                     ns, qs[ns // 2], qs[-1], tick_over), flush=True)
+            tick_us = []
+            tick_slow_us = []
+            tick_over = 0
+            tick_report = now
 
         nticks_total += 1
         if now - last_print >= 1.0:
