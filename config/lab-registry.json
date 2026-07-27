@@ -222,6 +222,7 @@
     "headroom": 0.03,
     "n1_freeze_s": 0.25,
     "n2_failopen_s": 2.0,
+    "flow_evict_s": 30,
     "telemetry_port": 9710,
     "mix_window_s": 2.0,
     "slow_loop_ms": 200,

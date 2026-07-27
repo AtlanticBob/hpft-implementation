@@ -383,6 +383,10 @@ def main():
     # the law is unaffected - purely delivery robustness, so it can be
     # slow relative to the 1 ms period.
     tcp_refresh_s = ep.get("tcp_refresh_ms", 100) / 1e3
+    # Forget a flow-set the receiver has stopped reporting for this long.
+    # Without it the table only ever grows: every flow-set ever seen stays
+    # in fail-open forever, ticking, actuating and writing budgets.
+    evict_s = ep.get("flow_evict_s", 30)
 
     def track(st, target, now):
         """track_step bound to one flow-set's wall-clock anchor."""
@@ -414,6 +418,7 @@ def main():
     sock.settimeout(period)
 
     flows = {}   # fsid -> FlowState
+    last_any_rx = time.monotonic()   # last telemetry from ANY flow-set
     logf = open(args.log, "a", buffering=1)
     print("tx_agent_e: local=%s T=%.0fms law=track k=%.1f/s (tau=%.0fms, "
           "alpha@T=%.4f) failopen=%.2f/%.1fs tree=dynamic(§4.3) shim=%s "
@@ -508,6 +513,7 @@ def main():
         now = time.monotonic()
         rdma_batch = []
         if recs_all:
+            last_any_rx = now
             recs = {f: rec for f, rec in recs_all.items()
                     if f.split(">")[0].startswith(local_host + "/")}
             fresh = []
@@ -565,6 +571,29 @@ def main():
         if now - last_ticker >= period:
             last_ticker = now
             mailbox.ensure_open()
+            # Eviction, and why it is gated on telemetry being alive: a
+            # flow-set going quiet and the telemetry channel dying look
+            # identical from one flow-set's record stream. They are told
+            # apart by everyone else - a real outage silences EVERY
+            # flow-set at once. So a flow-set is only forgotten while
+            # OTHER records are still arriving. Under a genuine outage
+            # nothing is evicted and every flow-set stays in fail-open,
+            # which is what §4.4 asks for: degraded to sender-local
+            # policy, still capped by Tree_f, never uncapped.
+            #
+            # Executor state is deliberately left alone. The RP keeps the
+            # last budget in device memory and the EDT map keeps the last
+            # rate, so a forgotten flow-set stays paced at what it last
+            # had - never faster. Releasing them would be the one way to
+            # turn eviction into an uncapped flow.
+            telemetry_alive = (now - last_any_rx) < n1_s
+            dead = [f for f, st in flows.items()
+                    if now - st.last_rx > evict_s] if telemetry_alive else []
+            for f in dead:
+                logf.write(json.dumps(
+                    {"ts": round(time.time(), 4), "fs": f,
+                     "mode": "evicted"}) + "\n")
+                del flows[f]
             for fsid, st in flows.items():
                 age = now - st.last_rx
                 if age > n2_s:
