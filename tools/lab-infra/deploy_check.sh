@@ -13,13 +13,17 @@
 set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$REPO"
-# The registry is included on purpose: runners push their own scenario
-# copy, so a mismatch here means the lab is still carrying an experiment's
-# configuration rather than the standing one. That is worth being told
-# before the next experiment inherits it.
-RX_FILES="tools/dpu/rx_agent.py tools/dpu/fastfill.py config/lab-registry.json"
-TX_FILES="tools/dpu/tx_agent_e.py tools/dpu/fastfill.py config/lab-registry.json"
+# Code mismatch is FATAL, configuration mismatch is a WARNING. Every
+# runner pushes its own scenario registry, so a strict registry check
+# makes chained runs impossible - and the failure it would be guarding
+# against is not the same kind: the wrong registry produces a
+# well-defined experiment with the wrong parameters, which the run's own
+# output shows, whereas the wrong code produces a crashed agent and
+# plausible numbers that show nothing.
+RX_FILES="tools/dpu/rx_agent.py tools/dpu/fastfill.py"
+TX_FILES="tools/dpu/tx_agent_e.py tools/dpu/fastfill.py"
 bad=0
+warn=0
 
 cmp_one() { # cmp_one <host> <repo-path>
   local h=$1 f=$2 b
@@ -36,8 +40,10 @@ cmp_one() { # cmp_one <host> <repo-path>
 
 for f in $RX_FILES; do cmp_one hpft-dpu2 "$f" || bad=1; done
 for f in $TX_FILES; do cmp_one hpft-dpu  "$f" || bad=1; done
+cmp_one hpft-dpu2 config/lab-registry.json || warn=1
+cmp_one hpft-dpu  config/lab-registry.json || warn=1
 
-if [ "${1:-}" = "--deploy" ] && [ $bad -ne 0 ]; then
+if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
   echo "== deploying =="
   for f in $RX_FILES; do scp -q "$f" hpft-dpu2:/opt/hpft/; done
   for f in $TX_FILES; do scp -q "$f" hpft-dpu:/opt/hpft/; done
@@ -48,10 +54,11 @@ if [ "${1:-}" = "--deploy" ] && [ $bad -ne 0 ]; then
     ssh "$h" 'cd /opt/hpft && gcc -O2 -shared -fPIC -o libfastfill.so fastfill.c -lm' \
       || echo "  WARN $h: libfastfill.so build failed (agent falls back to Python)"
   done
-  bad=0
+  bad=0; warn=0
   for f in $RX_FILES; do cmp_one hpft-dpu2 "$f" || bad=1; done
   for f in $TX_FILES; do cmp_one hpft-dpu  "$f" || bad=1; done
 fi
+for f in $RX_FILES; do :; done
 
 # an agent that is not running is the same class of problem
 for u in "hpft-dpu2 hpft-rxagent-e" "hpft-dpu hpft-txagent-e"; do
@@ -69,6 +76,14 @@ for u in "hpft-dpu2 hpft-rxagent-e" "hpft-dpu hpft-txagent-e"; do
   [ "${n:-0}" -eq 0 ] || { echo "  TRACEBACKS  $1/$2: $n in the last 90 s"; bad=1; }
 done
 
-[ $bad -eq 0 ] && echo "deploy_check: repo == DPUs, both agents healthy" \
-               || echo "deploy_check: MISMATCH (run with --deploy to push)"
+if [ $bad -eq 0 ]; then
+  if [ $warn -ne 0 ]; then
+    echo "deploy_check: code OK, agents healthy; registry differs (a"
+    echo "              previous run's scenario config is still loaded)"
+  else
+    echo "deploy_check: repo == DPUs, both agents healthy"
+  fi
+else
+  echo "deploy_check: CODE MISMATCH (run with --deploy to push)"
+fi
 exit $bad

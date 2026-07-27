@@ -18,6 +18,18 @@ mkdir -p "$OUT"; cd "$REPO"
 bash tools/lab-infra/deploy_check.sh >/dev/null || {
   bash tools/lab-infra/deploy_check.sh; echo "ABORT: lab not in a known state"; exit 1; }
 
+# Restore the standing configuration on the way out, whatever happened.
+# Runners push their own scenario registry, so without this the lab keeps
+# whatever the last experiment wanted and the next one silently inherits
+# it - which is the same class of mistake as a stale deployed agent, just
+# quieter.
+restore_standing() {
+  scp -q "$REPO/config/lab-registry.json" hpft-dpu:/opt/hpft/  2>/dev/null || true
+  scp -q "$REPO/config/lab-registry.json" hpft-dpu2:/opt/hpft/ 2>/dev/null || true
+}
+trap restore_standing EXIT
+
+
 echo "== preflight =="
 bash tools/lab-infra/flow_preflight.sh "0,0 1,1 2,2 3,3" || { echo "ABORT: dead pair"; exit 1; }
 
