@@ -29,6 +29,7 @@ import socket
 import struct
 import time
 
+import fastfill
 from fastfill import waterfill_ceilings
 
 FIFO = "/tmp/rp_fifo"   # PCC RP mailbox (batched: 0xb47c000N ft bud rate ...)
@@ -163,13 +164,55 @@ class SenderTree:
                 out.update(waterfill(cls_share[c], fs_items))
         return out
 
+    def _trees_c(self, demand):
+        vms = self.policy["vms"]
+        fsids = list(demand)
+        vm_ids, cls_ids = {}, {"rdma": 0, "tcp": 1}
+        src_idx, cls_idx, wfs, dem = [], [], [], []
+        for f in fsids:
+            src_dst, c = f.rsplit("|", 1)
+            src = src_dst.split(">")[0]
+            if src not in vm_ids:
+                vm_ids[src] = len(vm_ids)
+            src_idx.append(vm_ids[src])
+            cls_idx.append(cls_ids.setdefault(c, len(cls_ids)))
+            wfs.append(1.0)
+            dem.append(float(demand[f]))
+        n_vm, n_cls = len(vm_ids), len(cls_ids)
+        vm_w = [1.0] * n_vm
+        vm_max = [float("inf")] * n_vm
+        cls_w = [1.0] * (n_vm * n_cls)
+        for src, i in vm_ids.items():
+            p = vms.get(src, {})
+            vm_w[i] = float(p.get("weight", 1))
+            m = p.get("max_rate_bps")
+            vm_max[i] = float(m) if m else float("inf")
+            cwd = p.get("class_weights", {})
+            for c, j in cls_ids.items():
+                cls_w[i * n_cls + j] = float(cwd.get(c, 1))
+        _, ceil = fastfill.entitlements_c(fsids, src_idx, cls_idx, wfs, dem,
+                                          n_vm, n_cls, vm_w, vm_max, cls_w,
+                                          self.cap)
+        return ceil
+
     def trees(self, flows):
+        """Tree_f for every local flow-set.
+
+        Structurally the same three-layer ceiling cascade the receiver
+        runs - src VM -> class -> flow-set, with the root capacity being
+        this sender's uplink and the leaf weights all 1 - so it uses the
+        same C entry point. Measured first: the sender was the TIGHTER of
+        the two agents (132% of the period at 288 flow-sets against the
+        receiver's 97%), because it rebuilds this tree on every telemetry
+        datagram and was paying per-layer ctypes marshalling."""
         demand = {}
         for f, st in flows.items():
             d = max(st.r * (1.0 + self.delta), self.floor)
             if st.pace > 0 and st.r >= 0.85 * st.pace:
                 d = max(d, st.pace * (1.0 + self.delta))   # cap-hit boost
             demand[f] = d
+        if fastfill.USING_C and demand:
+            return self._trees_c(demand)
         # single-pass ceiling cascade (same math as the per-fs N-fill
         # loop; property-tested) - O(N log N)
         tree = {}
