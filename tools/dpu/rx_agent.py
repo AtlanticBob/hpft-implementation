@@ -691,6 +691,56 @@ class Scheduler:
         return e
 
 
+class RootCongestion:
+    """Hysteretic saturation state of the root (design.md §3.2.2).
+
+    Entering closes borrowing, which lowers utilisation, which would
+    immediately look like "not congested" again - so the exit threshold
+    has to sit below the entry one or the two regimes chatter every tick.
+    """
+
+    def __init__(self, enter=0.95, leave=0.85):
+        self.enter = enter
+        self.leave = leave
+        self.on = False
+
+    def update(self, total, capacity):
+        if capacity > 0:
+            if total >= self.enter * capacity:
+                self.on = True
+            elif total <= self.leave * capacity:
+                self.on = False
+        return self.on
+
+
+def demand_estimate(active, shat, delta, theta, big, congested,
+                    share_test=True):
+    """Per-flow-set demand for the fill (design.md §3.2.1-§3.2.2).
+
+    An idle flow-set (r = 0) is never backlogged. A non-idle one is
+    backlogged through either entry:
+      share   it is realising at least theta_b of its pure weighted share,
+              so its own rate already demonstrates the appetite;
+      root    the root is congested, in which case a flow-set below its
+              share cannot be short of appetite - there is no spare
+              capacity it could have declined, so it is losing a race.
+    Backlogged means demand = big (a finite stand-in for infinity, chosen
+    so the derived ceiling still packs into a uint64 on the wire), which
+    claims the full weighted share; otherwise the r*(1+delta) ratchet.
+
+    Kept module-level so both entries and the hysteresis can be tested
+    without a DPU - they had only lab A/B coverage, and a regression in
+    either returns the allocator to the starvation it was built to stop.
+    """
+    out = {}
+    for f, r in active.items():
+        backlogged = r > 0 and (
+            congested or
+            (share_test and shat.get(f, 0.0) > 0 and r >= theta * shat[f]))
+        out[f] = big if backlogged else r * (1.0 + delta)
+    return out
+
+
 class VQMarker:
     """Per-flow-set virtual-queue integrator -> mark s_f (design.md §3.3).
 
@@ -941,7 +991,7 @@ def main():
     next_tick = t_start
     last_print = t_start
     nticks_total = 0
-    root_congested = False
+    rootcong = RootCongestion()
     last_speed = c_link
     sched.set_downlink(c_link)
 
@@ -1062,53 +1112,26 @@ def main():
             # unused and utilisation drops back.
             # backlog_congestion_aware gates this term so the A/B is a
             # registry flip, not a different binary.
-            if ep.get("backlog_congestion_aware", True):
-                tot_r = sum(active.values())
-                if tot_r >= 0.95 * sched.c_root:
-                    root_congested = True
-                elif tot_r <= 0.85 * sched.c_root:
-                    root_congested = False
-            else:
-                root_congested = False
+            root_congested = (
+                rootcong.update(sum(active.values()), sched.c_root)
+                if ep.get("backlog_congestion_aware", True) else False)
             if ep.get("backlog_floor", False):
                 # backlog-aware share floor (2026-07-13): the r*(1+delta)
-                # demand estimate caps a class at sum(per-flow demands), so a
-                # BACKLOGGED class with fewer flows (or a lower realize rate)
-                # is capped below its weighted share and the sibling class
-                # borrows the surplus -> class ratio drifts off the policy
-                # weight (28fs 3v4: RDMA/TCP 0.75). Fix: a flow realizing
-                # >= theta of its weighted share (shat, the all-backlogged
-                # fill) is backlogged -> demand=inf so it claims its full
-                # weighted class share; a genuinely idle flow (r << shat)
-                # keeps r*(1+delta) so work-conserving borrowing survives.
-                # This is the naive "floor every flow at its weighted share"
-                # (which kills borrowing, design.md §9 tradeoff 3) made
-                # backlog-selective; theta = theta_b of design.md §3.2.2.
+                # demand estimate caps a class at sum(per-flow demands), so
+                # a BACKLOGGED class with fewer flows (or a lower realize
+                # rate) is capped below its weighted share and the sibling
+                # class borrows the surplus -> class ratio drifts off the
+                # policy weight. shat is the all-backlogged fill: a neutral
+                # ruler that depends only on policy and the active set.
                 shat = sched._fill({f: float("inf") for f in active})
-                theta = ep.get("backlog_theta", 0.5)
                 # a finite "big" (root capacity), NOT inf: it saturates the
                 # class demand cap exactly like inf but survives int(ceil_f)
                 # in the telemetry pack (inf overflows).
-                big = sched.c_root
-                # backlogged = not idle AND (claiming its share on its own
-                # OR the root is congested, i.e. nothing it fails to take
-                # could have been left idle by it)
-                # Two conditions, covering DIFFERENT bottleneck layers:
-                #  - the share test is layer-agnostic (shat is computed
-                #    through root -> VM cap -> class), so it catches
-                #    contention at the VM-cap and class layers, which the
-                #    root test cannot see;
-                #  - the root-congestion test catches the receiver-downlink
-                #    layer, where a flow can be held below theta_b of its
-                #    share and would otherwise have its demand collapsed.
-                share_test = ep.get("backlog_share_test", True)
-                demand = {f: (big
-                              if r > 0 and (root_congested or
-                                            (share_test
-                                             and shat.get(f, 0.0) > 0
-                                             and r >= theta * shat[f]))
-                              else r * (1.0 + ep["delta_demand"]))
-                          for f, r in active.items()}
+                demand = demand_estimate(
+                    active, shat, ep["delta_demand"],
+                    ep.get("backlog_theta", 0.5), sched.c_root,
+                    root_congested,
+                    share_test=ep.get("backlog_share_test", True))
             else:
                 demand = {f: r * (1.0 + ep["delta_demand"])
                           for f, r in active.items()}

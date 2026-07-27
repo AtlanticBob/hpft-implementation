@@ -12,6 +12,11 @@ DIR=$(cd "$(dirname "$0")" && pwd); REPO=$(cd "$DIR/../.." && pwd)
 OUT="$DIR/results"; PT=$HOME/hyperfront/perftest-26015/ib_write_bw
 TAG=${1:-lab20}; D=60
 mkdir -p "$OUT"; cd "$REPO"
+# repo == DPUs and both agents healthy, or the run is
+# meaningless (a crashed sender leaves RDMA unpaced while
+# every other layer still reports fine)
+bash tools/lab-infra/deploy_check.sh >/dev/null || {
+  bash tools/lab-infra/deploy_check.sh; echo "ABORT: lab not in a known state"; exit 1; }
 
 echo "== preflight =="
 bash tools/lab-infra/flow_preflight.sh "0,0 1,1 2,2 3,3" || { echo "ABORT: dead pair"; exit 1; }
