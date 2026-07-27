@@ -40,17 +40,26 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
   （`tools/dpu/rx_agent.py`）：vport 硬件计数器直读 → 三层 water-filling
   → 虚拟队列标记 → 带内遥测。
 - 发送端 DPU（`ssh hpft-dpu`）跑 `hpft-txagent-e`
-  （`tools/dpu/tx_agent_e.py`）：MIMD 响应律（乘性增硬顶 ê + 乘性减，
-  MD 另有对称硬顶下限）→ 发送端树 → 执行（RDMA 走 PCC mailbox，TCP
-  经 UDP 发给 sgpu01 上的 `hpft-pace-shim` 写 BPF map）。
+  （`tools/dpu/tx_agent_e.py`）：响应律 → 发送端树 → 执行（RDMA 走
+  PCC mailbox，TCP 经 UDP 发给 sgpu01 上的 `hpft-pace-shim` 写 BPF
+  map）。
 - RDMA 侧执行面是 `tools/dpu/pcc/rp_rtt_template_dev_main.c`（DOCA PCC
   device 代码，跑在 DPA 上），`rate = min(cc_rate, level)`；`cc_rate`
-  是 PCC 里自实现的 DCQCN 风格状态机（独立于 tx_agent 的 MIMD）。
+  是 PCC 里自实现的 DCQCN 风格状态机，独立于响应律。
 
-控制周期 1ms（`config/lab-registry.json` 的 `period_ms`）。生产参数：
-`mi_alpha=0.6`、`beta=0.15`、`v_periods=2`——具体数值和为什么这样调，
-见 `hpft-design` 仓库的 `docs/response_law_mimd_analysis.md` 和本仓库
-`results/convergence_opt_20260722/summary.md`。
+**响应律（v2「跟踪-审计」，2026-07-27 迁移）**：接收端把政策裁定与
+审计账本压成一个目标 $u_f=\hat e_f(1-\gamma s_f)$ 下发，发送端在对数轴
+上做一阶跟踪 $R_f\leftarrow R_f(u_f/R_f)^{kT}$——无分支、无钳位、
+律侧只剩一个参数 $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步
+格式，必须一起下发**。上一代 MIMD/AIMD/MIAD 三条骨架、以及只为兜住
+它们而存在的参数（`mi_alpha`/`beta`/app-limited/fast-recovery/HAI/
+probe 余量/MD 锚与地板/RDMA 预算降速斜坡）随律一并删除；退回 v1 见
+`git tag v1-mimd-lab`。控制周期 1ms（`config/lab-registry.json` 的
+`period_ms`），现行参数 `k=20`、`gamma=0.25`、`v_seconds=0.1`
+（V=600 Mbit）。取值理由与收敛闭式见 `hpft-design` 仓库的
+`docs/design.md` §3.4/§4.2/§6 与 `docs/design_theory.md`；离线验收
+（wire 往返 + 三条收敛闭式 + 账本自愈）跑
+`results/v2_migration_20260727/law_check.py`。
 
 ## 硬性规则
 

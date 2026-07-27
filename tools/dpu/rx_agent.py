@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
-"""Scheme-E receiver-side agent: the hierarchical virtual scheduler
-(design_e §3.3-§3.4). Runs on the receiver DPU Arm as root.
+"""Receiver-side agent: the hierarchical virtual scheduler (design.md
+§3.2-§3.4). Runs on the receiver DPU Arm as root.
 
 Pipeline per control period T:
   meter   hybrid r_f (see below): fresh per-dst-VF totals x flow-set mix
   sched   demand D_f = r_f(1+delta) -> 3-layer weighted water-filling
           (VM cap MaxRate_d -> class -> per-sender) -> entitled rate e_f
-  marker  vq_f <- clip(vq_f + (r_f - e_f)T, 0, Vmax); s_f = min(vq_f/V, 1)
-  telem   one UDP datagram per sender DPU per tick: {fsid: {s, r, e}};
-          s_f = 0 is sent too (explicit freshness permit, §3.5 fail-open)
+          and the fair-share ceiling ceil_f (§3.2)
+  marker  vq_f <- clip(vq_f + (r_f - e_f)T, 0, V); s_f = min(vq_f/V, 1)
+  target  u_f = ceil_f * (1 - gamma * s_f)   (§3.4: policy ceiling x audit
+          discount; bounded, u_f >= (1-gamma)*ceil_f)
+  telem   one UDP datagram per sender DPU per tick, TWO numbers per active
+          flow-set: {fsid: {u, r}}. u drives the sender's tracking law
+          (§4.2); r is the class-level arrival rate the sender forwards to
+          the RDMA executor as rate feedback (§5.2) and uses as its own
+          tree demand input (§4.3). A record is sent every tick even with
+          no excess (u = ceil_f then) - the record IS the explicit
+          freshness permit, and its absence is what triggers the sender's
+          fail-open (§4.4).
+
+e_f, s_f, ceil_f and vq_f stay local: they are the intermediate ledger the
+target is synthesised from, kept in the jsonl log for offline analysis but
+no longer on the wire (v1 shipped {s, r, e, ceil} because the MIMD law
+re-derived its own caps and floors at the sender; the v2 law consumes one
+number).
 
 Hybrid r_f measurement (lab fact, 2026-07-09): megaflow HW byte counters
 are exact but only refresh ~1 Hz (mlx5 fc bulk-query period, hardcoded in
@@ -537,36 +552,6 @@ def waterfill(capacity, items):
     return alloc
 
 
-class DemandHold:
-    """F1 (standing-deficit fix, 2026-07-10): demand estimate holds the
-    windowed peak so a tenant-CC dip does not instantly collapse the
-    grant (e_sum p5 was 2.4G of 6G; see docs/archive/tuning-and-diagnostics-log.md).
-    Two half-window buckets -> peak decays within [hold/2, hold].
-    Cost: borrowing reclaim is delayed by <= hold (~10 periods)."""
-
-    def __init__(self, hold_s):
-        self.hold = hold_s
-        self.b = {}   # fs -> [bucket_start, peak_cur, peak_prev]
-
-    def peaks(self, rates, now):
-        if self.hold <= 0:
-            return rates
-        out = {}
-        for f, r in rates.items():
-            b = self.b.get(f)
-            if b is None:
-                b = self.b[f] = [now, r, 0.0]
-            if now - b[0] >= self.hold / 2:
-                b[2] = b[1] if now - b[0] < self.hold else 0.0
-                b[0], b[1] = now, r
-            b[1] = max(b[1], r)
-            out[f] = max(r, b[1], b[2])
-        for f in list(self.b):
-            if f not in rates:
-                del self.b[f]
-        return out
-
-
 class Scheduler:
     """3-layer water-filling -> e_f (design_e §3.3)."""
 
@@ -660,11 +645,15 @@ class Scheduler:
 
 
 class VQMarker:
-    """Per-flow-set virtual-queue integrator -> mark s_f (design_e §3.3)."""
+    """Per-flow-set virtual-queue integrator -> mark s_f (design.md §3.3).
 
-    def __init__(self, v_full, v_max):
+    The anti-windup clip is V itself (§3.3): a deeper integration bin only
+    makes the mark ring on for extra ticks after the excess has stopped,
+    deepening the undershoot."""
+
+    def __init__(self, v_full):
         self.v_full = v_full    # bits at which s saturates to 1
-        self.v_max = v_max      # anti-windup clip
+        self.v_max = v_full     # anti-windup clip = V (§3.3)
         self.vq = {}            # fsid -> bits
 
     def step(self, rates, ents, ceils, dt_s):
@@ -702,23 +691,23 @@ class Telemetry:
     encode/decode of a per-flow-set dict is a real cost; a fixed struct is
     an order of magnitude cheaper and smaller on the wire. Wire format:
       header  '<HH'  = (seq_lo16, n_records)
-      record  '<64s f Q Q'  = (fsid[64], s, r_bps, e_bps)
-    fsid strings are short ('sgpu01/vf0>sgpu02/vf0|tcp' ~ 26 B); r/e use
+      record  '<64s Q Q'  = (fsid[64], u_bps, r_bps)
+    fsid strings are short ('sgpu01/vf0>sgpu02/vf0|tcp' ~ 26 B); u/r use
     uint64 because bps at 200G line rate overflows uint32.
 
+    THIS FORMAT IS A SYNCHRONIZED BOTH-ENDS CHANGE: tx_agent_e._TREC must
+    match exactly, and both agents must be deployed and restarted together
+    or the control loop parses garbage.
+
     Dual-cast (2026-07-11): each record goes both to the sender DPU (which
-    runs the RDMA response law + mailbox) and, for the tcp class, to the
-    sender host's pace shim, so the TCP law runs one hop closer to its
+    runs the response law + mailbox) and, for the tcp class, to the sender
+    host's pace shim, so the TCP law would run one hop closer to its
     actuator. Destinations resolved from control.telemetry_ip (DPU) and
-    control.pace_shim (host)."""
+    control.shim_ip/shim_telemetry_port (host) - the latter two are absent
+    from the registry, so the shim leg is currently inert."""
 
     HDR = struct.Struct("<HH")
-    # record carries ceil_f (fair-share ceiling) besides the demand-capped
-    # e_f: the sender's AI/HAI probe bound must anchor to ceil, not e -
-    # e = min(fair, r*1.15) is self-referential through the sender's own
-    # rate and traps a crushed flow below its share (same lesson as the
-    # Q22 VQ-drain fix; observed as a 0.27G no-marks deadlock, 2026-07-11)
-    REC = struct.Struct("<64sfQQQ")
+    REC = struct.Struct("<64sQQ")
 
     def __init__(self, vnic_host, telemetry_ip, port, shim_ip=None,
                  shim_port=None):
@@ -732,20 +721,18 @@ class Telemetry:
 
     def _pack(self, recs):
         out = [self.HDR.pack(self.seq & 0xffff, len(recs))]
-        for fsid, s, r, e, c in recs:
-            out.append(self.REC.pack(fsid.encode()[:64], s, int(r), int(e),
-                                     int(c)))
+        for fsid, u, r in recs:
+            out.append(self.REC.pack(fsid.encode()[:64], int(u), int(r)))
         return b"".join(out)
 
-    def send(self, marks, rates, ents, ceils):
+    def send(self, targets, rates):
         self.seq += 1
         per_dpu = {}     # dpu ip -> [records]
         per_shim = {}    # (shim ip, port) -> [tcp records]
-        for f, s in marks.items():
+        for f, u in targets.items():
             src, cls = f.split(">")[0], f.rsplit("|", 1)[1]
             host = self.vnic_host.get(src)
-            rec = (f, s, rates.get(f, 0), ents.get(f, 0),
-                   ceils.get(f, ents.get(f, 0)))
+            rec = (f, u, rates.get(f, 0))
             ip = self.telemetry_ip.get(host)
             if ip is not None:
                 per_dpu.setdefault(ip, []).append(rec)
@@ -800,19 +787,20 @@ def main():
     # mark saturates), so it must NOT scale with the control period: the
     # VQ accumulates the time integral of (r - e), which over a given
     # wall-clock window is the same no matter how finely it is ticked.
-    # Scaling V with period (the earlier formula) made the VQ 50x more
+    # Scaling V with period (an early formula) made the VQ 50x more
     # sensitive at 1ms - a few measurement spikes above the cap saturated
     # it and fired spurious marks, pinning the flow ~20% below its cap.
-    # Anchor V to the reference period instead.
-    ref_period = ep.get("ref_period_ms", 50) / 1e3
-    v_full = ep["v_periods"] * ref_period * line * ep["headroom"]
-    v_max = ep["vmax_over_v"] * v_full
+    # Stated directly as wall-clock x line rate x headroom (design.md §6):
+    # v_seconds = 0.1 -> V = 600 Mbit, i.e. ~100 ms of headroom-scale
+    # sustained excess pushes the mark to saturation.
+    v_full = ep["v_seconds"] * line * ep["headroom"]
+    gamma = ep["gamma"]
 
     added = install_class_rules(args.bridge)
-    print("rx_agent[E]: bridge=%s rules_added=%s T=%.0fms local=%s "
-          "V=%.0fMbit log=%s meter_only=%s vport_meter=%s"
+    print("rx_agent: bridge=%s rules_added=%s T=%.0fms local=%s "
+          "V=%.0fMbit gamma=%.2f log=%s meter_only=%s vport_meter=%s"
           % (args.bridge, added or "none", period * 1e3, local_host,
-             v_full / 1e6, args.log, args.meter_only,
+             v_full / 1e6, gamma, args.log, args.meter_only,
              args.vport_meter or "off"), flush=True)
 
     vpm = None
@@ -836,7 +824,7 @@ def main():
         meter=vpm)
     sched = Scheduler(reg["policy"], line, ep["headroom"], ep["delta_demand"])
     last_seen = {}
-    marker = VQMarker(v_full, v_max)
+    marker = VQMarker(v_full)
     ctl = reg["control"]
     telem = Telemetry(vnic_host, ctl["telemetry_ip"], ep["telemetry_port"],
                       shim_ip=ctl.get("shim_ip"),
@@ -942,25 +930,25 @@ def main():
                         and f not in sched_rates):
                     sched_rates[f] = 0.0
         if args.meter_only:
-            ents, marks = {}, {}
+            ents, ceils, marks, targets = {}, {}, {}, {}
         else:
             nowm = now
             for f in sched_rates:
                 last_seen[f] = nowm
             active = dict(sched_rates)
-            grace = ep.get("share_floor_grace_s", 0.5)
+            # flow-set membership grace: a flow-set whose megaflow key
+            # momentarily disappears stays in the fill (at r=0) for this
+            # long, so a one-tick gap does not reshuffle everyone's share.
+            # (Named share_floor_grace_s until 2026-07-27 - it never had
+            # anything to do with the deleted share_floor.)
+            grace = ep.get("fs_grace_s", 0.5)
             for f, t_ in list(last_seen.items()):
                 if f not in active:
                     if nowm - t_ <= grace:
                         active[f] = 0.0
                     else:
                         del last_seen[f]
-            if ep.get("share_floor", False):
-                shat = sched._fill({f: float("inf") for f in active})
-                demand = {f: max(r * (1.0 + ep["delta_demand"]),
-                                 shat.get(f, 0.0))
-                          for f, r in active.items()}
-            elif ep.get("backlog_floor", False):
+            if ep.get("backlog_floor", False):
                 # backlog-aware share floor (2026-07-13): the r*(1+delta)
                 # demand estimate caps a class at sum(per-flow demands), so a
                 # BACKLOGGED class with fewer flows (or a lower realize rate)
@@ -971,8 +959,9 @@ def main():
                 # fill) is backlogged -> demand=inf so it claims its full
                 # weighted class share; a genuinely idle flow (r << shat)
                 # keeps r*(1+delta) so work-conserving borrowing survives.
-                # This is the naive share_floor (which floors ALL flows and
-                # kills borrowing, sec 9 tradeoff 3) made backlog-selective.
+                # This is the naive "floor every flow at its weighted share"
+                # (which kills borrowing, design.md §9 tradeoff 3) made
+                # backlog-selective; theta = theta_b of design.md §3.2.2.
                 shat = sched._fill({f: float("inf") for f in active})
                 theta = ep.get("backlog_theta", 0.5)
                 # a finite "big" (root capacity), NOT inf: it saturates the
@@ -988,7 +977,14 @@ def main():
                           for f, r in active.items()}
             ents, ceils = sched.entitlements(active, demand)
             marks = marker.step(sched_rates, ents, ceils, dt)
-            telem.send(marks, sched_rates, ents, ceils)
+            # §3.4 target synthesis: the policy ceiling discounted by the
+            # audited sustained excess. Bounded by construction - no
+            # excess leaves the target AT the ceiling, saturated excess
+            # can press it no lower than (1-gamma)*ceil - so the sender's
+            # law needs no floor of its own.
+            targets = {f: ceils.get(f, ents.get(f, 0.0)) * (1.0 - gamma * s)
+                       for f, s in marks.items()}
+            telem.send(targets, sched_rates)
 
         # throttled logging (default ~50 Hz), never every 1ms tick
         if nticks_total % log_every == 0 and nticks_total:
@@ -1002,16 +998,21 @@ def main():
                    "rv": {d: [int(x) for x in (vpm.rates(d) or (0, 0))]
                           for d in hybrid.attr_meter},
                    "r": {f: int(v) for f, v in rates.items()},
+                   # u is the only one of these on the wire; e/c/s/vq are
+                   # the local ledger the target is synthesised from, kept
+                   # here for offline accounting against design_theory §2.8
+                   "u": {f: int(v) for f, v in targets.items()},
                    "e": {f: int(v) for f, v in ents.items()},
+                   "c": {f: int(v) for f, v in ceils.items()},
                    "s": {f: round(v, 4) for f, v in marks.items()},
                    "vq": {f: int(v) for f, v in marker.vq.items()}}
             logf.write(json.dumps(rec) + "\n")
 
         nticks_total += 1
         if now - last_print >= 1.0:
-            act = " ".join("%s r=%.2fG e=%.2fG s=%.2f"
+            act = " ".join("%s r=%.2fG u=%.2fG s=%.2f"
                            % (f, rates.get(f, 0) / 1e9,
-                              ents.get(f, 0) / 1e9, marks.get(f, 0))
+                              targets.get(f, 0) / 1e9, marks.get(f, 0))
                            for f in sorted(marks) if rates.get(f, 0) > 0)
             print("t=%.0fs ticks/s=%d dump_ms=%.1f | %s"
                   % (now - t_start, nticks_total // max(int(now - t_start), 1),
