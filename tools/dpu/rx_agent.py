@@ -66,6 +66,7 @@ import struct
 import subprocess
 import time
 
+import fastfill
 from fastfill import waterfill_ceilings
 
 CLASS_RULES = [
@@ -567,6 +568,52 @@ class Scheduler:
         self.c_root = speed_bps * (1.0 - self.headroom)
 
     def entitlements(self, rates, demand_in=None):
+        """See _entitlements_py for the reference implementation.
+
+        The C path computes the same two outputs in one crossing of the
+        ctypes boundary; it is property-tested to agree with the Python
+        path pointwise (fastfill_test.py). Falls back automatically when
+        the shared object is not built, so a machine without it still
+        runs - just with the old ceiling on flow-set count."""
+        if fastfill.USING_C:
+            demand = demand_in if demand_in is not None else \
+                {f: r * (1.0 + self.delta) for f, r in rates.items()}
+            if demand:
+                return self._entitlements_c(demand)
+        return self._entitlements_py(rates, demand_in)
+
+    def _entitlements_c(self, demand):
+        vms = self.policy["vms"]
+        upw = self.policy.get("per_sender_weights", {})
+        fsids = list(demand)
+        vm_ids, cls_ids = {}, {"rdma": 0, "tcp": 1}
+        dst_idx, cls_idx, wfs, dem = [], [], [], []
+        for f in fsids:
+            src_dst, c = f.rsplit("|", 1)
+            src, d = src_dst.split(">")
+            if d not in vm_ids:
+                vm_ids[d] = len(vm_ids)
+            dst_idx.append(vm_ids[d])
+            cls_idx.append(cls_ids.setdefault(c, len(cls_ids)))
+            wfs.append(float(upw.get("%s|%s|%s" % (d, c, src), 1)))
+            dem.append(float(demand[f]))
+        n_vm, n_cls = len(vm_ids), len(cls_ids)
+        vm_w = [1.0] * n_vm
+        vm_max = [float("inf")] * n_vm
+        cls_w = [1.0] * (n_vm * n_cls)
+        for d, i in vm_ids.items():
+            p = vms.get(d, {})
+            vm_w[i] = float(p.get("weight", 1))
+            m = p.get("max_rate_bps")
+            vm_max[i] = float(m) if m else float("inf")
+            cwd = p.get("class_weights", {})
+            for c, j in cls_ids.items():
+                cls_w[i * n_cls + j] = float(cwd.get(c, 1))
+        return fastfill.entitlements_c(fsids, dst_idx, cls_idx, wfs, dem,
+                                       n_vm, n_cls, vm_w, vm_max, cls_w,
+                                       self.c_root)
+
+    def _entitlements_py(self, rates, demand_in=None):
         """rates: {fsid: r_f} -> ({fsid: e_f}, {fsid: ceil_f}).
 
         e_f: demand-capped water-filling share (design §3.3) - the grant.
@@ -725,11 +772,20 @@ class Telemetry:
         self.shim_port = shim_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.seq = 0
+        # fsid -> its 64-byte wire field. The encode+pad is identical on
+        # every tick for the life of a flow-set, and at a 1 ms period it
+        # was being redone for every record of every datagram.
+        self._fsb = {}
 
     def _pack(self, recs):
         out = [self.HDR.pack(self.seq & 0xffff, len(recs))]
+        fsb = self._fsb
+        pack = self.REC.pack
         for fsid, u, r in recs:
-            out.append(self.REC.pack(fsid.encode()[:64], int(u), int(r)))
+            b = fsb.get(fsid)
+            if b is None:
+                b = fsb[fsid] = fsid.encode()[:64]
+            out.append(pack(b, int(u), int(r)))
         return b"".join(out)
 
     def send(self, targets, rates):
@@ -821,10 +877,11 @@ def main():
 
     added = install_class_rules(args.bridge)
     print("rx_agent: bridge=%s rules_added=%s T=%.0fms local=%s C=%.0fG "
-          "V=%.0fMbit gamma=%.2f log=%s meter_only=%s vport_meter=%s"
+          "V=%.0fMbit gamma=%.2f fill=%s log=%s meter_only=%s vport_meter=%s"
           % (args.bridge, added or "none", period * 1e3, local_host,
-             c_link / 1e9, v_full / 1e6, gamma, args.log, args.meter_only,
-             args.vport_meter or "off"), flush=True)
+             c_link / 1e9, v_full / 1e6, gamma,
+             "C" if fastfill.USING_C else "python", args.log,
+             args.meter_only, args.vport_meter or "off"), flush=True)
 
     vpm = None
     if args.vport_meter:
