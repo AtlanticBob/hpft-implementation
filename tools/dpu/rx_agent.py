@@ -993,10 +993,15 @@ def main():
             # Hysteresis (enter 0.95, leave 0.85) keeps the two regimes
             # from chattering when a genuinely small flow leaves capacity
             # unused and utilisation drops back.
-            tot_r = sum(active.values())
-            if tot_r >= 0.95 * sched.c_root:
-                root_congested = True
-            elif tot_r <= 0.85 * sched.c_root:
+            # backlog_congestion_aware gates this term so the A/B is a
+            # registry flip, not a different binary.
+            if ep.get("backlog_congestion_aware", True):
+                tot_r = sum(active.values())
+                if tot_r >= 0.95 * sched.c_root:
+                    root_congested = True
+                elif tot_r <= 0.85 * sched.c_root:
+                    root_congested = False
+            else:
                 root_congested = False
             if ep.get("backlog_floor", False):
                 # backlog-aware share floor (2026-07-13): the r*(1+delta)
@@ -1037,8 +1042,21 @@ def main():
             # excess leaves the target AT the ceiling, saturated excess
             # can press it no lower than (1-gamma)*ceil - so the sender's
             # law needs no floor of its own.
-            targets = {f: ceils.get(f, ents.get(f, 0.0)) * (1.0 - gamma * s)
-                       for f, s in marks.items()}
+            # Report membership is decided by the FLOW TABLE, never by the
+            # instantaneous rate (design.md §3.4). Building this from
+            # `marks` violated that: VQMarker.step drops a flow-set that is
+            # momentarily at r=0 with a drained ledger, so it vanished from
+            # telemetry entirely. Measured 2026-07-27 (deep-pit rep 3): a
+            # flow-set whose wire had died appeared in only 14-16% of
+            # ticks, and since the v2 law only steps when a record arrives,
+            # its effective k fell ~6x and a 200 ms recovery took 958 ms.
+            # §3.4 warns about exactly this: an absent record is read as a
+            # dead control channel, which is a positive feedback into
+            # fail-open. Iterate `active` (present in the flow table, plus
+            # the membership grace) and default an absent mark to 0.
+            targets = {f: ceils.get(f, ents.get(f, 0.0))
+                          * (1.0 - gamma * marks.get(f, 0.0))
+                       for f in active}
             telem.send(targets, sched_rates)
 
         # throttled logging (default ~50 Hz), never every 1ms tick
