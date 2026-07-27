@@ -55,7 +55,7 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
 它们而存在的参数（`mi_alpha`/`beta`/app-limited/fast-recovery/HAI/
 probe 余量/MD 锚与地板/RDMA 预算降速斜坡）随律一并删除；退回 v1 见
 `git tag v1-mimd-lab`。控制周期 1ms（`config/lab-registry.json` 的
-`period_ms`），现行参数 `k=20`、`gamma=0.25`、`v_seconds=0.1`
+`period_ms`），现行参数 `k=20`、`gamma=0.25`、`v_seconds=0.2`
 （V=600 Mbit）。取值理由与收敛闭式见 `hpft-design` 仓库的
 `docs/design.md` §3.4/§4.2/§6 与 `docs/design_theory.md`；离线验收
 （wire 往返 + 三条收敛闭式 + 账本自愈）跑

@@ -500,10 +500,21 @@ def main():
                     track(st, tree_of(fsid), now)
                     st.mode = "fail_open"
                     actuate(fsid, st, 0, rdma_batch)
-                    logf.write(json.dumps(
-                        {"ts": round(time.time(), 4), "fs": fsid,
-                         "R": int(st.R), "pace": int(st.pace),
-                         "mode": st.mode}) + "\n")
+                    # same throttle as the telemetry path: this branch runs
+                    # EVERY tick, so logging it unconditionally wrote ~820
+                    # lines/s/flow-set at 1 ms (7155 lines for one 8.7 s
+                    # outage, measured 2026-07-27) into the DPU's tmpfs.
+                    st.log_age += 1
+                    if (st.mode != st.log_mode or st.log_R < 0
+                            or abs(st.R - st.log_R) > 0.01 * st.log_R
+                            or st.log_age >= 1000):
+                        st.log_R = st.R
+                        st.log_age = 0
+                        st.log_mode = st.mode
+                        logf.write(json.dumps(
+                            {"ts": round(time.time(), 4), "fs": fsid,
+                             "R": int(st.R), "pace": int(st.pace),
+                             "mode": st.mode}) + "\n")
                 elif age > n1_s and st.mode not in ("frozen", "fail_open"):
                     # freeze: also re-anchor last_step, so the first record
                     # after the outage takes ONE period's step, not one

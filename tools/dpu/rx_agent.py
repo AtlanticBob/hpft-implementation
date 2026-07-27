@@ -652,9 +652,16 @@ class VQMarker:
     deepening the undershoot."""
 
     def __init__(self, v_full):
+        self.vq = {}            # fsid -> bits
+        self.set_v(v_full)
+
+    def set_v(self, v_full):
+        """V follows the downlink bottleneck capacity (§3.3): zeta =
+        0.5*sqrt(k*V/(gamma*ehat)) must not depend on link rate, and ehat
+        scales with C, so V has to scale with C too. Recomputed whenever
+        the scheduler's root capacity moves."""
         self.v_full = v_full    # bits at which s saturates to 1
         self.v_max = v_full     # anti-windup clip = V (§3.3)
-        self.vq = {}            # fsid -> bits
 
     def step(self, rates, ents, ceils, dt_s):
         marks = {}
@@ -790,17 +797,33 @@ def main():
     # Scaling V with period (an early formula) made the VQ 50x more
     # sensitive at 1ms - a few measurement spikes above the cap saturated
     # it and fired spurious marks, pinning the flow ~20% below its cap.
-    # Stated directly as wall-clock x line rate x headroom (design.md §6):
-    # v_seconds = 0.1 -> V = 600 Mbit, i.e. ~100 ms of headroom-scale
-    # sustained excess pushes the mark to saturation.
-    v_full = ep["v_seconds"] * line * ep["headroom"]
+    #
+    # V = v_seconds * headroom * C, anchored on the DOWNLINK BOTTLENECK
+    # CAPACITY C, not on the NIC port line rate (design.md §3.3): the
+    # audit loop's damping zeta = 0.5*sqrt(k*V/(gamma*ehat)) has ehat
+    # scaling with C, so V must scale with C for zeta to be independent
+    # of link rate. v_seconds = 0.2 s, C = 100G here -> V = 600 Mbit.
+    # C is read from the uplink at startup and tracked on every change.
     gamma = ep["gamma"]
 
+    def v_of(capacity):
+        return ep["v_seconds"] * ep["headroom"] * capacity
+
+    def uplink_speed():
+        try:
+            spd = int(open("/sys/class/net/%s/speed" % args.uplink).read())
+            return spd * 1e6 if spd > 0 else None
+        except (OSError, ValueError):
+            return None
+
+    c_link = uplink_speed() or line
+    v_full = v_of(c_link)
+
     added = install_class_rules(args.bridge)
-    print("rx_agent: bridge=%s rules_added=%s T=%.0fms local=%s "
+    print("rx_agent: bridge=%s rules_added=%s T=%.0fms local=%s C=%.0fG "
           "V=%.0fMbit gamma=%.2f log=%s meter_only=%s vport_meter=%s"
           % (args.bridge, added or "none", period * 1e3, local_host,
-             v_full / 1e6, gamma, args.log, args.meter_only,
+             c_link / 1e9, v_full / 1e6, gamma, args.log, args.meter_only,
              args.vport_meter or "off"), flush=True)
 
     vpm = None
@@ -851,7 +874,8 @@ def main():
     next_tick = t_start
     last_print = t_start
     nticks_total = 0
-    last_speed = line
+    last_speed = c_link
+    sched.set_downlink(c_link)
 
     while True:
         now = time.monotonic()
@@ -903,15 +927,17 @@ def main():
                     print("rx_agent: policy reloaded", flush=True)
             except (OSError, ValueError) as e:
                 print("rx_agent: policy reload failed: %s" % e, flush=True)
-            try:
-                spd = int(open("/sys/class/net/%s/speed" % args.uplink).read())
-                if spd > 0 and spd * 1e6 != last_speed:
-                    last_speed = spd * 1e6
-                    sched.set_downlink(spd * 1e6)
-                    print("rx_agent: downlink %d Mbps -> C_root %.1fG"
-                          % (spd, sched.c_root / 1e9), flush=True)
-            except (OSError, ValueError):
-                pass
+            spd_bps = uplink_speed()
+            if spd_bps is not None and spd_bps != last_speed:
+                last_speed = spd_bps
+                sched.set_downlink(spd_bps)
+                # V is anchored on C, so it moves with the link (§3.3):
+                # holding V fixed across a speed change would make the
+                # audit loop's damping link-rate dependent.
+                marker.set_v(v_of(spd_bps))
+                print("rx_agent: downlink %.0fG -> C_root %.1fG V %.0fMbit"
+                      % (spd_bps / 1e9, sched.c_root / 1e9,
+                         marker.v_full / 1e6), flush=True)
 
         # ---- fast loop: rates -> waterfill -> VQ -> telemetry ----
         rates = hybrid.rates(now)
