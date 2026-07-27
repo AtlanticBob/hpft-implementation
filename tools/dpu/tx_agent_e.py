@@ -421,10 +421,11 @@ def main():
     last_any_rx = time.monotonic()   # last telemetry from ANY flow-set
     logf = open(args.log, "a", buffering=1)
     print("tx_agent_e: local=%s T=%.0fms law=track k=%.1f/s (tau=%.0fms, "
-          "alpha@T=%.4f) failopen=%.2f/%.1fs tree=dynamic(§4.3) shim=%s "
+          "alpha@T=%.4f) failopen=%.2f/%.1fs evict=%.0fs tree=%s shim=%s "
           "log=%s"
           % (local_host, period * 1e3, k, 1e3 / k,
-             1.0 - math.exp(-k * period), n1_s, n2_s,
+             1.0 - math.exp(-k * period), n1_s, n2_s, evict_s,
+             "C" if fastfill.USING_C else "python",
              ctl["pace_shim"][local_host], args.log), flush=True)
 
     def actuate(fsid, st, r_bps, rdma_batch):
@@ -500,6 +501,13 @@ def main():
     # 2^20-unit) every push so the RP always sees a change and keeps
     # converging its level toward the budget.
     rp_dither_flip = False
+    # Per-datagram cost histogram, the sender's counterpart to the
+    # receiver's. It matters MORE here: tx was measured to be the tighter
+    # of the two agents, rebuilding its whole sender tree on every
+    # telemetry datagram. Averages hide the tail and the tail is what
+    # turns a late decision into a missed one.
+    proc_us = []
+    proc_report = time.monotonic()
     while True:
         # --- telemetry-driven law ---
         try:
@@ -667,6 +675,18 @@ def main():
             mailbox.write_batch(entries)
             last_rdma_push = now
         shim.drain_acks()
+        if recs_all:
+            proc_us.append((time.monotonic() - now) * 1e6)
+        if now - proc_report >= 10.0 and proc_us:
+            q = sorted(proc_us)
+            n_ = len(q)
+            print("proc_us n=%d p50=%.0f p90=%.0f p99=%.0f max=%.0f "
+                  "over_period=%d"
+                  % (n_, q[n_ // 2], q[int(n_ * 0.90)], q[int(n_ * 0.99)],
+                     q[-1], sum(1 for x in q if x > period * 1e6)),
+                  flush=True)
+            proc_us = []
+            proc_report = now
         if now - last_print >= 5.0:
             act = " ".join("%s R=%.2fG %s" % (f, st.R / 1e9, st.mode)
                            for f, st in sorted(flows.items()))

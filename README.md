@@ -77,7 +77,10 @@ probe 余量/MD 锚与地板/RDMA 预算降速斜坡）随律一并删除；退�
 ## 代码地图
 
 - `tools/dpu/rx_agent.py`、`tools/dpu/tx_agent_e.py` —— 现行两端 agent；
-  `tools/dpu/fastfill.py` —— 单遍 fair-share 上限算法（两端共用）；
+  `tools/dpu/fastfill.{c,py}` —— 三层分配（water-filling + 单遍天花板
+  级联），两端共用。C 经 ctypes 加载，`.so` 缺失自动回落纯 Python；
+  纯 Python 路径**保留为参照**，`fastfill_test.py` 用它对拍 C。
+  两个 agent 的启动 banner 会打印 `fill=C` 还是 `fill=python`；
   `tools/dpu/vport_meter.c` —— 独立于 agent 之外的 1ms vport 计数器
   采样常驻进程（`hpft-vport-meter` systemd unit）。
 - `tools/dpu/pcc/` —— DOCA PCC device 代码（RDMA 执行面，跑在 DPA 上）。
@@ -89,6 +92,13 @@ probe 余量/MD 锚与地板/RDMA 预算降速斜坡）随律一并删除；退�
   进本仓库，源码原样保留。
 - `tools/lab-infra/vf_setup.sh` —— VF 重建脚本（`cc_mode.sh` 的
   `post_recover` 调用）。
+- `tools/lab-infra/deploy_check.sh` —— **跑实验前必过**：repo 与两台 DPU
+  的代码一致、两个 agent 健康且近期无 traceback。代码不一致是致命的、
+  配置不一致只是警告（runner 会推自己的场景配置）。`--deploy` 推送差异
+  并在各自 Arm 上重编 `libfastfill.so`。
+- `tools/lab-infra/flow_preflight.sh` / `flow_postflight.py` —— 流对可用性
+  守卫。RC 的错误完成是**终态**，被打死的 QP 不会自己回来，而每一层都
+  还在报健康——这是几次实验产出"看起来正常但结论是错的"数据的原因。
 - `tools/cc_mode.sh` —— lab CC 模式切换（DCQCN ↔ PCC+HPFT，GBN ↔ SR）。
 - `tools/lab_env.sh` —— 三套实验环境一键切换（`hpft` 生产栈 / `plain`
   固件 DCQCN 基线 / `jakiro` VxLAN+DHTB），编排 cc_mode.sh + 拓扑装拆；
