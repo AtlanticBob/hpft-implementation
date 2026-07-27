@@ -18,6 +18,9 @@
  * non-TSO frame is <= ~1514 B at this hook; anything larger is a TSO
  * super-packet, i.e. bulk traffic, which must never skip the shaper. */
 #define HPFT_SPARSE_MAX_LEN 2048ULL
+/* Per-wire-frame bytes the shaper must charge for but skb->len never
+ * counts: 8 B preamble+SFD, 12 B inter-packet gap, 4 B FCS. */
+#define HPFT_FRAME_OVERHEAD 24ULL
 
 struct hpft_vlan_hdr {
     __u16 h_vlan_TCI;
@@ -185,7 +188,26 @@ int hpft_tcp_edt(struct __sk_buff *skb)
             return TC_ACT_OK;
 
         now = bpf_ktime_get_ns();
-        packet_ns = hpft_bytes_to_ns((__u64)skb->len, cfg->rate_bps);
+        /* Meter WIRE bytes, not skb bytes. The policy share is defined
+         * against link capacity and the link carries framing, but skb->len
+         * counts the L2/L3/L4 headers of a GSO super-packet ONCE and knows
+         * nothing about preamble/SFD/IPG/FCS. Measured 2026-07-27: a pair
+         * paced at 10G delivered 9.79G of goodput and 10.6G on the wire,
+         * so every TCP flow-set was quietly consuming ~8% more link than
+         * its share - a systematic bias in favour of TCP over RDMA, whose
+         * budget the RP enforces against the wire.
+         * Each wire frame adds its own L2+L3+L4 headers (the super-packet
+         * carried one copy) plus 8 B preamble+SFD, 12 B inter-packet gap
+         * and 4 B FCS. */
+        {
+            __u32 segs = skb->gso_segs ? skb->gso_segs : 1;
+            __u32 hdr = ETH_HLEN + (__u32)iph->ihl * 4 +
+                        (__u32)tcph->doff * 4;
+            __u64 wire = (__u64)skb->len +
+                         (__u64)(segs - 1) * (__u64)hdr +
+                         (__u64)segs * HPFT_FRAME_OVERHEAD;
+            packet_ns = hpft_bytes_to_ns(wire, cfg->rate_bps);
+        }
         burst_ns = hpft_bytes_to_ns((__u64)cfg->burst_bytes, cfg->rate_bps);
         min_next_ns = now > burst_ns ? now - burst_ns : 0;
 

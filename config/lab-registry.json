@@ -233,6 +233,7 @@
     "backlog_floor": true,
     "backlog_theta": 0.5,
     "backlog_congestion_aware": true,
-    "policy": null
+    "policy": null,
+    "backlog_share_test": true
   }
 }

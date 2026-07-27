@@ -1026,9 +1026,19 @@ def main():
                 # backlogged = not idle AND (claiming its share on its own
                 # OR the root is congested, i.e. nothing it fails to take
                 # could have been left idle by it)
+                # Two conditions, covering DIFFERENT bottleneck layers:
+                #  - the share test is layer-agnostic (shat is computed
+                #    through root -> VM cap -> class), so it catches
+                #    contention at the VM-cap and class layers, which the
+                #    root test cannot see;
+                #  - the root-congestion test catches the receiver-downlink
+                #    layer, where a flow can be held below theta_b of its
+                #    share and would otherwise have its demand collapsed.
+                share_test = ep.get("backlog_share_test", True)
                 demand = {f: (big
                               if r > 0 and (root_congested or
-                                            (shat.get(f, 0.0) > 0
+                                            (share_test
+                                             and shat.get(f, 0.0) > 0
                                              and r >= theta * shat[f]))
                               else r * (1.0 + ep["delta_demand"]))
                           for f, r in active.items()}
