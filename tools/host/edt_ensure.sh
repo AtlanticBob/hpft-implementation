@@ -25,7 +25,21 @@ for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do
     tc qdisc show dev "$d" | grep -q "^qdisc fq [0-9a-f]*: root" \
         || sudo tc qdisc replace dev "$d" root fq
     sudo tc qdisc add dev "$d" clsact 2>/dev/null
-    tc filter show dev "$d" egress | grep -q hpft_tcp_edt \
-        || sudo tc filter add dev "$d" egress bpf da object-pinned "$PIN/hpft_tcp_edt"
-    echo "$d: fq=$(tc qdisc show dev "$d" | grep -c '^qdisc fq') edt=$(tc filter show dev "$d" egress | grep -c hpft_tcp_edt)"
+    # Compare the attached program's ID against the CURRENTLY PINNED one,
+    # not just "is something called hpft_tcp_edt attached". A reload leaves
+    # the previous program alive as long as a filter still references it,
+    # and the old filter matches by name - so the name test silently left
+    # three of four VFs running the PREVIOUS program with its PREVIOUS
+    # maps. Measured 2026-07-27: vf1/vf2/vf3 kept enforcing the static
+    # rdma_rules rates (4G/2G/2G) from the old cfg map while the new map
+    # showed the correct 12G, and a single TCP pair on an idle 100G link
+    # sat at exactly 2.00 Gb/s. Cost me most of an incast investigation.
+    want=$(sudo bpftool prog show pinned "$PIN/hpft_tcp_edt" 2>/dev/null \
+           | head -1 | cut -d: -f1)
+    have=$(tc filter show dev "$d" egress 2>/dev/null \
+           | grep -o 'id [0-9]*' | head -1 | cut -d' ' -f2)
+    [ -n "$want" ] && [ "$have" = "$want" ] \
+        || sudo tc filter replace dev "$d" egress pref 10 protocol all \
+               bpf da object-pinned "$PIN/hpft_tcp_edt"
+    echo "$d: fq=$(tc qdisc show dev "$d" | grep -c '^qdisc fq') edt_prog=$(tc filter show dev "$d" egress | grep -o 'id [0-9]*' | head -1 | cut -d' ' -f2) want=$want"
 done

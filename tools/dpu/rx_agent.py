@@ -874,6 +874,7 @@ def main():
     next_tick = t_start
     last_print = t_start
     nticks_total = 0
+    root_congested = False
     last_speed = c_link
     sched.set_downlink(c_link)
 
@@ -974,6 +975,29 @@ def main():
                         active[f] = 0.0
                     else:
                         del last_seen[f]
+            # Root-congestion state, hysteretic (design.md §3.2.2). The
+            # demand estimate exists to enable BORROWING, and borrowing
+            # only means anything when there is spare capacity. When the
+            # root is saturated there is none, so a flow-set running below
+            # its share is not evidence of small appetite - it is evidence
+            # that it is losing a race. Down-rating its demand there is
+            # what latches starvation in:
+            #   2026-07-27 incast8 - four TCP flow-sets started unevenly
+            #   (50/4/2/2 G at t+0.3 s, before any RDMA, purely TCP's own
+            #   startup race with no ECN). The three losers sat below
+            #   theta_b of their share, so their demand collapsed to
+            #   r*(1+delta), which raised their RDMA siblings' ceilings to
+            #   19-21 G against a 12.1 G share, which kept the link full,
+            #   which kept TCP down. A perfectly stable wrong equilibrium:
+            #   Jain 0.69, reproducible across three runs.
+            # Hysteresis (enter 0.95, leave 0.85) keeps the two regimes
+            # from chattering when a genuinely small flow leaves capacity
+            # unused and utilisation drops back.
+            tot_r = sum(active.values())
+            if tot_r >= 0.95 * sched.c_root:
+                root_congested = True
+            elif tot_r <= 0.85 * sched.c_root:
+                root_congested = False
             if ep.get("backlog_floor", False):
                 # backlog-aware share floor (2026-07-13): the r*(1+delta)
                 # demand estimate caps a class at sum(per-flow demands), so a
@@ -994,8 +1018,13 @@ def main():
                 # class demand cap exactly like inf but survives int(ceil_f)
                 # in the telemetry pack (inf overflows).
                 big = sched.c_root
+                # backlogged = not idle AND (claiming its share on its own
+                # OR the root is congested, i.e. nothing it fails to take
+                # could have been left idle by it)
                 demand = {f: (big
-                              if shat.get(f, 0.0) > 0 and r >= theta * shat[f]
+                              if r > 0 and (root_congested or
+                                            (shat.get(f, 0.0) > 0
+                                             and r >= theta * shat[f]))
                               else r * (1.0 + ep["delta_demand"]))
                           for f, r in active.items()}
             else:
