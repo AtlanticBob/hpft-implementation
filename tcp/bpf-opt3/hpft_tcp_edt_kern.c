@@ -13,7 +13,11 @@
 #define HPFT_MAX_VNICS 4096
 #define HPFT_MAX_PAIRS 16384
 #define HPFT_NSEC_PER_SEC 1000000000ULL
-#define HPFT_GAP_NS 40000ULL  /* opt3: inter-pkt gap > 40us => latency-sparse flow, bypass shared pacing */
+#define HPFT_GAP_NS 40000ULL  /* inter-pkt gap > 40us: flow idled (design §5.3) */
+/* A bypass candidate must also be a SMALL packet. The VF MTU is 1500, so a
+ * non-TSO frame is <= ~1514 B at this hook; anything larger is a TSO
+ * super-packet, i.e. bulk traffic, which must never skip the shaper. */
+#define HPFT_SPARSE_MAX_LEN 2048ULL
 
 struct hpft_vlan_hdr {
     __u16 h_vlan_TCI;
@@ -214,11 +218,38 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         state->next_ns = next_ns;
         bpf_spin_unlock(&state->lock);
 
-        /* latency-sparse flow (idle between packets, any packet size) bypasses
-         * the shared pacing delay - its bytes are still in the pair debt so the
-         * cap stays accurate. Bulk flows are paced by the shared debt. */
-        if (gap <= HPFT_GAP_NS && send_ns > now)
-            skb->tstamp = send_ns;
+        /* Latency-sparse bypass (design.md §5.3): a request/response flow
+         * that idles between packets should not queue behind a bulk flow's
+         * shaping debt. THREE conditions, all necessary - the original
+         * single gap test did not enforce the cap at all in the common
+         * case (2026-07-27 incast8, measured):
+         *
+         *  - gap > HPFT_GAP_NS: the flow idled. The original intent.
+         *  - skb->len small: a TSO super-packet is never a latency
+         *    sensitive request. This is the condition whose absence broke
+         *    the cap. With TSO on, a pair's rate divided among several
+         *    bulk streams gives EVERY stream an inter-packet gap above the
+         *    threshold (4 iperf3 streams sharing 14.85G => one 64 KB skb
+         *    per stream per ~141 us), so every packet took the bypass,
+         *    nothing was ever delayed, and the pair ran 1.13-1.46x its
+         *    pace for 85 s while the debt grew unread. Whether a run
+         *    enforced or escaped depended on how bursty TCP happened to
+         *    be, which is why identical reps measured 94% and 146%.
+         *  - the pair is within one burst of its debt: past that the cap
+         *    outranks the latency favour. Without it, many sparse small
+         *    flows could still walk through the cap in aggregate.
+         *
+         * The comment this replaces claimed the cap stayed accurate
+         * because bypassed bytes still charge the debt. They do - but a
+         * debt nobody ever waits on enforces nothing.
+         */
+        if (send_ns > now) {
+            int sparse = gap > HPFT_GAP_NS &&
+                         (__u64)skb->len <= HPFT_SPARSE_MAX_LEN &&
+                         (send_ns - now) <= burst_ns;
+            if (!sparse)
+                skb->tstamp = send_ns;
+        }
         return TC_ACT_OK;
     }
 }

@@ -126,11 +126,11 @@
     }
   ],
   "policy": {
-    "comment": "design_e \u00a73.1. VM == vnic in this lab. weight = W_i (inter-tenant); max_rate_bps = MaxRate_i (null = uncapped); class_weights = W_{i,TCP}/W_{i,RDMA}. per_sender_weights: 'dst_vnic|class|src_vnic' -> u (absent = 1). Receiver scheduler reads dst-VM params; sender tree reads src-VM params.",
+    "comment": "design.md \u00a73.2. VM == vnic in this lab. weight = W_i (inter-tenant); max_rate_bps = MaxRate_i (null = uncapped); class_weights = W_{i,TCP}/W_{i,RDMA}. per_sender_weights: 'dst_vnic|class|src_vnic' -> u (absent = 1). Receiver scheduler reads dst-VM params; sender tree reads src-VM params. MaxRate = 30G re-derived 2026-07-27 for the current 100G receiver downlink: C' = 97G over 4 dst VMs is 24.25G each, so the previous 20G standing default made 4x20 = 80G < 97G and the RECEIVER-DOWNLINK (incast) bottleneck of design.md \u00a71.3 structurally unreachable - every run at that default only ever exercised the VM-cap layer. At 30G, 4x30 = 120G > 97G so the root layer binds under full load while a single VM alone is still capped below the link, keeping both guarantee classes reachable at the default.",
     "vms": {
       "sgpu01/vf0": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -138,7 +138,7 @@
       },
       "sgpu01/vf1": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -146,7 +146,7 @@
       },
       "sgpu01/vf2": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -154,7 +154,7 @@
       },
       "sgpu01/vf3": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -162,7 +162,7 @@
       },
       "sgpu02/vf0": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -170,7 +170,7 @@
       },
       "sgpu02/vf1": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -178,7 +178,7 @@
       },
       "sgpu02/vf2": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -186,7 +186,7 @@
       },
       "sgpu02/vf3": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -204,7 +204,7 @@
     "pace_shim": {
       "sgpu01": "192.168.102.1:9711"
     },
-    "tree_stub_bps": 50000000000,
+    "tree_stub_bps": 30000000000,
     "pace_floor_bps": 50000000,
     "rate_export": {
       "sgpu02": "192.168.102.2:9712"
@@ -213,7 +213,7 @@
     "rate_export_ms": 5
   },
   "e_params": {
-    "comment": "design.md §6 (v2 tracking-audit law, migrated 2026-07-27). RESPONSE LAW: the receiver synthesises one target per flow-set, u_f = ceil_f*(1-gamma*s_f) (§3.4), and the sender does first-order tracking in log space, R <- R*(u/R)^(k*T) (§4.2). No branches, no clamps, no skeleton switch: the v1 MIMD/AIMD/MIAD skeletons and every parameter that only existed to keep them stable (mi_alpha/beta/mi_bang, app-limited, fast-recovery/HAI, probe margins, MD anchors/floors, the RDMA budget descent slew) were deleted with the law. Fairness still lives entirely in the receiver's water-filling, not in the law. Params are wall-clock quantities (rate constants in s^-1, integrals in bits), so they do not need retuning when period_ms changes -- there is no ref_period_ms scaling any more. k=20 s^-1 is capped by target staleness (k*tau_eff <~ 0.4, tau_eff ~20ms); gamma=0.25 sets both the audit discount band (u >= 0.75*ceil) and the audit-loop damping (zeta = 0.5*sqrt(k*V/(gamma*ceil))); V = v_seconds*headroom*C = 600 Mbit is a wall-clock excess-integral: it must NOT scale with the control period, and it IS anchored on C, the downlink bottleneck capacity the receiver actually schedules against (100G here), not on the NIC port line rate -- ehat scales with C, so V must too or the audit loop's damping becomes link-rate dependent (design.md §3.3). rx_agent reads C from the uplink and recomputes V whenever the link speed changes. The 600 Mbit value itself is empirical (settled by the 2026-07-22 convergence campaign, halved from the AIMD-era 1.2 Gbit); design_theory §3 shows it lands 1% from the optimal-damping inverse V = 4*zeta^2*gamma*ehat_star/k at zeta=1/sqrt(2), which is post-hoc confirmation, not a derivation -- re-derive it if the tenant count, flow count, link rate or loop delay changes. Derivations and tuning rules: hpft-design/docs/design_theory.md.",
+    "comment": "design.md \u00a76 (v2 tracking-audit law, migrated 2026-07-27). RESPONSE LAW: the receiver synthesises one target per flow-set, u_f = ceil_f*(1-gamma*s_f) (\u00a73.4), and the sender does first-order tracking in log space, R <- R*(u/R)^(k*T) (\u00a74.2). No branches, no clamps, no skeleton switch: the v1 MIMD/AIMD/MIAD skeletons and every parameter that only existed to keep them stable (mi_alpha/beta/mi_bang, app-limited, fast-recovery/HAI, probe margins, MD anchors/floors, the RDMA budget descent slew) were deleted with the law. Fairness still lives entirely in the receiver's water-filling, not in the law. Params are wall-clock quantities (rate constants in s^-1, integrals in bits), so they do not need retuning when period_ms changes -- there is no ref_period_ms scaling any more. k=20 s^-1 is capped by target staleness (k*tau_eff <~ 0.4, tau_eff ~20ms); gamma=0.25 sets both the audit discount band (u >= 0.75*ceil) and the audit-loop damping (zeta = 0.5*sqrt(k*V/(gamma*ceil))); V = v_seconds*headroom*C = 600 Mbit is a wall-clock excess-integral: it must NOT scale with the control period, and it IS anchored on C, the downlink bottleneck capacity the receiver actually schedules against (100G here), not on the NIC port line rate -- ehat scales with C, so V must too or the audit loop's damping becomes link-rate dependent (design.md \u00a73.3). rx_agent reads C from the uplink and recomputes V whenever the link speed changes. The 600 Mbit value itself is empirical (settled by the 2026-07-22 convergence campaign, halved from the AIMD-era 1.2 Gbit); design_theory \u00a73 shows it lands 1% from the optimal-damping inverse V = 4*zeta^2*gamma*ehat_star/k at zeta=1/sqrt(2), which is post-hoc confirmation, not a derivation -- re-derive it if the tenant count, flow count, link rate or loop delay changes. Derivations and tuning rules: hpft-design/docs/design_theory.md.",
     "period_ms": 1,
     "k": 20.0,
     "gamma": 0.25,
@@ -227,6 +227,7 @@
     "slow_loop_ms": 200,
     "log_every_ms": 20,
     "rdma_push_ms": 13,
+    "tcp_refresh_ms": 100,
     "rate_window_s": 0.02,
     "fs_grace_s": 0.5,
     "backlog_floor": true,

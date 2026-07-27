@@ -81,7 +81,8 @@ def track_step(R, target, dt, k, floor):
 
 class FlowState:
     __slots__ = ("R", "last_rx", "last_step", "last_seq", "mode", "pace", "r",
-                 "log_R", "log_age", "log_mode", "esc_since", "esc_log")
+                 "log_R", "log_age", "log_mode", "esc_since", "esc_log",
+                 "shim_last")
 
     def __init__(self, tree, now):
         self.R = tree          # optimistic start at the tree share (§4.2)
@@ -96,6 +97,7 @@ class FlowState:
         self.log_mode = ""
         self.esc_since = 0.0   # executor-escape tripwire: since when r >> pace
         self.esc_log = 0.0     # last escape alarm emitted
+        self.shim_last = 0.0   # last TCP rate push to the host shim
 
 
 def waterfill(capacity, items):
@@ -332,6 +334,12 @@ def main():
     n1_s = ep["n1_freeze_s"]
     n2_s = ep["n2_failopen_s"]
     floor = ctl["pace_floor_bps"]
+    # TCP rate heartbeat to the host shim. The RDMA side re-flushes its
+    # budget every rdma_push_ms regardless of change; this is the same
+    # idea for the UDP hop to the EDT maps. Not a control-loop parameter -
+    # the law is unaffected - purely delivery robustness, so it can be
+    # slow relative to the 1 ms period.
+    tcp_refresh_s = ep.get("tcp_refresh_ms", 100) / 1e3
 
     def track(st, target, now):
         """track_step bound to one flow-set's wall-clock anchor."""
@@ -375,9 +383,18 @@ def main():
         pace = max(min(st.R, tree_of(fsid)), floor)
         src_dst, cls = fsid.rsplit("|", 1)
         src, dst = src_dst.split(">")
+        tnow = time.monotonic()
         if cls == "tcp":
-            if pace != st.pace:
+            # Re-send on a heartbeat, not only on change. The hop to the
+            # shim is fire-and-forget UDP with no ack path back into the
+            # law, and the EDT pair_cfg map is recreated by any re-apply
+            # of the actuator - after which a pair stays UNPACED until the
+            # law happens to move a rate. The RDMA path has always had
+            # this property (it reflushes every rdma_push_ms even when the
+            # budget has not changed); the TCP path did not.
+            if pace != st.pace or tnow - st.shim_last >= tcp_refresh_s:
                 shim.set_rate(src, dst, pace)
+                st.shim_last = tnow
         elif cls == "rdma":
             ft = pair_ft.get(src_dst, flowtags.get(src))
             if ft is not None:
@@ -387,16 +404,27 @@ def main():
         # was a silent one: an unpaced EDT pair, an unmatched flowtag and a
         # wedged RP all kept every layer reporting healthy while the wire
         # ignored the pace. r persistently above pace is the one signal the
-        # control plane can already see. 1.5x / 1s absorbs RC-retransmit
-        # inflation (~1.3x observed) and transition bursts.
-        tnow = time.monotonic()
-        if r_bps > 1.5 * pace:
+        # control plane can already see.
+        #
+        # The threshold is per class, and neither class reads 1.00 when
+        # healthy: r is the receiver's WIRE byte count while the pace is
+        # applied to skb bytes, so framing (L2/L3/L4 headers, preamble,
+        # IPG) shows up as inflation. Calibrated 2026-07-27: a TCP pair
+        # paced at 10G delivers 9.79G of iperf3 goodput (cap enforced to
+        # 2%) and reads 10.6G on the wire, i.e. 1.08x. RDMA additionally
+        # carries RC retransmits (~1.3x observed).
+        # 1.25 for TCP sits clear of the 1.08 baseline and would still
+        # have caught the 2026-07-27 incast escape (1.46x), which the
+        # single old 1.5x threshold let run for 85 s unseen.
+        esc_ratio = 1.5 if cls == "rdma" else 1.25
+        if r_bps > esc_ratio * pace:
             if st.esc_since == 0.0:
                 st.esc_since = tnow
             elif tnow - st.esc_since >= 1.0 and tnow - st.esc_log >= 5.0:
-                print("pace-escape %s r=%.2fG pace=%.2fG dur=%.0fs"
-                      % (fsid, r_bps / 1e9, pace / 1e9, tnow - st.esc_since),
-                      flush=True)
+                print("pace-escape %s r=%.2fG pace=%.2fG (%.2fx, trip %.2fx) "
+                      "dur=%.0fs" % (fsid, r_bps / 1e9, pace / 1e9,
+                                     r_bps / max(pace, 1.0), esc_ratio,
+                                     tnow - st.esc_since), flush=True)
                 st.esc_log = tnow
         else:
             if st.esc_log > 0.0:
