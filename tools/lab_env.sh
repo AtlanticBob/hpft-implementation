@@ -113,7 +113,12 @@ build_overlay() {
   sudo ip -s -s neigh flush all >/dev/null 2>&1; ssh sgpu02 'sudo ip -s -s neigh flush all >/dev/null 2>&1'
 }
 _setup_dpu() { # host local_ip remote_ip
-  ssh "$1" "sudo ip addr flush dev underlay-p1 2>/dev/null; sudo ip addr flush dev p1 2>/dev/null
+  # p1 must leave underlay-p1 and become a standalone L3 netdev: the VxLAN
+  # underlay IP sits straight on p1 and the kernel routes encap traffic over
+  # it, which an OVS bridge PORT (pure L2) cannot do. teardown_overlay is the
+  # exact inverse (re-adds p1 to underlay-p1).
+  ssh "$1" "sudo ovs-vsctl --if-exists del-port underlay-p1 p1
+    sudo ip addr flush dev underlay-p1 2>/dev/null; sudo ip addr flush dev p1 2>/dev/null
     sudo ip addr add $2/24 dev p1; sudo ip link set p1 up mtu 9000
     sudo ovs-vsctl --if-exists del-br ovsbr-p1; sudo ovs-vsctl add-br ovsbr-p1
     for i in 0 1 2 3; do sudo ovs-vsctl --if-exists del-port underlay-p1 pf1vf\$i; sudo ovs-vsctl --may-exist add-port ovsbr-p1 pf1vf\$i; done
@@ -121,15 +126,24 @@ _setup_dpu() { # host local_ip remote_ip
     sudo ip link set ovsbr-p1 up"
 }
 # Tear the overlay down and restore the DIRECT data path: delete ovsbr-p1,
-# move the VF representors back onto underlay-p1, drop the underlay IP from p1.
-# (reboot_recover.sh restores the telemetry IP + VFs but NOT representor
-# placement, so this inverse of build_overlay is mandatory before hpft/plain.)
+# move the VF representors back onto underlay-p1, AND put the p1 uplink back
+# into underlay-p1, dropping the underlay L3 IP from p1.
+# (reboot_recover.sh restores the telemetry IP + VFs but NOT representor NOR
+# uplink placement, so this inverse of build_overlay is mandatory before
+# hpft/plain.) The p1 add-back is essential: build_overlay turns p1 into a
+# standalone L3 netdev (underlay IP straight on p1), so after teardown the
+# underlay-p1 bridge has the representors but NO uplink to the wire -- the
+# "cc all correct, data plane totally broken" symptom is exactly p1 missing
+# from the bridge (2026-07-24, found by the impl agent; teardown alone did
+# not fix a live instance of this state until p1 was re-added).
 teardown_overlay() {
   echo "== teardown VxLAN overlay -> direct data path =="
   for h in hpft-dpu hpft-dpu2; do
     ssh "$h" 'sudo ovs-vsctl --if-exists del-br ovsbr-p1
+      sudo ip addr flush dev p1 2>/dev/null
+      sudo ovs-vsctl --may-exist add-port underlay-p1 p1
       for i in 0 1 2 3; do sudo ovs-vsctl --may-exist add-port underlay-p1 pf1vf$i; done
-      sudo ip addr flush dev p1 2>/dev/null; sudo ip link set p1 up'
+      sudo ip link set p1 up'
   done
   # restore direct VF IPs on both hosts (sender vf_i=10.1.i.1, recv vf_i=10.1.i.2)
   for i in 0 1 2 3; do sudo ip addr flush dev dpu1vf$i 2>/dev/null; sudo ip addr add 10.1.$i.1/24 dev dpu1vf$i; sudo ip link set dpu1vf$i up; done
