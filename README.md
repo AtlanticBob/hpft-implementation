@@ -90,6 +90,9 @@ probe 余量/MD 锚与地板/RDMA 预算降速斜坡）随律一并删除；退�
 - `tools/lab-infra/vf_setup.sh` —— VF 重建脚本（`cc_mode.sh` 的
   `post_recover` 调用）。
 - `tools/cc_mode.sh` —— lab CC 模式切换（DCQCN ↔ PCC+HPFT，GBN ↔ SR）。
+- `tools/lab_env.sh` —— 三套实验环境一键切换（`hpft` 生产栈 / `plain`
+  固件 DCQCN 基线 / `jakiro` VxLAN+DHTB），编排 cc_mode.sh + 拓扑装拆；
+  用法与"fw reset 不清 OVS"等坑见头注释与 `hpft-design` 的 ops_notes.md。
 - `tcp/bpf-opt3/` —— TCP 执行面（host fq+edt 的 BPF 实现）。
 - `config/lab-registry.json` —— 唯一真值配置。
 - `results/<experiment>_<UTC日期>/` —— 工程验证/回归实验产物；论文
