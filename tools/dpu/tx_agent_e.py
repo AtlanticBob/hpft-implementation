@@ -12,8 +12,12 @@ already bounded on both sides at the receiver (u >= (1-gamma)*ceil, §3.4),
 tracking approaches it asymptotically from either side, so none of v1's
 walls - increase cap, decrease floor, probe margin, app-limited freeze,
 fast recovery - have anything left to do. The one clamp that survives is
-the 50 Mbps pace floor (§6), which is an executor anti-wedge orthogonal to
-the law and also serves as the ln() domain guard when u collapses to 0.
+the 50 Mbps pace floor (§6), and its justification is now numerical
+rather than protective: it keeps u > 0 so the log law has a domain, and
+keeps the pace above the executor's quantisation step. It is NOT an
+anti-wedge - a steady low rate was measured to be safe (1G cap runs at
+87-91% realisation indefinitely); what endangers an RDMA connection is
+the RATIO of a fall, which §5.1's transition clause handles.
 
 fail-open (§4.4): no telemetry for n1_freeze_s -> R frozen; for
 n2_failopen_s -> the same tracking step with the target set to Tree_f, so
@@ -69,10 +73,13 @@ def track_step(R, target, dt, k, floor):
     late or coalesced update converges towards the target instead of
     shooting past it.
 
-    `floor` (the 50 Mbps pace floor, §6) doubles as the ln() domain guard:
-    u = ceil*(1-gamma*s) is >= 0.75*ceil by construction, so it can only
-    reach 0 when the flow-set's policy ceiling is itself 0 (capacity
-    exhausted, or MaxRate 0) - and then the floor is the right answer.
+    `floor` (the 50 Mbps pace floor, §6) is what gives the logarithm a
+    domain: u = ceil*(1-gamma*s) is >= 0.75*ceil by construction, so it
+    can only reach 0 when the flow-set's policy ceiling is itself 0
+    (capacity exhausted, or MaxRate 0) - and then the floor is the right
+    answer. It also keeps the pace above the executor's quantisation
+    step. Both reasons are numerical; it is not protecting the executor
+    from low rates, which were measured to be safe.
     Kept module-level and pure so the convergence closed-forms in
     design_theory §2.4 can be checked against the production expression."""
     u = max(float(target), floor)
@@ -121,13 +128,13 @@ def waterfill(capacity, items):
 
 
 class SenderTree:
-    """design_e §3.6: the sender-side tree over the local uplink, sharing
+    """design.md §4.3: the sender-side tree over the local uplink, sharing
     the rx scheduler's structure (src VM MaxRate -> class weights -> fs).
-    Tree_f is computed as the fs's fair-share CEILING (its demand set to
-    infinity, siblings at their measured demands): §3.6's demand-capped
-    fill contradicts Q20 (a new flow with r=0 would get Tree ~= 0, not
-    "the full locally-permitted allowance") and §3.5's fail-open ramp
-    target - recorded as a design note, pending user confirmation.
+    Tree_f is the fs's fair-share CEILING (its own demand set to infinity,
+    siblings at their measured demands) rather than a demand-capped fill:
+    a new flow-set starts at Tree_f (§4.2) and fail-open climbs to it
+    (§4.4), and under a demand-capped fill a flow-set with r=0 would get
+    Tree ~= 0, which contradicts both.
     Class borrowing between the two actuator planes (fq+edt / PCC) falls
     out of the work-conserving fill: this IS the budget arbiter, feasible
     in one process because both actuators hang off this agent.
@@ -383,10 +390,42 @@ def main():
     # the law is unaffected - purely delivery robustness, so it can be
     # slow relative to the 1 ms period.
     tcp_refresh_s = ep.get("tcp_refresh_ms", 100) / 1e3
-    # Forget a flow-set the receiver has stopped reporting for this long.
-    # Without it the table only ever grows: every flow-set ever seen stays
-    # in fail-open forever, ticking, actuating and writing budgets.
-    evict_s = ep.get("flow_evict_s", 30)
+    # N_3 (design.md §4.4): forget a flow-set the receiver has stopped
+    # reporting for this long. Without it the table only ever grows -
+    # every flow-set ever seen stays in fail-open forever, ticking,
+    # actuating and writing budgets.
+    evict_s = ep.get("n3_evict_s", ep.get("flow_evict_s", 30))
+    # §5.1 transition-process clause: the contract binds the TRANSITION,
+    # not only the steady state - a rate change violent enough that the
+    # controlled transport reads it as a fault is a dropped packet in
+    # effect. The law's own output already satisfies this (the target
+    # moves with a 1/k time constant, so consecutive budget flushes
+    # differ by a few percent). What needs limiting is an externally
+    # injected STEP, and the path it takes is Tree_f: pace = min(R, Tree)
+    # and Tree does NOT go through the tracking law, so an operator
+    # dropping a MaxRate by 20x reaches the executor in one write.
+    # Measured: that step risks a terminal RDMA connection failure (1 in
+    # 3), while steady operation at the same low rate is entirely safe -
+    # the danger is the RATIO OF THE FALL, not the destination.
+    #
+    # Limited as a halving per interval rather than a fixed slope, so it
+    # is scale-free like everything else in v2; the interval is one budget
+    # flush.
+    #
+    # Why this cannot become the convergence bottleneck the deleted slew
+    # became - and the argument is structural, not a rate comparison.
+    # (A rate comparison would be wrong: the law's INSTANTANEOUS descent
+    # is k times the log gap, not k, so against a 20x target step it runs
+    # at 20*ln20 = 60 s^-1, faster than this limiter's ln2/0.013 = 53.)
+    # The real reason is min(): the limiter only ever holds Tree ABOVE
+    # what it would otherwise be, and pace = min(R, Tree), so a lagging
+    # Tree can only be the un-selected side. Whatever descent the law
+    # commands through R passes through untouched. The deleted slew sat
+    # on the budget itself, downstream of the min, which is exactly why
+    # it could throttle the law.
+    tree_halve_s = ep.get("tree_step_halving_s", 0.013)
+    tree_applied = {}      # fsid -> Tree_f as actually applied
+    tree_ts = time.monotonic()
 
     def track(st, target, now):
         """track_step bound to one flow-set's wall-clock anchor."""
@@ -410,7 +449,22 @@ def main():
     trees = {}   # fsid -> Tree_f, recomputed on telemetry / ticker
 
     def tree_of(f):
-        return trees.get(f, ctl["tree_stub_bps"])
+        return tree_applied.get(f, trees.get(f, ctl["tree_stub_bps"]))
+
+    def apply_trees(now_):
+        """Let Tree_f rise freely, limit how fast it may fall."""
+        nonlocal tree_ts
+        dt_ = max(now_ - tree_ts, 0.0)
+        tree_ts = now_
+        floor_ratio = 2.0 ** (-dt_ / tree_halve_s) if tree_halve_s > 0 else 0.0
+        for f, want in trees.items():
+            prev = tree_applied.get(f)
+            if prev is None or want >= prev:
+                tree_applied[f] = want          # ascent is immediate
+            else:
+                tree_applied[f] = max(want, prev * floor_ratio)
+        for f in [f for f in tree_applied if f not in trees]:
+            del tree_applied[f]
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -532,7 +586,8 @@ def main():
                     fresh.append(fsid)
                 st.r = rec.get("r", 0)
             _t0 = time.monotonic()
-            trees = stree.trees(flows)      # §3.6 tree follows demand
+            trees = stree.trees(flows)      # §4.3 tree follows demand
+            apply_trees(now)                # §5.1 transition limiting
             tree_us = int((time.monotonic() - _t0) * 1e6)
             for fsid in fresh:
                 flows[fsid].R = tree_of(fsid)   # optimistic start (§4.2)
