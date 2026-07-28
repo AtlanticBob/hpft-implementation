@@ -195,7 +195,7 @@ for i in range(400):
 check("F2 the limiter can only raise pace, never delay a descent",
       worst_low >= 0.0 and abs(gap_end) < 1e3,
       "pace_limited - pace_unlimited >= 0 throughout (min %.1e) and closes "
-      "to %.1e; the deleted slew sat downstream of the min, which is why "
+      "to %.1e; a limiter on the budget would sit downstream of the min, where it could throttle the law"
       "it could throttle the law" % (worst_low, gap_end))
 
 check("F3 ascent is immediate",

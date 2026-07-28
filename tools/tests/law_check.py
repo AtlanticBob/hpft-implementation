@@ -114,7 +114,7 @@ check("B2 deep recovery (0.05 ehat)", abs(deep - pred_deep) < 0.02,
 
 down = settle_s(EHAT, 0.5 * EHAT)
 check("B3 down-step symmetric with up", abs(down - up) < 0.010,
-      "%.0f ms down vs %.0f ms up (v1 slew-limited: 580 ms)"
+      "%.0f ms down vs %.0f ms up "
       % (down * 1e3, up * 1e3))
 
 # no overshoot in either direction, ever (asymptotic approach)
@@ -158,7 +158,7 @@ while t < 2.0:
     u = EHAT * (1.0 - GAMMA * s)
     R = tx_agent_e.track_step(R, u, T, K, FLOOR)
     # wire follows the pace exactly (executor realisation 1.0: the
-    # pessimistic case - v1's drain dead-zone was only survivable
+    # pessimistic case - the drain dead-zone is the pessimistic term here
     # because realisation was < 1)
     marker.step({fs: R}, {fs: EHAT}, {fs: EHAT}, T)
     hist.append((t, s, R))
