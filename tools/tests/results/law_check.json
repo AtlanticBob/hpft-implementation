@@ -1,0 +1,74 @@
+{
+  "registry": "/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-registry.json",
+  "k": 20.0,
+  "gamma": 0.25,
+  "period_s": 0.001,
+  "V_bits": 600000000.0,
+  "checks": [
+    {
+      "name": "A1 pack/parse round-trip",
+      "ok": true,
+      "detail": "3 records, 80 B/record, seq=0"
+    },
+    {
+      "name": "A2 rec size matches sender",
+      "ok": true,
+      "detail": "rx=80B tx=80B"
+    },
+    {
+      "name": "A3 truncated datagram degrades",
+      "ok": true,
+      "detail": "2 of 3 records recovered, no exception"
+    },
+    {
+      "name": "A4 runt datagram ignored",
+      "ok": true,
+      "detail": "returns {}"
+    },
+    {
+      "name": "B1 up-step (ehat x2) -> 5% band",
+      "ok": true,
+      "detail": "131 ms measured vs 132 ms predicted (2.6/k)"
+    },
+    {
+      "name": "B2 deep recovery (0.05 ehat)",
+      "ok": true,
+      "detail": "204 ms measured vs 206 ms predicted (4.1/k)"
+    },
+    {
+      "name": "B3 down-step symmetric with up",
+      "ok": true,
+      "detail": "133 ms down vs 131 ms up (v1 slew-limited: 580 ms)"
+    },
+    {
+      "name": "B4 no overshoot either direction",
+      "ok": true,
+      "detail": "max over 0.000e+00, max under 0.000e+00"
+    },
+    {
+      "name": "B5 1 s stall does not overshoot",
+      "ok": true,
+      "detail": "exact -> 10.000G (<= target); literal k*dt -> 5.243e+25 G"
+    },
+    {
+      "name": "B6 u=0 clamps to pace floor",
+      "ok": true,
+      "detail": "R stays finite and positive (ln domain guarded by the floor)"
+    },
+    {
+      "name": "C1 residual ledger self-heals (prop 3)",
+      "ok": true,
+      "detail": "1/e at 247 ms vs 240 ms predicted (V/(gamma*ehat)), realisation=1.0"
+    },
+    {
+      "name": "C2 discount stays inside its band",
+      "ok": true,
+      "detail": "R in [8.09G, 10.00G], band is [7.50G, 10.00G]"
+    },
+    {
+      "name": "C3 overdamped at 10G share, no ringing",
+      "ok": true,
+      "detail": "zeta=1.10 (design_theory table: 1.10), 0 direction changes in the tail"
+    }
+  ]
+}

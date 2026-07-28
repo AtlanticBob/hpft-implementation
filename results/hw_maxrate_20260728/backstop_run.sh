@@ -3,7 +3,6 @@
 #
 # That is the whole reason the hardware cap exists: the selling principle
 # is supposed to survive the software being wrong. M5d showed this under
-# the v1 stack (a VF hard-capped at 8G measured 7.72G while the software
 # layer handed its share to the others). Two things make it worth redoing
 # under v2. The response law is different - it now tracks a receiver-
 # supplied target rather than searching - and a hardware cap below that

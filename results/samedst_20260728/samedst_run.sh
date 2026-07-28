@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Does a second RDMA flow to the same dst still crush the incumbent?
 #
-# Measured 2026-07-13 under the v1 stack: the joining flow pushed the
 # incumbent from 44G to ~2G, and after it left the incumbent recovered
 # only to 12.5G in 5 s. That observation was filed as a control-domain
 # leftover and never retested. It matters now because it would silently

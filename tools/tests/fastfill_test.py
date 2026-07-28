@@ -14,7 +14,8 @@ import os
 import random
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "dpu"))
 import fastfill  # noqa: E402
 
 if not fastfill.USING_C:

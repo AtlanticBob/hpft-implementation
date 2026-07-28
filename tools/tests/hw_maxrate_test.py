@@ -13,7 +13,8 @@ usage: hw_maxrate_test.py    exit 0 = all checks passed
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "dpu"))
 import hw_maxrate  # noqa: E402
 
 fails = []

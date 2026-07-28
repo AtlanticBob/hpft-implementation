@@ -55,7 +55,7 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
 （V=600 Mbit）。取值理由与收敛闭式见 `hpft-design` 仓库的
 `docs/design.md` §3.4/§4.2/§6 与 `docs/design_theory.md`；离线验收
 （wire 往返 + 三条收敛闭式 + 账本自愈）跑
-`results/acceptance_20260727/law_check.py`。
+`tools/tests/law_check.py`。
 
 ## 硬性规则
 
