@@ -30,14 +30,21 @@ D=70; JOIN=25; LEAVE=45; QN=4
 # cap; at 60G each can hold a ~29G ceiling and they never contend for the
 # allocator's second layer. That splits "contention for a shared cap" from
 # "two flows down one receive path" - the two live hypotheses.
-DSTCAP=${1:-30000000000}; TAG=${2:-sd}
+DSTCAP=${1:-30000000000}; TAG=${2:-sd}; THETA=${3:-}
+# theta=0 makes every active flow-set count as backlogged, which freezes
+# the backlog criterion entirely: the split becomes a fixed 15/15 from
+# policy alone. If the oscillation survives that, the criterion is not
+# what is driving it and the executor is.
 mkdir -p "$OUT"; cd "$REPO"
-python3 - "$DSTCAP" <<EOF
+THETA="$THETA" python3 - "$DSTCAP" <<EOF
 import json, sys
 r = json.load(open("config/lab-registry.json"))
 for vm, p in r["policy"]["vms"].items():
     p["max_rate_bps"] = 30000000000
 r["policy"]["vms"]["sgpu02/vf0"]["max_rate_bps"] = int(sys.argv[1])
+import os
+if os.environ.get("THETA"):
+    r["e_params"]["backlog_theta"] = float(os.environ["THETA"])
 json.dump(r, open("/tmp/lr_sd.json", "w"), indent=2)
 EOF
 scp -q /tmp/lr_sd.json hpft-dpu:/tmp/lr.json;  ssh hpft-dpu  'sudo cp /tmp/lr.json /opt/hpft/lab-registry.json'
