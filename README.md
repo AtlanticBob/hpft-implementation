@@ -27,8 +27,7 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
 2. **这个仓库怎么用**：往下看"现行系统"和"代码地图"两节。
 3. **动 lab 前必读**：`docs/ops_notes.md`（在 `hpft-design` 仓库）——
    平台缺陷病历与实验卫生规则，每一条都有事故背书。
-4. **实验数据找什么、信不信得过**：`results/EXPERIMENT_STATUS.md`——
-   哪些实验是旧配置（2026-07-13/14 三个配置边界之前），结论按边界打折。
+
 
 ## 现行系统
 
@@ -60,12 +59,13 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
 
 ## 硬性规则
 
-- PCC device 码（`tools/dpu/pcc/`）改动前先备份（`backup/` 惯例）；改
-  完要 `meson setup --reconfigure build && ninja -C build pcc/doca_pcc`
-  （在 hpft-dpu 上）才会真正生效，改完不重编是常见坑。
-- TCP shaper 叫 "host fq+edt"，不叫 "opt3"；DPU 侧 TCP 卸载（原 T3.2）
-  已暂停（架构性负结论，见 `hpft-design` 仓库 `docs/archive/
-  superseded-designs.md`），除非用户重提不要重启。
+- PCC device 码（`tools/dpu/pcc/`）改完要
+  `meson setup --reconfigure build && ninja -C build pcc/doca_pcc`
+  （在 hpft-dpu 上）才会真正生效——`ninja` 单独不重编设备码（dpacc 是
+  configure 步），改完不重编是常见坑。
+- TCP shaper 叫 "host fq+edt"；DPU 侧 TCP 卸载已暂停（架构性负结论：
+  OVS 占据 representor ingress，没有既透明又保持 pacing 语义的挂载点），
+  除非用户重提不要重启。
 - dpu2 underlay-p1 上的分类 OpenFlow 规则、遥测通道等运行时状态，
   重启会丢，`rx_agent`/`cc_mode.sh` 的恢复流程会自动重装，不要手工删。
 - lab 默认停留态、切换 CC 模式：`tools/cc_mode.sh status`/`dcqcn`/`pcc`
@@ -102,6 +102,5 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
   用法与"fw reset 不清 OVS"等坑见头注释与 `hpft-design` 的 ops_notes.md。
 - `tcp/bpf-opt3/` —— TCP 执行面（host fq+edt 的 BPF 实现）。
 - `config/lab-registry.json` —— 唯一真值配置。
-- `results/<experiment>_<UTC日期>/` —— 工程验证/回归实验产物；论文
-  评估章节引用的那部分实验已经搬到 `hpft-paper` 仓库，此处剩下的是
-  纯工程向的验证/压测数据，见 `results/EXPERIMENT_STATUS.md` 的分类。
+- `results/<experiment>_<UTC日期>/` —— 工程验证/回归实验产物，每个目录
+  一份 `summary.md`；论文评估章节引用的实验在 `hpft-paper` 仓库。
