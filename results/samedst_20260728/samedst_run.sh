@@ -78,6 +78,20 @@ sleep 2
 SAMP=$!
 trap 'kill $SAMP 2>/dev/null; restore_standing' EXIT
 
+# Device-side probe. 0xdeb gives {flowtag,budget,level,remote_rx}, 0xdec
+# gives {.,.,qp_count,cc_rate,.,flowtag}. Each response is printed just
+# before the HPFT_SET line that carries the probe type and pair index, so
+# the two can be paired unambiguously in a log the agent is also writing.
+if [ "${PROBE:-0}" = "1" ]; then
+  ssh hpft-dpu 'echo "PROBE_START $(date +%s.%N)" > /tmp/rp_probe_mark;
+    ( for i in $(seq 1 300); do
+        for p in 0 1 2 3; do
+          echo "0xdeb $p" > /tmp/rp_fifo; echo "0xdec $p" > /tmp/rp_fifo
+        done
+        sleep 1
+      done ) >/dev/null 2>&1 &' &
+fi
+
 t0=$(date +%s.%N); echo "$t0" > "$OUT/${TAG}_t0.txt"; : > "$OUT/${TAG}_events.txt"
 $PT -d mlx5_6 -p 26420 -q $QN --report_gbits -D $D 10.1.0.2 > "$OUT/${TAG}_A.txt" 2>&1 &
 A=$!
@@ -92,4 +106,7 @@ echo "$(date +%s.%N) leave" >> "$OUT/${TAG}_events.txt"
 wait $A; echo "A rc=$?" >> "$OUT/${TAG}_events.txt"
 sleep 2
 ssh hpft-dpu 'sudo cat /tmp/hpft_txagent_e.jsonl' > "$OUT/${TAG}_tx.jsonl"
+if [ "${PROBE:-0}" = "1" ]; then
+  ssh hpft-dpu 'pkill -f "0xdeb" 2>/dev/null; grep -a -A1 HPFT_RSP /tmp/pcc_rp.log | grep -aE "HPFT_RSP|ft=0xde" | tail -4000' > "$OUT/${TAG}_rp.txt" 2>/dev/null
+fi
 echo "sd-done"

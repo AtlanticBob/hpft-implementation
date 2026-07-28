@@ -354,6 +354,9 @@ class HybridRates:
         self.meter = meter                # VportMeter or None
         self.attr_meter = set()           # dsts meter-attributed this tick
         self.hist = []                    # (t, fs_delta_bytes) for the mix
+        self.first_seen = {}              # fsid -> when it entered the mix
+        self.unmeasured = set()           # fsids with no bytes in the window
+        self.prev_ents = {}               # last tick's entitlements (prior)
         self.ring = {}                    # vnic -> deque of (t, bytes)
         self._fd = {}
         self.r_d = {}                     # vnic -> fresh vport rate
@@ -399,14 +402,47 @@ class HybridRates:
         for f in set(fs_present) | set(win):
             dst = f.rsplit("|", 1)[0].split(">")[1]
             by_dst.setdefault(dst, set()).add(f)
+            self.first_seen.setdefault(f, now)
+        for f in [f for f in self.first_seen if f not in fs_present
+                  and f not in win]:
+            del self.first_seen[f]
         shares = {}
+        unmeasured = set()
         for dst, members in by_dst.items():
-            wtot = sum(win.get(f, 0) for f in members)
+            # "no bytes in the window" means two completely different
+            # things, and conflating them is what let one sender be
+            # credited with another's traffic. A flow-set that has been in
+            # the mix for longer than the window and still shows nothing is
+            # genuinely idle and its share is 0. One that appeared less
+            # than a window ago is merely UNMEASURED: the megaflow dump is
+            # hardware-cached ~1 s and this window is 2 s, so a sender that
+            # just started legitimately has no history yet.
+            #
+            # Giving an unmeasured member 0 is not a small error, it is the
+            # worst possible one: its whole rate lands on its peers, the
+            # peer then reads far above the budget it was given, and the
+            # RP's water level digs that peer to zero. Measured 2026-07-28
+            # with two senders on one dst: the incumbent was reported at
+            # 58.3G against a true 29G while the newcomer read 0.00G.
+            #
+            # Until its own bytes arrive, an unmeasured member is assumed
+            # to look like the average of its measured peers - the least
+            # committal guess that keeps the split conservative, and the
+            # exactly right one for the common case of a peer joining at a
+            # similar rate. It expires by itself after one window.
+            eff = {}
             for f in members:
-                shares[f] = (win.get(f, 0) / wtot) if wtot > 0 \
+                b = win.get(f, 0)
+                eff[f] = b
+                if b <= 0:
+                    unmeasured.add(f)
+            wtot = sum(eff.values())
+            for f in members:
+                shares[f] = (eff[f] / wtot) if wtot > 0 \
                     else 1.0 / len(members)
         self.mix_shares = shares
         self.by_dst = by_dst
+        self.unmeasured = unmeasured
 
     def sample(self, now, period):
         """Read every dst-VF vport counter and update its rate estimate.
@@ -506,10 +542,7 @@ class HybridRates:
                     pools = {"kern": min(kern, total)}
                     pools["rdma"] = max(total - pools["kern"], 0.0)
             if pools is None:
-                for f in members:
-                    share = self.mix_shares.get(f, 1.0 / len(members))
-                    if share > 0:
-                        rates[f] = total * share
+                self._split(list(members), total, rates)
                 continue
             groups = {"kern": [], "rdma": []}
             for f in members:
@@ -522,13 +555,53 @@ class HybridRates:
                 if not fs:
                     self.unattributed += pool
                     continue
-                wsum = sum(self.mix_shares.get(f, 0.0) for f in fs)
-                for f in fs:
-                    share = (self.mix_shares.get(f, 0.0) / wsum) \
-                        if wsum > 0 else 1.0 / len(fs)
-                    if share > 0:
-                        rates[f] = pool * share
+                self._split(fs, pool, rates)
         return rates
+
+    def _split(self, fs, pool, out):
+        """Divide one exactly-measured pool among its flow-sets.
+
+        Which ruler splits this pool. The megaflow byte ratio is
+                # a MEASUREMENT and is preferred - but only when every
+                # member has actually been measured. A member with no bytes
+                # in the window is not evidence of silence: the dump is
+                # hardware-cached and a sender that just started can go
+                # seconds without appearing, during which the ratio hands
+                # its entire rate to its peers. Measured 2026-07-28: two
+                # RDMA senders on one dst reported 58.3G / 0.00G against a
+                # true 29 / 29, and the peer's executor then dug its own
+                # rate to zero for being "over budget".
+                #
+                # When any member is unmeasured, split by the previous
+                # tick's ENTITLEMENTS instead. That prior is exactly the
+                # right one and it handles both cases with no extra rule:
+                # a sender we granted a share is assumed to be using it,
+                # while a genuinely idle flow-set has a demand-capped
+                # entitlement near zero and so still gets ~nothing. The
+        sum being split is the exact vport total either way - only its
+        division is in question.
+        """
+        if not fs:
+            return
+        w = {f: self.mix_shares.get(f, 0.0) for f in fs}
+        if any(f in self.unmeasured for f in fs):
+            # ABSENT from the prior and PRESENT-BUT-NEAR-ZERO are different
+            # again, and defaulting the absent case to 0 reproduces the very
+            # bug this prior exists to fix: a flow-set created this tick has
+            # no previous entitlement, would weigh 0, and its peer would once
+            # more be credited with the whole pool. An unknown newcomer is
+            # assumed to look like the average of the flow-sets we do know;
+            # one we know to be idle keeps its own near-zero weight.
+            known = [self.prev_ents[f] for f in fs if f in self.prev_ents]
+            fill = (sum(known) / len(known)) if known else 1.0
+            w = {f: self.prev_ents.get(f, fill) for f in fs}
+            if sum(w.values()) <= 0:
+                w = {f: 1.0 for f in fs}
+        wsum = sum(w.values())
+        for f in fs:
+            share = (w[f] / wsum) if wsum > 0 else 1.0 / len(fs)
+            if share > 0:
+                out[f] = pool * share
 
 
 def waterfill(capacity, items):
@@ -692,7 +765,13 @@ class Scheduler:
 
 
 class RootCongestion:
-    """Hysteretic saturation state of the root (design.md §3.2.2).
+    """Hysteretic saturation state of ONE node of the policy tree.
+
+    Named for the root because that is where it started, but the test is
+    not special to the root: any node whose capacity is fully claimed is
+    a place where flow-sets contend, and a flow-set below a saturated
+    node is contending whether or not it happens to be realising much
+    right now. One instance per node - see NodeSaturation.
 
     Entering closes borrowing, which lowers utilisation, which would
     immediately look like "not congested" again - so the exit threshold
@@ -713,8 +792,71 @@ class RootCongestion:
         return self.on
 
 
+class NodeSaturation:
+    """Saturation of every dst-VM node, the layer between root and class.
+
+    Why this exists, and why it is a better criterion than the share test
+    it takes over from. Backlog discrimination has to answer "is this
+    flow-set held back by US, or does it simply have nothing to send",
+    and the share test answers it by thresholding the flow-set's own
+    measured rate against its share. That quantity is the one thing the
+    receiver CANNOT measure per sender: a dst VF's total is exact from
+    its vport counter, but splitting that total among several senders is
+    an estimate from a megaflow byte ratio that lags seconds behind a
+    sender joining. Threshold an estimate and you get the estimate's
+    errors amplified into policy - measured 2026-07-28, two RDMA senders
+    on one dst, the split reported 58.3G / 0.00G against a true 29 / 29.
+
+    The saturation test needs no split. The SUM of the estimates is the
+    exact vport total no matter how badly the split is wrong, because the
+    split is a partition of it. So compare that sum against the node's
+    own capacity: if a dst VM is at its MaxRate, every sender aimed at it
+    is contending, full stop, and each of their ceilings must collapse to
+    the joint fair share instead of each being computed as though it were
+    alone. Without this the ceilings are individually right and jointly
+    impossible - each flow-set's e-hat is defined with its OWN demand set
+    to infinity, so two senders both acting on theirs sum to twice the
+    cap, and the virtual queue cannot claw that back: its discount is
+    bounded by gamma = 0.25 by construction.
+
+    Root congestion was always this same test on one particular node. It
+    stays as it was; this generalises it downward.
+    """
+
+    def __init__(self, enter=0.95, leave=0.85):
+        self.enter, self.leave = enter, leave
+        self.nodes = {}
+
+    def update(self, active, caps):
+        """active: {fsid: rate}; caps: {dst_vnic: max_rate_bps}.
+
+        Returns the set of saturated dst vnics.
+        """
+        totals = {}
+        for f, r in active.items():
+            pair = f.rsplit("|", 1)[0]
+            if ">" not in pair:
+                continue
+            dst = pair.split(">")[1]
+            totals[dst] = totals.get(dst, 0.0) + r
+        for dst in list(self.nodes):
+            if dst not in totals:
+                del self.nodes[dst]
+        out = set()
+        for dst, tot in totals.items():
+            cap = caps.get(dst)
+            if not cap:
+                continue
+            n = self.nodes.get(dst)
+            if n is None:
+                n = self.nodes[dst] = RootCongestion(self.enter, self.leave)
+            if n.update(tot, cap):
+                out.add(dst)
+        return out
+
+
 def demand_estimate(active, shat, delta, theta, big, congested,
-                    share_test=True):
+                    share_test=True, saturated_dsts=()):
     """Per-flow-set demand for the fill (design.md §3.2.1-§3.2.2).
 
     An idle flow-set (r = 0) is never backlogged. A non-idle one is
@@ -734,8 +876,11 @@ def demand_estimate(active, shat, delta, theta, big, congested,
     """
     out = {}
     for f, r in active.items():
+        pair = f.rsplit("|", 1)[0]
         backlogged = r > 0 and (
             congested or
+            (saturated_dsts and ">" in pair
+             and pair.split(">")[1] in saturated_dsts) or
             (share_test and shat.get(f, 0.0) > 0 and r >= theta * shat[f]))
         out[f] = big if backlogged else r * (1.0 + delta)
     return out
@@ -992,6 +1137,7 @@ def main():
     last_print = t_start
     nticks_total = 0
     rootcong = RootCongestion()
+    nodesat = NodeSaturation()
     last_speed = c_link
     sched.set_downlink(c_link)
 
@@ -1127,15 +1273,26 @@ def main():
                 # a finite "big" (root capacity), NOT inf: it saturates the
                 # class demand cap exactly like inf but survives int(ceil_f)
                 # in the telemetry pack (inf overflows).
+                # A dst VM at its MaxRate saturates the tree node that
+                # its senders share, which makes every one of them
+                # contending regardless of how the (estimated) split
+                # attributes the exact total between them.
+                sat = nodesat.update(active, {
+                    v: p.get("max_rate_bps")
+                    for v, p in sched.policy.get("vms", {}).items()
+                }) if ep.get("backlog_node_saturation", True) else set()
                 demand = demand_estimate(
                     active, shat, ep["delta_demand"],
                     ep.get("backlog_theta", 0.5), sched.c_root,
                     root_congested,
-                    share_test=ep.get("backlog_share_test", True))
+                    share_test=ep.get("backlog_share_test", True),
+                    saturated_dsts=sat)
             else:
                 demand = {f: r * (1.0 + ep["delta_demand"])
                           for f, r in active.items()}
             ents, ceils = sched.entitlements(active, demand)
+            # the split prior for the next tick (see HybridRates.rates)
+            hybrid.prev_ents = ents
             marks = marker.step(sched_rates, ents, ceils, dt)
             # §3.4 target synthesis: the policy ceiling discounted by the
             # audited sustained excess. Bounded by construction - no

@@ -552,6 +552,14 @@ def main():
         elif cls == "rdma":
             ft = pair_ft.get(src_dst, flowtags.get(src))
             if ft is not None:
+                # r_bps is the receiver's rate for this flow-set and it
+                # drives the RP's water level. Withholding it when a dst
+                # has several senders was tried and is WORSE: the device
+                # falls back to its own TX-event estimate, which undercounts,
+                # so it reads under budget and lets the wire run to the
+                # sender tree (measured 2.6x the granted pace). The fix
+                # belongs where the error was - in the receiver's split -
+                # not in refusing to use its output.
                 rdma_batch.append((ft, pace, r_bps))
         st.pace = pace
         # executor-escape tripwire (log-only). Every stress-D1 failure class
@@ -595,6 +603,11 @@ def main():
     # freshest snapshot at the mailbox rate. The RDMA congestion response
     # stays event-speed on the DPA; only the policy target is rate-limited.
     latest_rdma = {}    # flowtag -> (budget_bps, rx_rate_bps)
+    # dsts whose RDMA rate the receiver can only split by estimate, i.e.
+    # those carrying more than one RDMA sender. Recomputed per datagram
+    # from the FULL record set (not the local filter): a remote sender we
+    # do not pace still makes our own dst's split an estimate.
+    ambiguous_dsts = set()
     rdma_sent_budget = {}   # flowtag -> last budget written (hysteresis)
     rdma_push_s = ep.get("rdma_push_ms", 13) / 1e3
     last_rdma_push = time.monotonic()
@@ -627,6 +640,14 @@ def main():
         rdma_batch = []
         if recs_all:
             last_any_rx = now
+            srcs_per_dst = {}
+            for f in recs_all:
+                sd, c = f.rsplit("|", 1)
+                if c == "rdma":
+                    s_, d_ = sd.split(">")
+                    srcs_per_dst.setdefault(d_, set()).add(s_)
+            ambiguous_dsts = {d for d, ss in srcs_per_dst.items()
+                              if len(ss) > 1}
             recs = {f: rec for f, rec in recs_all.items()
                     if f.split(">")[0].startswith(local_host + "/")}
             fresh = []
@@ -641,7 +662,24 @@ def main():
             apply_trees(now)                # §5.1 transition limiting
             tree_us = int((time.monotonic() - _t0) * 1e6)
             for fsid in fresh:
-                flows[fsid].R = tree_of(fsid)   # optimistic start (§4.2)
+                # Optimistic start (§4.2), but no more optimistic than what
+                # the receiver has ALREADY said. Tree_f is the sender-local
+                # allowance and is the right start when nothing better is
+                # known; the very record that creates this flow-set carries
+                # u_f, which is the receiver's ceiling for it right now.
+                # Starting above u and tracking down means the first budget
+                # written to the executor is knowingly too large.
+                #
+                # It matters most in exactly the case that hurts: joining a
+                # dst that is already at its MaxRate. There u is the joint
+                # fair share while Tree is the whole VM allowance, so the
+                # old start doubled the load on a saturated node for the
+                # 50 ms the law needs to come down - and the RDMA executor
+                # reads a 2x over-budget condition as something to dig out
+                # of, hard, for both senders at once (2026-07-28).
+                u0 = recs[fsid].get("u", 0)
+                flows[fsid].R = min(tree_of(fsid), u0) if u0 > 0 \
+                    else tree_of(fsid)
             for fsid, rec in recs.items():
                 st = flows[fsid]
                 st.last_rx = now
