@@ -21,7 +21,7 @@ cd "$REPO"
 # output shows, whereas the wrong code produces a crashed agent and
 # plausible numbers that show nothing.
 RX_FILES="tools/dpu/rx_agent.py tools/dpu/fastfill.py"
-TX_FILES="tools/dpu/tx_agent_e.py tools/dpu/fastfill.py"
+TX_FILES="tools/dpu/tx_agent_e.py tools/dpu/fastfill.py tools/dpu/hw_maxrate.py"
 bad=0
 warn=0
 

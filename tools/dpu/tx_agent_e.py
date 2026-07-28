@@ -34,6 +34,7 @@ import struct
 import time
 
 import fastfill
+import hw_maxrate
 from fastfill import waterfill_ceilings
 
 FIFO = "/tmp/rp_fifo"   # PCC RP mailbox (batched: 0xb47c000N ft bud rate ...)
@@ -448,6 +449,56 @@ def main():
                        ep["delta_demand"], floor)
     trees = {}   # fsid -> Tree_f, recomputed on telemetry / ticker
 
+    # §4.3 layer one. The hardware cap is programmed from the same policy
+    # that feeds the tree, so the two layers can never be configured apart,
+    # and it is reasserted on every reload because a firmware reset or a
+    # hand-run devlink command silently drops it.
+    hw = hw_maxrate.HwMaxRate(local_host, reg["vnics"])
+    hw.discover()
+
+    def sync_hw(why):
+        if hw.error:
+            # Layer two still enforces the same numbers; what is lost is
+            # the guarantee that it keeps enforcing them if this agent
+            # stops. Worth a loud line, not worth refusing to run.
+            print("tx_agent_e: hardware MaxRate UNAVAILABLE (%s) - selling "
+                  "principle is software-only this run" % hw.error, flush=True)
+            return
+        changed, errors = hw.sync(hw_maxrate.caps_from_policy(
+            stree.policy, reg["vnics"], local_host))
+        for v, bps in sorted(changed.items()):
+            print("tx_agent_e: hw MaxRate %s -> %.2fG (%s)"
+                  % (v, bps / 1e9, why), flush=True)
+        for v, e in sorted(errors.items()):
+            print("tx_agent_e: hw MaxRate %s FAILED: %s" % (v, e), flush=True)
+
+    sync_hw("startup")
+
+    # Policy hot-reload, the sender's counterpart to the receiver's. Both
+    # layers must move together: reloading only the tree would leave the
+    # hardware enforcing the old allowance (and a raise would not take
+    # effect at all), while reloading only the hardware would leave the
+    # tree handing out shares the NIC refuses to send.
+    reg_mtime = os.stat(args.registry).st_mtime
+    reload_period_s = 0.2
+    last_reload_chk = time.monotonic()
+
+    def maybe_reload(now_):
+        nonlocal reg_mtime, last_reload_chk
+        if now_ - last_reload_chk < reload_period_s:
+            return
+        last_reload_chk = now_
+        try:
+            mt = os.stat(args.registry).st_mtime
+            if mt == reg_mtime:
+                return
+            reg_mtime = mt
+            stree.policy = json.load(open(args.registry))["policy"]
+            print("tx_agent_e: policy reloaded", flush=True)
+            sync_hw("reload")
+        except (OSError, ValueError) as e:
+            print("tx_agent_e: policy reload failed: %s" % e, flush=True)
+
     def tree_of(f):
         return tree_applied.get(f, trees.get(f, ctl["tree_stub_bps"]))
 
@@ -633,6 +684,7 @@ def main():
         # Tree_f the way a linear ramp plus min() clamp could.
         if now - last_ticker >= period:
             last_ticker = now
+            maybe_reload(now)
             mailbox.ensure_open()
             # Eviction, and why it is gated on telemetry being alive: a
             # flow-set going quiet and the telemetry channel dying look
