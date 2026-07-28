@@ -197,7 +197,7 @@ check("D7 fail-open climbs towards Tree_f",
          len(fo)))
 
 # mailbox: batches at the coalescing rate, budget descends on the
-# down-step (this is the line the deleted slew used to hold back)
+# down-step (this is the line a descent limit on the budget would hold back)
 gaps = [b[0] - a[0] for a, b in zip(budgets, budgets[1:])]
 med = sorted(gaps)[len(gaps) // 2] if gaps else 0
 check("D8 RDMA budgets coalesced at ~13 ms",
