@@ -1,0 +1,1 @@
+tick_us fast n=4902 p50=185 p90=263 p99=317 p999=370 max=447 | slow n=49 p50=3923 max=4603 | over_period=49
