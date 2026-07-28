@@ -548,7 +548,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		 * the host uses, and it costs one hash probe on a path that
 		 * already computed the hash.
 		 */
-		if (target >= 0 && qslot >= 0) {
+		if (target >= 0 && qslot >= 0 && qpn > 1) {
 			g_qpn_key[qslot] = qpn + 1;
 			g_qpn_pair[qslot] = (uint32_t)target;
 			/* seen now, countable from the NEXT epoch */
@@ -556,7 +556,17 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			qh = (uint32_t)qslot;	/* count it below */
 		}
 	}
-	if (target >= 0) {
+	/* QP0 and QP1 are reserved by the IB spec for management (SMI and
+	 * GSI) and never carry data; the GSI QP in particular exists on
+	 * every RoCE device, is owned by ib_core, and stays live for the
+	 * lifetime of the port. Counting it toward N hands it a full 1/N of
+	 * the pair's allowance which it then never uses - measured
+	 * 2026-07-28 as one incast pair reading a stable N=5 against four
+	 * data QPs and delivering 4/5 of its budget. This is NOT an artefact
+	 * of the traffic generator: the same QP is present in any real
+	 * deployment, so the exclusion belongs in the device code.
+	 */
+	if (target >= 0 && qpn > 1) {
 		/* count this QP once per epoch */
 		uint32_t eid = g_hpft_pairs[target].epoch_id;
 
