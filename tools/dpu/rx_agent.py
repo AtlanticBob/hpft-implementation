@@ -866,8 +866,7 @@ class NodeSaturation:
         return out
 
 
-def demand_estimate(active, shat, delta, theta, big, congested,
-                    share_test=True, saturated_dsts=()):
+def demand_estimate(active, delta, big, congested, saturated_dsts=()):
     """Per-flow-set demand for the fill (design.md §3.2.1-§3.2.2).
 
     An idle flow-set (r = 0) is never backlogged. A non-idle one is
@@ -891,8 +890,7 @@ def demand_estimate(active, shat, delta, theta, big, congested,
         backlogged = r > 0 and (
             congested or
             (saturated_dsts and ">" in pair
-             and pair.split(">")[1] in saturated_dsts) or
-            (share_test and shat.get(f, 0.0) > 0 and r >= theta * shat[f]))
+             and pair.split(">")[1] in saturated_dsts))
         out[f] = big if backlogged else r * (1.0 + delta)
     return out
 
@@ -1267,40 +1265,22 @@ def main():
             # Hysteresis (enter 0.95, leave 0.85) keeps the two regimes
             # from chattering when a genuinely small flow leaves capacity
             # unused and utilisation drops back.
-            # backlog_congestion_aware gates this term so the A/B is a
-            # registry flip, not a different binary.
-            root_congested = (
-                rootcong.update(sum(active.values()), sched.c_root)
-                if ep.get("backlog_congestion_aware", True) else False)
-            if ep.get("backlog_floor", False):
-                # backlog-aware share floor (2026-07-13): the r*(1+delta)
-                # demand estimate caps a class at sum(per-flow demands), so
-                # a BACKLOGGED class with fewer flows (or a lower realize
-                # rate) is capped below its weighted share and the sibling
-                # class borrows the surplus -> class ratio drifts off the
-                # policy weight. shat is the all-backlogged fill: a neutral
-                # ruler that depends only on policy and the active set.
-                shat = sched._fill({f: float("inf") for f in active})
-                # a finite "big" (root capacity), NOT inf: it saturates the
-                # class demand cap exactly like inf but survives int(ceil_f)
-                # in the telemetry pack (inf overflows).
-                # A dst VM at its MaxRate saturates the tree node that
-                # its senders share, which makes every one of them
-                # contending regardless of how the (estimated) split
-                # attributes the exact total between them.
-                sat = nodesat.update(active, {
-                    v: p.get("max_rate_bps")
-                    for v, p in sched.policy.get("vms", {}).items()
-                }) if ep.get("backlog_node_saturation", True) else set()
-                demand = demand_estimate(
-                    active, shat, ep["delta_demand"],
-                    ep.get("backlog_theta", 0.5), sched.c_root,
-                    root_congested,
-                    share_test=ep.get("backlog_share_test", True),
-                    saturated_dsts=sat)
-            else:
-                demand = {f: r * (1.0 + ep["delta_demand"])
-                          for f, r in active.items()}
+            root_congested = rootcong.update(sum(active.values()),
+                                             sched.c_root)
+            # Every node of the policy tree that is at its capacity, not
+            # just the root. A dst VM at its MaxRate saturates the node its
+            # senders share, so all of them are contending - and this test
+            # needs no per-sender split, because however wrong the split
+            # is, the SUM of the estimates is the exact vport total.
+            sat = nodesat.update(active, {
+                v: p.get("max_rate_bps")
+                for v, p in sched.policy.get("vms", {}).items()})
+            # a finite "big" (root capacity), NOT inf: it saturates the
+            # class demand cap exactly like inf but survives int(ceil_f)
+            # in the telemetry pack (inf overflows).
+            demand = demand_estimate(active, ep["delta_demand"],
+                                     sched.c_root, root_congested,
+                                     saturated_dsts=sat)
             ents, ceils = sched.entitlements(active, demand)
             # the split prior for the next tick (see HybridRates.rates)
             hybrid.prev_ents = ents

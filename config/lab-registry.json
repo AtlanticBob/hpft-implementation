@@ -232,10 +232,7 @@
     "tcp_refresh_ms": 100,
     "rate_window_s": 0.02,
     "fs_grace_s": 0.5,
-    "backlog_floor": true,
-    "backlog_theta": 0.5,
     "backlog_congestion_aware": true,
-    "policy": null,
-    "backlog_share_test": true
+    "policy": null
   }
 }
