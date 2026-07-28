@@ -551,7 +551,8 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		if (target >= 0 && qslot >= 0) {
 			g_qpn_key[qslot] = qpn + 1;
 			g_qpn_pair[qslot] = (uint32_t)target;
-			g_qpn_epoch[qslot] = 0;
+			/* seen now, countable from the NEXT epoch */
+			g_qpn_epoch[qslot] = g_hpft_pairs[target].epoch_id;
 			qh = (uint32_t)qslot;	/* count it below */
 		}
 	}
@@ -563,9 +564,30 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			uint32_t idx = (qh + pr) % HPFT_QPMAP_SIZE;
 
 			if (g_qpn_key[idx] == qpn + 1) {
-				if (g_qpn_epoch[idx] != eid + 1) {
-					g_qpn_epoch[idx] = eid + 1;
-					g_hpft_pairs[target].qp_seen++;
+				if (g_qpn_epoch[idx] != eid) {
+					/* Count only QPs that are CONTINUOUSLY
+					 * sending: this one must also have been
+					 * seen in the immediately preceding
+					 * epoch. The level is budget/N, so a QP
+					 * that emits a handful of events per
+					 * second - a connection-management QP
+					 * alongside the data QPs - would
+					 * otherwise take a full 1/N of the
+					 * pair's allowance and never use it.
+					 * Measured 2026-07-28: one incast pair
+					 * read N=5 against four data QPs,
+					 * stably, and delivered 4/5 of its
+					 * budget - the 17% deficit that showed
+					 * up as Jain 0.996.
+					 *
+					 * A genuinely new data QP is counted
+					 * from its second epoch, i.e. 1 ms
+					 * late, which is below anything the
+					 * loop upstream can resolve.
+					 */
+					if (g_qpn_epoch[idx] + 1 == eid)
+						g_hpft_pairs[target].qp_seen++;
+					g_qpn_epoch[idx] = eid;
 				}
 				break;
 			}
