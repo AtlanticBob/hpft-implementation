@@ -334,6 +334,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					if (c->flowtag == eft) {
 						if (ebud == 0) {
 							c->flowtag = 0;
+							c->qp_count = 0;
 						} else {
 							if (c->budget != ebud) {
 									/* proportional feed-forward: level tracks bud/N,
@@ -366,6 +367,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					c->budget = ebud;
 					c->level = ebud;
 					c->cc_rate = DOCA_PCC_DEV_MAX_RATE;
+					c->qp_count = 0;	/* relearned from events */
 					c->remote_rx_rate = erx;
 					for (int s = 0; s < HPFT_MAX_THREADS; s++)
 						c->b32_shard[s] = 0;
@@ -496,20 +498,20 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		doca_pcc_dev_trace_flush();
 	}
 	int target = -1;
+	uint32_t qpn = doca_pcc_dev_get_flow_qpn(event);
+	uint32_t qh = (qpn * 2654435761u) % HPFT_QPMAP_SIZE;
+	int qslot = -1;
 
-	if (g_qpn_map_active) {
-		uint32_t qpn = doca_pcc_dev_get_flow_qpn(event);
-		uint32_t h = (qpn * 2654435761u) % HPFT_QPMAP_SIZE;
+	for (uint32_t pr = 0; pr < HPFT_QPMAP_PROBE; pr++) {
+		uint32_t idx = (qh + pr) % HPFT_QPMAP_SIZE;
 
-		for (uint32_t pr = 0; pr < HPFT_QPMAP_PROBE; pr++) {
-			uint32_t idx = (h + pr) % HPFT_QPMAP_SIZE;
-
-			if (g_qpn_key[idx] == qpn + 1) {
-				target = g_qpn_pair[idx];
-				break;
-			}
-			if (g_qpn_key[idx] == 0)
-				break;
+		if (g_qpn_key[idx] == qpn + 1) {
+			target = g_qpn_pair[idx];
+			break;
+		}
+		if (g_qpn_key[idx] == 0) {
+			qslot = (int)idx;	/* first free slot on this chain */
+			break;
 		}
 	}
 	if (target < 0) {
@@ -518,6 +520,33 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				target = i;
 				break;
 			}
+		}
+		/* Learn the QP here, on the event path.
+		 *
+		 * qp_count is what normalises the CNP decrease: the cut is
+		 * (cc_rate>>6)/nqp precisely so that the AGGREGATE response of
+		 * a pair does not scale with how many QPs it happens to have.
+		 * It was only ever incremented by the 0xB48E qpn-map mailbox,
+		 * and the sender agent does not send that format - it sends
+		 * 0xB47C batches - so nqp was 1 for every pair in production
+		 * and a 4-QP flow backed off four times harder than designed.
+		 *
+		 * Alone that is invisible, because a lone flow sitting at its
+		 * cap draws no CNPs. Put two senders on one dst, let them
+		 * briefly overshoot, and the resulting CNP burst collapses
+		 * cc_rate; since recovery is additive (MAX>>8 per epoch) the
+		 * wire then stays near zero for seconds. Measured 2026-07-28
+		 * as an 8 s limit cycle with both senders stalling together.
+		 *
+		 * Learning from the event stream makes the count reflect what
+		 * is actually running, independently of which mailbox format
+		 * the host uses, and it costs one hash probe on a path that
+		 * already computed the hash.
+		 */
+		if (target >= 0 && qslot >= 0) {
+			g_qpn_key[qslot] = qpn + 1;
+			g_qpn_pair[qslot] = (uint32_t)target;
+			g_hpft_pairs[target].qp_count++;
 		}
 	}
 	if (target >= 0) {
