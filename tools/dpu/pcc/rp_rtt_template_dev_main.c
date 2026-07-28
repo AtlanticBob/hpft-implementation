@@ -224,7 +224,7 @@ static volatile uint32_t g_hpft_cc_freeze;
 static volatile uint32_t g_hpft_ccrate_only;  /* EXPERIMENT 2026-07-22: when set,
 	 * results->rate = cc_rate directly (bypass min(cc_rate,level)) -
 	 * isolates this PCC-reimplemented DCQCN-style cc_rate state machine's
-	 * own convergence behavior from the software budget (level/MIMD),
+	 * own convergence behavior from the software budget (level),
 	 * for a clean "software DCQCN" comparison point against plain
 	 * firmware DCQCN (UPCC=0) and the full HPFT system (production
 	 * min(cc_rate,level)). Default 0 = production behavior unchanged. */

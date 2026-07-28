@@ -8,7 +8,7 @@
 # recreated (DPU reboot) - so coverage must be re-ensured, same as the
 # rx_agent's OpenFlow classification rules on the receiver DPU.
 #
-# Requires the EDT program already loaded and pinned by the v1 apply tool
+# Requires the EDT program already loaded and pinned by the apply tool
 # (tools/tcp_shaper/tools/tcp-shaper-apply); this script only repairs attachment drift.
 # pair_state seeding lives in hpft_pace_shim.py startup (restart the shim
 # after a full EDT re-apply). Idempotent; run on the sender host as root.
@@ -16,7 +16,7 @@ set -u
 PIN=/sys/fs/bpf/hpft_tcp_edt
 
 if ! sudo test -e "$PIN/hpft_tcp_edt"; then
-    echo "EDT program pin missing at $PIN - run the v1 tcp-shaper-apply first"
+    echo "EDT program pin missing at $PIN - run tcp-shaper-apply first"
     exit 1
 fi
 

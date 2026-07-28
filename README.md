@@ -47,19 +47,16 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
   device 代码，跑在 DPA 上），`rate = min(cc_rate, level)`；`cc_rate`
   是 PCC 里自实现的 DCQCN 风格状态机，独立于响应律。
 
-**响应律（v2「跟踪-审计」，2026-07-27 迁移）**：接收端把政策裁定与
-审计账本压成一个目标 $u_f=\hat e_f(1-\gamma s_f)$ 下发，发送端在对数轴
-上做一阶跟踪 $R_f\leftarrow R_f(u_f/R_f)^{kT}$——无分支、无钳位、
-律侧只剩一个参数 $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步
-格式，必须一起下发**。上一代 MIMD/AIMD/MIAD 三条骨架、以及只为兜住
-它们而存在的参数（`mi_alpha`/`beta`/app-limited/fast-recovery/HAI/
-probe 余量/MD 锚与地板/RDMA 预算降速斜坡）随律一并删除；退回 v1 见
-`git tag v1-mimd-lab`。控制周期 1ms（`config/lab-registry.json` 的
+**响应律（跟踪-审计）**：接收端把政策裁定与审计账本压成一个目标
+$u_f=\hat e_f(1-\gamma s_f)$ 下发，发送端在对数轴上做一阶跟踪
+$R_f\leftarrow R_f(u_f/R_f)^{kT}$——无分支、无钳位、律侧只剩一个参数
+$k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必须一起
+下发**。控制周期 1ms（`config/lab-registry.json` 的
 `period_ms`），现行参数 `k=20`、`gamma=0.25`、`v_seconds=0.2`
 （V=600 Mbit）。取值理由与收敛闭式见 `hpft-design` 仓库的
 `docs/design.md` §3.4/§4.2/§6 与 `docs/design_theory.md`；离线验收
 （wire 往返 + 三条收敛闭式 + 账本自愈）跑
-`results/v2_migration_20260727/law_check.py`。
+`results/acceptance_20260727/law_check.py`。
 
 ## 硬性规则
 

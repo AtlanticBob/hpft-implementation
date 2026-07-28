@@ -21,9 +21,7 @@ Pipeline per control period T:
 
 e_f, s_f, ceil_f and vq_f stay local: they are the intermediate ledger the
 target is synthesised from, kept in the jsonl log for offline analysis but
-no longer on the wire (v1 shipped {s, r, e, ceil} because the MIMD law
-re-derived its own caps and floors at the sender; the v2 law consumes one
-number).
+not on the wire - the sender consumes one number.
 
 Hybrid r_f measurement (lab fact, 2026-07-09): megaflow HW byte counters
 are exact but only refresh ~1 Hz (mlx5 fc bulk-query period, hardcoded in

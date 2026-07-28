@@ -8,16 +8,14 @@ first-order step towards the target in log space (§4.2):
     R_f <- R_f * (u_f / R_f) ** alpha,   alpha = 1 - exp(-k * dt)
 
 k = 20 s^-1 (time constant 50 ms). No branches, no clamps: the target is
-already bounded on both sides at the receiver (u >= (1-gamma)*ceil, §3.4),
-tracking approaches it asymptotically from either side, so none of v1's
-walls - increase cap, decrease floor, probe margin, app-limited freeze,
-fast recovery - have anything left to do. The one clamp that survives is
-the 50 Mbps pace floor (§6), and its justification is now numerical
-rather than protective: it keeps u > 0 so the log law has a domain, and
-keeps the pace above the executor's quantisation step. It is NOT an
-anti-wedge - a steady low rate was measured to be safe (1G cap runs at
-87-91% realisation indefinitely); what endangers an RDMA connection is
-the RATIO of a fall, which §5.1's transition clause handles.
+already bounded on both sides at the receiver (u >= (1-gamma)*ceil, §3.4)
+and tracking approaches it asymptotically from either side. The one clamp
+is the 50 Mbps pace floor (§6), and its justification is numerical rather
+than protective: it keeps u > 0 so the log law has a domain, and keeps the
+pace above the executor's quantisation step. It is NOT an anti-wedge - a
+steady low rate is safe (a 1G cap runs at 87-91% realisation
+indefinitely); what endangers an RDMA connection is the RATIO of a fall,
+which §5.1's transition clause handles.
 
 fail-open (§4.4): no telemetry for n1_freeze_s -> R frozen; for
 n2_failopen_s -> the same tracking step with the target set to Tree_f, so
@@ -410,20 +408,20 @@ def main():
     # the danger is the RATIO OF THE FALL, not the destination.
     #
     # Limited as a halving per interval rather than a fixed slope, so it
-    # is scale-free like everything else in v2; the interval is one budget
+    # is scale-free like everything else here; the interval is one budget
     # flush.
     #
-    # Why this cannot become the convergence bottleneck the deleted slew
-    # became - and the argument is structural, not a rate comparison.
-    # (A rate comparison would be wrong: the law's INSTANTANEOUS descent
-    # is k times the log gap, not k, so against a 20x target step it runs
-    # at 20*ln20 = 60 s^-1, faster than this limiter's ln2/0.013 = 53.)
-    # The real reason is min(): the limiter only ever holds Tree ABOVE
-    # what it would otherwise be, and pace = min(R, Tree), so a lagging
-    # Tree can only be the un-selected side. Whatever descent the law
-    # commands through R passes through untouched. The deleted slew sat
-    # on the budget itself, downstream of the min, which is exactly why
-    # it could throttle the law.
+    # Why this can never become the convergence bottleneck, and the
+    # argument is structural rather than a rate comparison. (A rate
+    # comparison would be wrong: the law's INSTANTANEOUS descent is k
+    # times the log gap, not k, so against a 20x target step it runs at
+    # 20*ln20 = 60 s^-1, faster than this limiter's ln2/0.013 = 53.) The
+    # real reason is min(): the limiter only ever holds Tree ABOVE what it
+    # would otherwise be, and pace = min(R, Tree), so a lagging Tree can
+    # only be the un-selected side. Whatever descent the law commands
+    # through R passes through untouched. A limiter placed on the budget
+    # instead would sit DOWNSTREAM of the min, and could throttle the law
+    # - which is why this one is on Tree.
     tree_halve_s = ep.get("tree_step_halving_s", 0.013)
     tree_applied = {}      # fsid -> Tree_f as actually applied
     tree_ts = time.monotonic()
@@ -686,12 +684,9 @@ def main():
                 st.last_seq = seq if seq is not None else -1
                 u, r = rec.get("u", 0.0), rec.get("r", 0)
                 # THE LAW (§4.2): one first-order step towards the target.
-                # Everything v1 needed AROUND this line - the increase cap
-                # at e_hat, the symmetric MD floor, the probe margin, the
-                # app-limited freeze, fast recovery and HAI - existed to
-                # make a blind search converge without overshooting. The
-                # target is not blind and is already bounded at the
-                # receiver, so none of it survives the migration.
+                # Nothing guards this line: the target is not a guess, it
+                # is bounded at the receiver, so there is nothing for an
+                # increase cap or a decrease floor to protect against.
                 track(st, u, now)
                 st.mode = "track"
                 actuate(fsid, st, r, rdma_batch)
@@ -716,10 +711,11 @@ def main():
         # permit to move at all). Still nothing after n2_failopen_s: the
         # SAME tracking step, with the target set to the sender-local
         # allowance Tree_f - the flow degrades to sender-side policy only,
-        # neither wedged nor uncontrolled. Tracking (rather than v1's fixed
-        # additive ramp) means no separate ramp constant to tune, and the
-        # approach is asymptotic, so a fail-open flow can never overshoot
-        # Tree_f the way a linear ramp plus min() clamp could.
+        # neither wedged nor uncontrolled. Using the tracking step here
+        # rather than a fixed additive ramp means no separate ramp constant
+        # to tune, and the approach is asymptotic, so a fail-open flow can
+        # never overshoot Tree_f the way a linear ramp plus min() clamp
+        # could.
         if now - last_ticker >= period:
             last_ticker = now
             maybe_reload(now)
@@ -786,15 +782,14 @@ def main():
         # drift is <3% keeps the budget quasi-static (the 20Hz-era
         # semantics the RP was built against); the rate field stays fresh
         # every flush, so the hold expires after 3 samples and the integral
-        # climbs the level back (~12.5%/step). This is executor semantics,
-        # NOT a law-era workaround: it stays under v2 (design_theory §2.7).
+        # climbs the level back (~12.5%/step). This is executor semantics
+        # (design_theory §2.7).
         #
-        # There is deliberately NO descent slew here. v1 slew-limited
-        # descending budget writes because the AIMD-era R sawtooth swung
-        # the budget +-50% at ~1s and the RP's ~100ms inner loop chased it
-        # into a three-loop limit cycle. v2 removes the premise twice over
-        # - equilibrium is signal-free so there is no sawtooth, and the
-        # target moves with a 1/k time constant under a bounded 25%
+        # There is deliberately NO rate limit on descending budget writes.
+        # One would only be needed if the budget could swing violently at
+        # the RP's own inner-loop timescale, and it cannot: equilibrium
+        # here is signal-free so there is no sawtooth, and the target moves
+        # with a 1/k time constant under a bounded 25%
         # discount - and keeping the slew would only make the executor
         # (1.05 s^-1) the convergence bottleneck instead of the law
         # (k*ln2 = 13.9 s^-1). Descent is one step, and the RP's

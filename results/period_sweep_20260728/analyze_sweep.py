@@ -56,7 +56,7 @@ def upstep(T):
     definition is enough, and it is the one whose numbers are on record."""
     import subprocess
     out = subprocess.run(
-        ["python3", os.path.join(HERE, "..", "v2_migration_20260727",
+        ["python3", os.path.join(HERE, "..", "acceptance_20260727",
                                  "analyze_step.py"),
          "%s/T%d_step_tx.jsonl" % (D, T)],
         capture_output=True, text=True).stdout

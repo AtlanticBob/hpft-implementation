@@ -57,14 +57,14 @@ for T in $TS; do
   sleep 22
   ssh hpft-dpu2 "sudo journalctl -u hpft-rxagent-e --no-pager -o cat --since '-20s' | grep -a tick_us | tail -1" \
       > "$OUT/T${T}_tick.txt"
-  bash "$REPO/results/v2_migration_20260727/conv_step_v2.sh" "T${T}_step" >/dev/null 2>&1
+  bash "$REPO/results/acceptance_20260727/conv_step_v2.sh" "T${T}_step" >/dev/null 2>&1
   set_period "$T"   # conv_step's trap restored the repo copy; re-apply
   bash tools/lab-infra/deploy_check.sh --deploy >/dev/null 2>&1
-  bash "$REPO/results/v2_migration_20260727/incast8_v2.sh" "T${T}_i8"   >/dev/null 2>&1
+  bash "$REPO/results/acceptance_20260727/incast8_v2.sh" "T${T}_i8"   >/dev/null 2>&1
   for f in step i8; do
     for s in rx tx t0; do
       ext=jsonl; [ "$s" = t0 ] && ext=txt
-      src="$REPO/results/v2_migration_20260727/results/T${T}_${f}_${s}.${ext}"
+      src="$REPO/results/acceptance_20260727/results/T${T}_${f}_${s}.${ext}"
       [ -f "$src" ] && mv "$src" "$OUT/" 2>/dev/null
     done
   done
