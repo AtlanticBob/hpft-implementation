@@ -434,7 +434,18 @@ class HybridRates:
             for f in members:
                 b = win.get(f, 0)
                 eff[f] = b
-                if b <= 0:
+                # UNMEASURED means "we have not had a chance to see it
+                # yet", which needs both halves: no bytes in the window
+                # AND young enough that the hardware-cached dump could
+                # not have reported it. A flow-set that has been here
+                # longer than the window and shows nothing has genuinely
+                # stopped, and treating it as unmeasured is not
+                # harmless - it keeps a phantom member in the split, so
+                # a survivor's own traffic gets divided with a flow that
+                # left. Measured 2026-07-28: after its peer stopped, the
+                # remaining sender read 14.4G against a true 28.8G and
+                # was then granted only that half.
+                if b <= 0 and now - self.first_seen.get(f, now) < self.window:
                     unmeasured.add(f)
             wtot = sum(eff.values())
             for f in members:

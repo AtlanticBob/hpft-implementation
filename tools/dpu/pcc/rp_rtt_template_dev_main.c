@@ -166,9 +166,6 @@ void doca_pcc_dev_user_port_info_changed(uint32_t portid)
 #define HPFT_PAIRS (16)
 #define HPFT_EPOCH_US (1000u)
 #define HPFT_MIN_LEVEL (2u)
-#define HPFT_SETTLE_HOLD (3u)	/* after a cap change, hold the integral ~3 fresh-R steps
-				 * (~60ms @50Hz) so the wire responds to the feed-forward
-				 * level before the integral reacts to the stale-high R */
 #define HPFT_MAX_THREADS (256)
 
 /* byte accumulation is sharded per DPA thread (each thread owns its slot),
@@ -191,10 +188,11 @@ typedef struct {
 	volatile uint32_t dbg_hits;	/* racy per-event counter for visibility */
 	volatile uint32_t remote_rx_rate;	/* receiver-measured RX rate (agent/NP fed) */
 	volatile uint32_t last_rrx_used;	/* control-step gating on fresh samples */
-	volatile uint32_t hold;		/* settle-hold: skip integral for N fresh-R steps after a cap change */
 	volatile uint32_t cc_rate;		/* pair DCQCN-lite term, 2^20 units */
 	volatile uint32_t remote_cap;		/* from NP RTT response payload w2 */
-	volatile uint32_t qp_count;	/* QPs mapped to this pair (decrease norm) */
+	volatile uint32_t qp_count;	/* QPs sending in the last epoch */
+	volatile uint32_t qp_seen;	/* QPs counted so far in THIS epoch */
+	volatile uint32_t epoch_id;	/* bumped once per epoch, ages the map */
 	volatile uint32_t cnp_hits;	/* DIAG 2026-07-22: CNP events matched to THIS pair
 					 * (target>=0 && ev_type==ROCE_CNP), vs g_hpft_cnp_any
 					 * which counts CNP events reaching the callback at all -
@@ -212,6 +210,13 @@ static volatile uint32_t g_hpft_cnp_any;  /* DIAG: any ROCE_CNP event seen by th
 #define HPFT_QPMAP_PROBE (8)
 static volatile uint32_t g_qpn_key[HPFT_QPMAP_SIZE];  /* qpn+1; 0 = empty */
 static volatile uint32_t g_qpn_pair[HPFT_QPMAP_SIZE]; /* pair index */
+/* Epoch in which each mapped QP was last counted. The level is assigned as
+ * budget/N, so N has to be the number of QPs actually SENDING, not the
+ * number ever seen: perftest recreates QPs, and stale entries made the
+ * count read 7 and 5 where four were running, which would under-rate the
+ * pair by the same ratio. Counting per epoch ages entries out for free -
+ * a QP that stops sending simply stops being counted. */
+static volatile uint32_t g_qpn_epoch[HPFT_QPMAP_SIZE];
 static volatile uint32_t g_qpn_map_active;
 static volatile uint32_t g_hpft_rtt_traces;
 static volatile uint32_t g_hpft_unknown_ft;
@@ -263,15 +268,15 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					continue;
 				}
 				if (c->flowtag != eft || c->dst_tag != edst || c->budget != ebud) {
-					/* proportional feed-forward on a pure cap change (same
-					 * pair); a new pair still initialises level=ebud. */
-					if (c->flowtag == eft && c->dst_tag == edst && c->budget > 0 && c->level > 0) {
-						uint64_t nl = ((uint64_t)c->level * ebud) / c->budget;
-						c->level = nl > 0 ? (uint32_t)nl : 1;
+					/* a cap change lands on the level immediately:
+					 * budget/N, the same assignment the epoch makes */
+					{
+						uint32_t n = c->qp_count ? c->qp_count : 1;
+						uint32_t w = ebud / n;
+
+						c->level = w < HPFT_MIN_LEVEL
+							? HPFT_MIN_LEVEL : w;
 						c->last_rrx_used = erx;
-						c->hold = HPFT_SETTLE_HOLD;
-					} else {
-						c->level = ebud;
 					}
 					c->budget = ebud;
 					c->cc_rate = DOCA_PCC_DEV_MAX_RATE;
@@ -343,16 +348,16 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 									 * integral then only fine-tunes. level=ebud would
 									 * overshoot to Nx target and force a slow (~430ms)
 									 * integral descent. */
-									if (c->budget > 0 && c->level > 0) {
-										uint64_t nl = ((uint64_t)c->level * ebud) / c->budget;
-										c->level = nl > 0 ? (uint32_t)nl : 1;
-									} else {
-										c->level = ebud;
-									}
+									{
+						uint32_t n = c->qp_count ? c->qp_count : 1;
+						uint32_t w = ebud / n;
+
+						c->level = w < HPFT_MIN_LEVEL
+							? HPFT_MIN_LEVEL : w;
+					}
 									c->budget = ebud;
 									c->last_rrx_used = erx; /* don't integrate on pre-change (stale) R */
-									c->hold = HPFT_SETTLE_HOLD;
-								}
+												}
 								c->remote_rx_rate = erx;
 						}
 						fidx = -2;
@@ -444,14 +449,14 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					g_hpft_pairs[i].flowtag = 0;
 				} else {
 					hpft_pair_t *c = &g_hpft_pairs[i];
-					if (c->budget > 0 && c->level > 0) {
-						uint64_t nl = ((uint64_t)c->level * budget) / c->budget;
-						c->level = nl > 0 ? (uint32_t)nl : 1;
-					} else {
-						c->level = budget;
+					{
+						uint32_t n = c->qp_count ? c->qp_count : 1;
+						uint32_t w = budget / n;
+
+						c->level = w < HPFT_MIN_LEVEL
+							? HPFT_MIN_LEVEL : w;
 					}
 					c->budget = budget;
-					c->hold = HPFT_SETTLE_HOLD;
 				}
 				return DOCA_PCC_DEV_STATUS_OK;
 			}
@@ -546,7 +551,26 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		if (target >= 0 && qslot >= 0) {
 			g_qpn_key[qslot] = qpn + 1;
 			g_qpn_pair[qslot] = (uint32_t)target;
-			g_hpft_pairs[target].qp_count++;
+			g_qpn_epoch[qslot] = 0;
+			qh = (uint32_t)qslot;	/* count it below */
+		}
+	}
+	if (target >= 0) {
+		/* count this QP once per epoch */
+		uint32_t eid = g_hpft_pairs[target].epoch_id;
+
+		for (uint32_t pr = 0; pr < HPFT_QPMAP_PROBE; pr++) {
+			uint32_t idx = (qh + pr) % HPFT_QPMAP_SIZE;
+
+			if (g_qpn_key[idx] == qpn + 1) {
+				if (g_qpn_epoch[idx] != eid + 1) {
+					g_qpn_epoch[idx] = eid + 1;
+					g_hpft_pairs[target].qp_seen++;
+				}
+				break;
+			}
+			if (g_qpn_key[idx] == 0)
+				break;
 		}
 	}
 	if (target >= 0) {
@@ -608,6 +632,10 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			/* racy claim: concurrent winners are rare and the EWMA absorbs
 			 * the occasional double-computed epoch */
 			c->epoch_ts = now;
+			if (c->qp_seen)
+				c->qp_count = c->qp_seen;
+			c->qp_seen = 0;
+			c->epoch_id++;
 			{
 				uint32_t b32 = 0;
 
@@ -616,7 +644,6 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 					c->b32_shard[s] = 0;
 				}
 				uint32_t dt = (uint32_t)(now - old);
-				uint32_t ets = old;
 				/* correct event undersampling with the exact HW port counter */
 				uint32_t prt = c->port;
 				uint32_t ev_now = 0;
@@ -645,7 +672,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				uint64_t b32_corr = ((uint64_t)b32 * s_x16) >> 4;
 				/* R in 2^20-of-200G units: bytes32*32B*8b / dt_us / 200e9 * 2^20 */
 				uint64_t r_units = (b32_corr << 28) / ((uint64_t)dt * 200000u);
-				uint32_t bud = c->budget, lvl = c->level;
+				uint32_t bud = c->budget;
 				uint32_t rrx = c->remote_rx_rate;
 				uint32_t rs;
 
@@ -673,54 +700,61 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				c->dbg_epochs++;
 				c->dbg_ev_b32 = b32;
 
-				if (do_ctrl && c->hold > 0) {
-					c->hold--;
-					do_ctrl = 0;	/* let the wire catch up to the feed-forward level first */
-				}
-
-				if (do_ctrl && ets != 0 && bud > 0) {
+				/* The level assignment below is stateless, so it needs
+				 * neither a fresh-measurement gate nor a settle hold -
+				 * both existed to protect an integral from acting on a
+				 * measurement that had not caught up. do_ctrl and rs
+				 * survive only as diagnostics. */
+				(void)do_ctrl;
+				if (bud > 0) {
 					/* small-step integral control: with 1000+ flows the
 					 * per-flow rate-application latency (event cadence)
 					 * makes fast level swings leave stale-rate mass;
 					 * a slowly-moving level converges every flow onto
 					 * the same L* and the integral term pins R to B. */
-					int64_t err = (int64_t)bud - (int64_t)rs;
-					int64_t adj = ((int64_t)lvl * err) / ((int64_t)bud * 8);
-					int64_t lim = (int64_t)(lvl >> 3) + 1;
+					/* The level is ASSIGNED, not searched for.
+					 *
+					 * results->rate = min(cc_rate, level) is applied
+					 * to each of the pair's QPs, so the aggregate the
+					 * pair puts on the wire is N x level and the level
+					 * that delivers exactly the budget is budget/N.
+					 * Both terms are known here: the budget arrives in
+					 * the mailbox, and N is counted from the event
+					 * stream each epoch. There is nothing left to
+					 * search for.
+					 *
+					 * This is the same move the response law upstream
+					 * makes: when the target is known, computing it
+					 * beats converging on it. An integral search needs
+					 * a step size, a clip, a floor to stop it digging
+					 * and a hold to keep it from integrating against a
+					 * measurement that has not caught up yet - four
+					 * parameters and four ways to wind up. A large
+					 * budget step-down is exactly the input that finds
+					 * them: measured 2026-07-28, budget 11.25G with the
+					 * wire held at 29.3G for ~2 s, then the level dug
+					 * through the target to its minimum and both
+					 * senders stalled for ~3 s, cycling every 8 s.
+					 * Assignment has no state to wind up, so that whole
+					 * class of failure has nowhere to live.
+					 *
+					 * rs is no longer used to steer the level - it stays
+					 * only as the diagnostic the probe reports. What
+					 * remains dynamic is cc_rate, which is the response
+					 * to actual fabric congestion and belongs on its own
+					 * timescale; min() lets whichever is tighter bind.
+					 *
+					 * A QP that is idle this epoch is not counted, so an
+					 * unused share is not silently handed to its
+					 * siblings here - the allocator upstream owns that
+					 * decision and sees it as r < u.
+					 */
+					uint32_t n = c->qp_count ? c->qp_count : 1;
+					uint32_t want = bud / n;
 
-					if (adj == 0 && err != 0)
-						adj = (err > 0) ? 1 : -1; /* kill the
-									   * truncation deadband */
-
-					if (adj > lim)
-						adj = lim;
-					if (adj < -lim)
-						adj = -lim;
-					/* aggregate dig-guard (replaces the per-QP floor
-					 * bud>>2). level is PER-QP: results->rate =
-					 * min(cc,level) is applied to each of the pair's N
-					 * QPs, so the aggregate wire ~= N x level and the
-					 * equilibrium level is budget/N. A fixed per-QP floor
-					 * is multiplied by N, so bud>>2 let a 1024-QP flow
-					 * escape to line rate under a 20G cap (stress L3
-					 * 2026-07-12: 1024 QP -> 197G). The collapse the floor
-					 * must prevent is the AGGREGATE wire digging to near
-					 * zero in apply-lag; guard on the measured aggregate rs
-					 * instead: only dig while rs is still above bud>>2.
-					 * This floors the AGGREGATE at bud>>2 for any QP count,
-					 * so a 1024-QP flow converges to budget/1024 per QP
-					 * instead of being pinned at bud>>2 per QP, while a
-					 * single flow (aggregate == level) still stops digging
-					 * at ~25% of budget as before. */
-					if (adj < 0 && rs <= (bud >> 2))
-						adj = 0;
-					int64_t nl = (int64_t)lvl + adj;
-
-					if (nl < (int64_t)HPFT_MIN_LEVEL)
-						nl = HPFT_MIN_LEVEL;
-					if (nl > (int64_t)bud)
-						nl = bud;
-					c->level = (uint32_t)nl;
+					if (want < HPFT_MIN_LEVEL)
+						want = HPFT_MIN_LEVEL;
+					c->level = want;
 				}
 				/* additive CC recovery toward line rate, every epoch,
 				 * independent of the level control step */
