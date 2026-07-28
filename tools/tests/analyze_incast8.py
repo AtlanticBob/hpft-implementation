@@ -4,7 +4,7 @@ expect each ~12.5G. Reports per-flow steady [40,85], fairness (Jain + min/max),
 aggregate util, per-class totals, convergence time (to all within 20% of 12.5)."""
 import json,sys
 from pathlib import Path
-DIR=Path(__file__).resolve().parent/"results"
+DIR=Path(__file__).resolve().parent.parent.parent/"results"/"regression"
 flows=[("sgpu01/vf%d>sgpu02/vf%d|%s"%(n,n,c),"vf%d.%s"%(n,c)) for n in range(4) for c in ("rdma","tcp")]
 def load(tag):
     try: t0=float((DIR/f"{tag}_t0.txt").read_text().strip())

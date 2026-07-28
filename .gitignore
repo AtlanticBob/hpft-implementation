@@ -44,3 +44,4 @@ results/*/results/*_rp.txt
 results/*/results/*_ticks.txt
 results/*/results/*.journal
 tools/tests/results/
+results/regression/
