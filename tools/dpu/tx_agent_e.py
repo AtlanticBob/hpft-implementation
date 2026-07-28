@@ -790,7 +790,7 @@ def main():
         # the RP's own inner-loop timescale, and it cannot: equilibrium
         # here is signal-free so there is no sawtooth, and the target moves
         # with a 1/k time constant under a bounded 25%
-        # discount - and keeping the slew would only make the executor
+        # discount - and a descent limit here would only make the executor
         # (1.05 s^-1) the convergence bottleneck instead of the law
         # (k*ln2 = 13.9 s^-1). Descent is one step, and the RP's
         # proportional feed-forward scales its level by the budget ratio

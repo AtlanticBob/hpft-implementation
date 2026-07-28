@@ -210,7 +210,7 @@ for _, line in budgets:
     parts = line.split()
     if len(parts) >= 4 and parts[0].startswith("0xb47c"):
         vals.append(int(parts[2]))
-check("D9 budget descends without a slew ramp",
+check("D9 budget descends without a ramp",
       bool(vals) and min(vals) < max(vals) * 0.7,
       "budget units %d -> %d (min %d): one step down, not a ramp"
       % (vals[0] if vals else 0, vals[-1] if vals else 0,

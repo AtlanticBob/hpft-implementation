@@ -152,9 +152,9 @@ check("E3 the marker alone would have dropped it",
 
 # ------------------------------- §5.1 transition limiting (sender side)
 # Two halves, and the second is the one that distinguishes this clause
-# from the slew that was deleted: an external step must be spread, and
-# the law's own descent must NOT be touched. A limiter that also caught
-# the law would make the executor the convergence bottleneck again.
+# from a limit on the budget: an external step must be spread, and the
+# law's own descent must NOT be touched. A limiter that also caught the
+# law would make the executor the convergence bottleneck.
 sys.path.insert(0, os.path.join(REPO, "tools", "dpu"))
 import tx_agent_e  # noqa: E402
 
