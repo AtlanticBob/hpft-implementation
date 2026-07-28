@@ -1,0 +1,4 @@
+Jul 28 11:30:07.675923 localhost.localdomain python3[569894]: tx_agent_e: policy reloaded
+Jul 28 11:30:07.690344 localhost.localdomain python3[569894]: tx_agent_e: hw MaxRate sgpu01/vf0 -> 1.50G (reload)
+Jul 28 11:30:35.591339 localhost.localdomain python3[569894]: tx_agent_e: policy reloaded
+Jul 28 11:30:35.605685 localhost.localdomain python3[569894]: tx_agent_e: hw MaxRate sgpu01/vf0 -> 30.00G (reload)

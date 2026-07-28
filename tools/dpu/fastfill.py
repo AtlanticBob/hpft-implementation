@@ -13,9 +13,124 @@ level solves F(t) - min(c_i, w_i t) + min(r_i, w_i t) = C: binary-search
 the same breakpoint grid with prefix sums. Ceiling_i = min(r_i, w_i t).
 """
 import bisect
+import ctypes
+import os
+
+# The C implementation of both primitives (fastfill.c). Water-filling is
+# 77% of the receiver's per-tick cost at every scale measured, and the
+# scaling is already near-linear, so the constant factor is the whole
+# problem - see results/scale_20260727. Loaded through ctypes so the DPU
+# Arm needs only gcc, not Python headers.
+#
+# Absent or unloadable .so falls back to the pure-Python path below, which
+# stays as the reference the C is property-tested against (fastfill_test.py).
+_LIB = None
+try:
+    _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "libfastfill.so")
+    if os.path.exists(_p):
+        _LIB = ctypes.CDLL(_p)
+        _dp = ctypes.POINTER(ctypes.c_double)
+        _LIB.hpft_waterfill.restype = None
+        _LIB.hpft_waterfill.argtypes = [ctypes.c_double, ctypes.c_int,
+                                        _dp, _dp, _dp]
+        _LIB.hpft_waterfill_ceilings.restype = None
+        _LIB.hpft_waterfill_ceilings.argtypes = [ctypes.c_double,
+                                                 ctypes.c_int,
+                                                 _dp, _dp, _dp, _dp]
+        _ip = ctypes.POINTER(ctypes.c_int)
+        _LIB.hpft_entitlements.restype = None
+        _LIB.hpft_entitlements.argtypes = [ctypes.c_int, _ip, _ip, _dp, _dp,
+                                           ctypes.c_int, ctypes.c_int,
+                                           _dp, _dp, _dp, ctypes.c_double,
+                                           _dp, _dp]
+except OSError:
+    _LIB = None
+
+USING_C = _LIB is not None
+
+
+def _arr(vals):
+    return (ctypes.c_double * len(vals))(*vals)
+
+
+def entitlements_c(fsids, dst_idx, cls_idx, wfs, demand,
+                   n_vm, n_cls, vm_w, vm_max, cls_w, c_root):
+    """Whole three-layer allocation in one crossing of the boundary.
+
+    Returns (e, ceil) as dicts keyed by fsid. Callers that cannot build
+    the flat form should use the Scheduler's Python path; this exists
+    because per-layer ctypes calls left marshalling, not arithmetic, as
+    the dominant per-tick cost."""
+    n = len(fsids)
+    if n == 0:
+        return {}, {}
+    d = (ctypes.c_int * n)(*dst_idx)
+    c = (ctypes.c_int * n)(*cls_idx)
+    w = _arr(wfs)
+    dm = _arr(demand)
+    vw = _arr(vm_w)
+    vm = _arr(vm_max)
+    cw = _arr(cls_w)
+    oe = (ctypes.c_double * n)()
+    oc = (ctypes.c_double * n)()
+    _LIB.hpft_entitlements(n, d, c, w, dm, n_vm, n_cls, vw, vm, cw,
+                           float(c_root), oe, oc)
+    return ({f: oe[i] for i, f in enumerate(fsids)},
+            {f: oc[i] for i, f in enumerate(fsids)})
+
+
+def waterfill(capacity, items):
+    """Bounded weighted water-filling; items: {key: (weight, cap)}."""
+    if not items:
+        return {}
+    if _LIB is None:
+        return _waterfill_py(capacity, items)
+    keys = list(items)
+    w = _arr([float(items[k][0]) for k in keys])
+    c = _arr([float(items[k][1]) for k in keys])
+    out = (ctypes.c_double * len(keys))()
+    _LIB.hpft_waterfill(float(capacity), len(keys), w, c, out)
+    return {k: out[i] for i, k in enumerate(keys)}
+
+
+def _waterfill_py(capacity, items):
+    alloc = {k: 0.0 for k in items}
+    active = {k: v for k, v in items.items() if v[1] > 0}
+    remaining = capacity
+    while active and remaining > 1e-3:
+        wsum = sum(w for w, _ in active.values())
+        t_sat = min((cap - alloc[k]) / w for k, (w, cap) in active.items())
+        t = min(t_sat, remaining / wsum)
+        for k, (w, cap) in list(active.items()):
+            alloc[k] += w * t
+            if alloc[k] >= cap - 1e-3:
+                alloc[k] = cap
+                del active[k]
+        remaining = capacity - sum(alloc.values())
+        if t < t_sat and t_sat != float("inf"):
+            break
+    return alloc
 
 
 def waterfill_ceilings(capacity, items, repl=None):
+    if not items:
+        return {}
+    if _LIB is None:
+        return _waterfill_ceilings_py(capacity, items, repl)
+    keys = list(items)
+    w = _arr([float(items[k][0]) for k in keys])
+    c = _arr([float(items[k][1]) for k in keys])
+    out = (ctypes.c_double * len(keys))()
+    if repl is None:
+        rp = None
+    else:
+        rp = _arr([float(repl.get(k, float("inf"))) for k in keys])
+    _LIB.hpft_waterfill_ceilings(float(capacity), len(keys), w, c, rp, out)
+    return {k: out[i] for i, k in enumerate(keys)}
+
+
+def _waterfill_ceilings_py(capacity, items, repl=None):
     if not items:
         return {}
     keys = list(items)

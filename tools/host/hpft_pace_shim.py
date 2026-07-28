@@ -46,7 +46,7 @@ def evnic_map(tcp_reg):
 
 
 def seed_pair_states(tcp_reg):
-    """The datapath paces a pair only when BOTH cfg and state exist; the v1
+    """The datapath paces a pair only when BOTH cfg and state exist; the
     apply tool seeds state for its static rule list (the straight pairs)
     only, so cfg writes for any other pair were silently ignored and
     cross-pair TCP ran unpaced (stress D1, 2026-07-11). Seed state for

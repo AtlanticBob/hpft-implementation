@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """hpft-shaper-controller: single entry point for the RDMA shaper v2 control
-plane, driven by a registry aligned with the v1 {src_vnic,dst_vnic,rate_bps}
+plane, driven by a registry aligned with the {src_vnic,dst_vnic,rate_bps}
 interface.
 
 Responsibilities (single-dst main path):

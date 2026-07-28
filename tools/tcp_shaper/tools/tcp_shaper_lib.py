@@ -17,12 +17,18 @@ from typing import Any, Iterable, Sequence
 
 
 TCP_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = TCP_ROOT.parent
+REPO_ROOT = TCP_ROOT.parents[1]
 DEFAULT_EGRESS_DEV = "p1"
 DEFAULT_PIN_DIR = Path("/sys/fs/bpf/hpft_tcp_edt")
 DEFAULT_SECTION = "classifier"
-DEFAULT_BPF_SOURCE = TCP_ROOT / "bpf" / "hpft_tcp_edt_kern.c"
-DEFAULT_BPF_OBJECT = TCP_ROOT / "bpf" / "hpft_tcp_edt_kern.o"
+# THE authoritative TCP executor source. This used to default to a copy
+# vendored under tools/tcp_shaper/bpf/, which was a different program -
+# no sparse-bypass conditions, no wire-byte metering. Re-applying without
+# an explicit --bpf-object therefore swapped the executor silently, and
+# the swap is invisible at every layer that reports health. One source of
+# truth now; the copies are deleted.
+DEFAULT_BPF_SOURCE = REPO_ROOT / "tcp" / "bpf-opt3" / "hpft_tcp_edt_kern.c"
+DEFAULT_BPF_OBJECT = REPO_ROOT / "tcp" / "bpf-opt3" / "hpft_tcp_edt_kern.o"
 DEFAULT_RULES_SECTION = "tcp_rules"
 DEFAULT_QDISC_MODE = "mq-leaf-fq"
 DEFAULT_MQ_LEAF_COUNT = 4

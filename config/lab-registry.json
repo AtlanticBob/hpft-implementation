@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "comment": "hpft-shaper v2 lab registry. v3 adds scheme-E fields: per-vnic MAC, policy (design_e \u00a73.1), e_params (design_e \u00a75.4 initial values, tuned in M4). rdma_rules kept for the legacy static-cap controller path. Units: rate_bps absolute; PCC converts to 2^20-of-linerate units (line = 200 Gb/s).",
+  "comment": "HPFT lab registry. Units: rate_bps absolute; PCC converts to 2^20-of-linerate units (line = 200 Gb/s).",
   "line_rate_bps": 200000000000,
   "sender_host": "sgpu01",
   "receiver_host": "sgpu02",
@@ -126,11 +126,11 @@
     }
   ],
   "policy": {
-    "comment": "design_e \u00a73.1. VM == vnic in this lab. weight = W_i (inter-tenant); max_rate_bps = MaxRate_i (null = uncapped); class_weights = W_{i,TCP}/W_{i,RDMA}. per_sender_weights: 'dst_vnic|class|src_vnic' -> u (absent = 1). Receiver scheduler reads dst-VM params; sender tree reads src-VM params.",
+    "comment": "design.md \u00a73.2. VM == vnic in this lab. weight = W_i (inter-tenant); max_rate_bps = MaxRate_i (null = uncapped); class_weights = W_{i,TCP}/W_{i,RDMA}. per_sender_weights: 'dst_vnic|class|src_vnic' -> u (absent = 1). Receiver scheduler reads dst-VM params; sender tree reads src-VM params. MaxRate = 30G re-derived 2026-07-27 for the current 100G receiver downlink: C' = 97G over 4 dst VMs is 24.25G each, so the previous 20G standing default made 4x20 = 80G < 97G and the RECEIVER-DOWNLINK (incast) bottleneck of design.md \u00a71.3 structurally unreachable - every run at that default only ever exercised the VM-cap layer. At 30G, 4x30 = 120G > 97G so the root layer binds under full load while a single VM alone is still capped below the link, keeping both guarantee classes reachable at the default.",
     "vms": {
       "sgpu01/vf0": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -138,7 +138,7 @@
       },
       "sgpu01/vf1": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -146,7 +146,7 @@
       },
       "sgpu01/vf2": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -154,7 +154,7 @@
       },
       "sgpu01/vf3": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -162,7 +162,7 @@
       },
       "sgpu02/vf0": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -170,7 +170,7 @@
       },
       "sgpu02/vf1": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -178,7 +178,7 @@
       },
       "sgpu02/vf2": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -186,7 +186,7 @@
       },
       "sgpu02/vf3": {
         "weight": 1,
-        "max_rate_bps": 20000000000,
+        "max_rate_bps": 30000000000,
         "class_weights": {
           "tcp": 1,
           "rdma": 1
@@ -204,7 +204,7 @@
     "pace_shim": {
       "sgpu01": "192.168.102.1:9711"
     },
-    "tree_stub_bps": 50000000000,
+    "tree_stub_bps": 30000000000,
     "pace_floor_bps": 50000000,
     "rate_export": {
       "sgpu02": "192.168.102.2:9712"
@@ -213,47 +213,26 @@
     "rate_export_ms": 5
   },
   "e_params": {
-    "comment": "design_e 5.4 + 1ms retrofit. RESPONSE LAW = MIMD (2026-07-13): multiplicative increase hard-capped at the fair-share ceiling e_hat (R*=(1+mi_alpha) up to e_hat when s=0), multiplicative mark-proportional decrease (R*=(1-beta*s)^a_scale when s>0). Both directions period-scale by period/ref; the hard cap at e_hat gives structural collapse-immunity (R never sits above the ceiling, so AIMD's overshoot->mark-storm->deep-cut relaxation cannot arise) and no parameter cliff. Fairness lives in the receiver's water-filling marking, NOT in the law (weightless law), so the skeleton choice does not affect shares. Params calibrated at ref_period_ms. v_periods 2 (2026-07-22 convergence-opt campaign: MIMD's structural hard-cap immunity already covers the D7 W2 incast root-regime sync-oscillation that v_periods=4 was raised to fix under AIMD; re-verified clean at v_periods=2 with mi_alpha=0.6, incast8 Jain 0.999-1.000; halves the VQ full-scale, ~13% faster down-step convergence). MIMD-PRODUCTION PARAMS: mi_alpha=0.6 (2026-07-22, was 0.05; 12x default validated no-cliff up to convergence-time dimension too, see results/convergence_opt_20260722/summary.md), beta (MD strength, mimd-tuned 0.15, re-verified not the down-step bottleneck post MD-ceiling-floor). mi_bang: experimental MI bang-bang toggle (jump straight to e_hat instead of gradual climb), default false -- confirmed unsafe under sustained incast contention (non-deterministic severe RDMA starvation), kept only for reference, do not enable. law_skeleton selects the skeleton: mimd=production; aimd/miad retained runnable for comparison only (tx_agent switch, driven per-run by results/miad_experiment/* runners). The following are COMPARISON-ONLY, ignored when law_skeleton=mimd: aimd path a_frac_linerate/fast_recovery/hai_after/hai_max/probe_over_grant/probe_gain (its 5 refinements, obsoleted by MIMD's structural immunity) and the aimd-tuned beta=0.3 (set per-run by runners, NOT this field); miad path ad_beta/ad_mode. n1_freeze/n2_failopen (telemetry fail-open) are law-independent safety and kept. app-limited (theta_al/m_al/eps_al) is aimd-path only; MIMD's e_hat hard-cap subsumes it (inflation bounded to fair share, verified clean across the campaign).",
+    "comment": "design.md \u00a76 (tracking-audit law). RESPONSE LAW: the receiver synthesises one target per flow-set, u_f = ceil_f*(1-gamma*s_f) (\u00a73.4), and the sender does first-order tracking in log space, R <- R*(u/R)^(k*T) (\u00a74.2). Fairness still lives entirely in the receiver's water-filling, not in the law. Params are wall-clock quantities (rate constants in s^-1, integrals in bits), so they do not need retuning when period_ms changes -- there is no ref_period_ms scaling any more. k=20 s^-1 is capped by target staleness (k*tau_eff <~ 0.4, tau_eff ~20ms); gamma=0.25 sets both the audit discount band (u >= 0.75*ceil) and the audit-loop damping (zeta = 0.5*sqrt(k*V/(gamma*ceil))); V = v_seconds*headroom*C = 600 Mbit is a wall-clock excess-integral: it must NOT scale with the control period, and it IS anchored on C, the downlink bottleneck capacity the receiver actually schedules against (100G here), not on the NIC port line rate -- ehat scales with C, so V must too or the audit loop's damping becomes link-rate dependent (design.md \u00a73.3). rx_agent reads C from the uplink and recomputes V whenever the link speed changes.2 Gbit); design_theory \u00a73 shows it lands 1% from the optimal-damping inverse V = 4*zeta^2*gamma*ehat_star/k at zeta=1/sqrt(2), which is post-hoc confirmation, not a derivation -- re-derive it if the tenant count, flow count, link rate or loop delay changes. Derivations and tuning rules: hpft-design/docs/design_theory.md.",
     "period_ms": 1,
-    "law_skeleton": "mimd",
-    "mi_alpha": 0.6,
-    "beta": 0.15,
+    "k": 20.0,
+    "gamma": 0.25,
+    "v_seconds": 0.2,
     "delta_demand": 0.15,
     "headroom": 0.03,
-    "v_periods": 2,
-    "vmax_over_v": 1.0,
-    "n1_freeze": 5,
-    "n2_failopen": 40,
+    "n1_freeze_s": 0.25,
+    "n2_failopen_s": 2.0,
+    "n3_evict_s": 30,
+    "tree_step_halving_s": 0.013,
     "telemetry_port": 9710,
     "mix_window_s": 2.0,
-    "ref_period_ms": 50,
     "slow_loop_ms": 200,
     "log_every_ms": 20,
     "rdma_push_ms": 13,
+    "tcp_refresh_ms": 100,
     "rate_window_s": 0.02,
-    "policy": null,
-    "rdma_bud_slew_per_s": 0.35,
-    "_comparison_only_aimd": "params below drive law_skeleton=aimd/miad comparison runs only; MIMD production ignores them",
-    "a_frac_linerate": 0.0005,
-    "theta_al": 0.85,
-    "m_al": 10,
-    "eps_al": 0.1,
-    "fast_recovery": true,
-    "hai_after": 10,
-    "hai_max": 8,
-    "demand_hold_s": 0.0,
-    "delta_boost": 0.0,
-    "peak_ref_s": 0.0,
-    "share_floor": false,
-    "share_floor_grace_s": 0.5,
-    "probe_over_grant": 1.05,
-    "probe_gain": 2.0,
-    "ad_beta": 0.1,
-    "ad_mode": "line",
-    "md_anchor": "zero",
-    "md_floor_frac": 0.3,
-    "backlog_floor": true,
-    "backlog_theta": 0.5,
-    "mi_bang": false
+    "fs_grace_s": 0.5,
+    "backlog_congestion_aware": true,
+    "policy": null
   }
 }

@@ -13,7 +13,14 @@
 #define HPFT_MAX_VNICS 4096
 #define HPFT_MAX_PAIRS 16384
 #define HPFT_NSEC_PER_SEC 1000000000ULL
-#define HPFT_GAP_NS 40000ULL  /* opt3: inter-pkt gap > 40us => latency-sparse flow, bypass shared pacing */
+#define HPFT_GAP_NS 40000ULL  /* inter-pkt gap > 40us: flow idled (design §5.3) */
+/* A bypass candidate must also be a SMALL packet. The VF MTU is 1500, so a
+ * non-TSO frame is <= ~1514 B at this hook; anything larger is a TSO
+ * super-packet, i.e. bulk traffic, which must never skip the shaper. */
+#define HPFT_SPARSE_MAX_LEN 2048ULL
+/* Per-wire-frame bytes the shaper must charge for but skb->len never
+ * counts: 8 B preamble+SFD, 12 B inter-packet gap, 4 B FCS. */
+#define HPFT_FRAME_OVERHEAD 24ULL
 
 struct hpft_vlan_hdr {
     __u16 h_vlan_TCI;
@@ -181,7 +188,26 @@ int hpft_tcp_edt(struct __sk_buff *skb)
             return TC_ACT_OK;
 
         now = bpf_ktime_get_ns();
-        packet_ns = hpft_bytes_to_ns((__u64)skb->len, cfg->rate_bps);
+        /* Meter WIRE bytes, not skb bytes. The policy share is defined
+         * against link capacity and the link carries framing, but skb->len
+         * counts the L2/L3/L4 headers of a GSO super-packet ONCE and knows
+         * nothing about preamble/SFD/IPG/FCS. Measured 2026-07-27: a pair
+         * paced at 10G delivered 9.79G of goodput and 10.6G on the wire,
+         * so every TCP flow-set was quietly consuming ~8% more link than
+         * its share - a systematic bias in favour of TCP over RDMA, whose
+         * budget the RP enforces against the wire.
+         * Each wire frame adds its own L2+L3+L4 headers (the super-packet
+         * carried one copy) plus 8 B preamble+SFD, 12 B inter-packet gap
+         * and 4 B FCS. */
+        {
+            __u32 segs = skb->gso_segs ? skb->gso_segs : 1;
+            __u32 hdr = ETH_HLEN + (__u32)iph->ihl * 4 +
+                        (__u32)tcph->doff * 4;
+            __u64 wire = (__u64)skb->len +
+                         (__u64)(segs - 1) * (__u64)hdr +
+                         (__u64)segs * HPFT_FRAME_OVERHEAD;
+            packet_ns = hpft_bytes_to_ns(wire, cfg->rate_bps);
+        }
         burst_ns = hpft_bytes_to_ns((__u64)cfg->burst_bytes, cfg->rate_bps);
         min_next_ns = now > burst_ns ? now - burst_ns : 0;
 
@@ -214,11 +240,38 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         state->next_ns = next_ns;
         bpf_spin_unlock(&state->lock);
 
-        /* latency-sparse flow (idle between packets, any packet size) bypasses
-         * the shared pacing delay - its bytes are still in the pair debt so the
-         * cap stays accurate. Bulk flows are paced by the shared debt. */
-        if (gap <= HPFT_GAP_NS && send_ns > now)
-            skb->tstamp = send_ns;
+        /* Latency-sparse bypass (design.md §5.3): a request/response flow
+         * that idles between packets should not queue behind a bulk flow's
+         * shaping debt. THREE conditions, all necessary - the original
+         * single gap test did not enforce the cap at all in the common
+         * case (2026-07-27 incast8, measured):
+         *
+         *  - gap > HPFT_GAP_NS: the flow idled. The original intent.
+         *  - skb->len small: a TSO super-packet is never a latency
+         *    sensitive request. This is the condition whose absence broke
+         *    the cap. With TSO on, a pair's rate divided among several
+         *    bulk streams gives EVERY stream an inter-packet gap above the
+         *    threshold (4 iperf3 streams sharing 14.85G => one 64 KB skb
+         *    per stream per ~141 us), so every packet took the bypass,
+         *    nothing was ever delayed, and the pair ran 1.13-1.46x its
+         *    pace for 85 s while the debt grew unread. Whether a run
+         *    enforced or escaped depended on how bursty TCP happened to
+         *    be, which is why identical reps measured 94% and 146%.
+         *  - the pair is within one burst of its debt: past that the cap
+         *    outranks the latency favour. Without it, many sparse small
+         *    flows could still walk through the cap in aggregate.
+         *
+         * The comment this replaces claimed the cap stayed accurate
+         * because bypassed bytes still charge the debt. They do - but a
+         * debt nobody ever waits on enforces nothing.
+         */
+        if (send_ns > now) {
+            int sparse = gap > HPFT_GAP_NS &&
+                         (__u64)skb->len <= HPFT_SPARSE_MAX_LEN &&
+                         (send_ns - now) <= burst_ns;
+            if (!sparse)
+                skb->tstamp = send_ns;
+        }
         return TC_ACT_OK;
     }
 }

@@ -27,3 +27,19 @@ results/*/*_ctr.txt
 results/*/*_a.log
 results/*/*_b.log
 results/*/*_vpm.csv
+
+# Same bulk rules for the nested layout (data lives in
+# results/<experiment>/results/ per the folder convention, one level
+# deeper than the patterns above reach - which is how 1.1 GB of raw
+# telemetry got tracked once).
+results/*/results/*_rx.jsonl
+results/*/results/*_tx.jsonl
+results/*/results/*_t0.txt
+results/*/results/*_arm.txt
+results/*/results/*_events.txt
+results/*/results/*rdma*.log
+results/*/results/*iperf*.json
+results/*/results/*_ctr.txt
+results/*/results/*_rp.txt
+results/*/results/*_ticks.txt
+results/*/results/*.journal

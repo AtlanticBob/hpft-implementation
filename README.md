@@ -40,17 +40,23 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
   （`tools/dpu/rx_agent.py`）：vport 硬件计数器直读 → 三层 water-filling
   → 虚拟队列标记 → 带内遥测。
 - 发送端 DPU（`ssh hpft-dpu`）跑 `hpft-txagent-e`
-  （`tools/dpu/tx_agent_e.py`）：MIMD 响应律（乘性增硬顶 ê + 乘性减，
-  MD 另有对称硬顶下限）→ 发送端树 → 执行（RDMA 走 PCC mailbox，TCP
-  经 UDP 发给 sgpu01 上的 `hpft-pace-shim` 写 BPF map）。
+  （`tools/dpu/tx_agent_e.py`）：响应律 → 发送端树 → 执行（RDMA 走
+  PCC mailbox，TCP 经 UDP 发给 sgpu01 上的 `hpft-pace-shim` 写 BPF
+  map）。
 - RDMA 侧执行面是 `tools/dpu/pcc/rp_rtt_template_dev_main.c`（DOCA PCC
   device 代码，跑在 DPA 上），`rate = min(cc_rate, level)`；`cc_rate`
-  是 PCC 里自实现的 DCQCN 风格状态机（独立于 tx_agent 的 MIMD）。
+  是 PCC 里自实现的 DCQCN 风格状态机，独立于响应律。
 
-控制周期 1ms（`config/lab-registry.json` 的 `period_ms`）。生产参数：
-`mi_alpha=0.6`、`beta=0.15`、`v_periods=2`——具体数值和为什么这样调，
-见 `hpft-design` 仓库的 `docs/response_law_mimd_analysis.md` 和本仓库
-`results/convergence_opt_20260722/summary.md`。
+**响应律（跟踪-审计）**：接收端把政策裁定与审计账本压成一个目标
+$u_f=\hat e_f(1-\gamma s_f)$ 下发，发送端在对数轴上做一阶跟踪
+$R_f\leftarrow R_f(u_f/R_f)^{kT}$——无分支、无钳位、律侧只剩一个参数
+$k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必须一起
+下发**。控制周期 1ms（`config/lab-registry.json` 的
+`period_ms`），现行参数 `k=20`、`gamma=0.25`、`v_seconds=0.2`
+（V=600 Mbit）。取值理由与收敛闭式见 `hpft-design` 仓库的
+`docs/design.md` §3.4/§4.2/§6 与 `docs/design_theory.md`；离线验收
+（wire 往返 + 三条收敛闭式 + 账本自愈）跑
+`results/acceptance_20260727/law_check.py`。
 
 ## 硬性规则
 
@@ -68,7 +74,10 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
 ## 代码地图
 
 - `tools/dpu/rx_agent.py`、`tools/dpu/tx_agent_e.py` —— 现行两端 agent；
-  `tools/dpu/fastfill.py` —— 单遍 fair-share 上限算法（两端共用）；
+  `tools/dpu/fastfill.{c,py}` —— 三层分配（water-filling + 单遍天花板
+  级联），两端共用。C 经 ctypes 加载，`.so` 缺失自动回落纯 Python；
+  纯 Python 路径**保留为参照**，`fastfill_test.py` 用它对拍 C。
+  两个 agent 的启动 banner 会打印 `fill=C` 还是 `fill=python`；
   `tools/dpu/vport_meter.c` —— 独立于 agent 之外的 1ms vport 计数器
   采样常驻进程（`hpft-vport-meter` systemd unit）。
 - `tools/dpu/pcc/` —— DOCA PCC device 代码（RDMA 执行面，跑在 DPA 上）。
@@ -80,7 +89,17 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
   进本仓库，源码原样保留。
 - `tools/lab-infra/vf_setup.sh` —— VF 重建脚本（`cc_mode.sh` 的
   `post_recover` 调用）。
+- `tools/lab-infra/deploy_check.sh` —— **跑实验前必过**：repo 与两台 DPU
+  的代码一致、两个 agent 健康且近期无 traceback。代码不一致是致命的、
+  配置不一致只是警告（runner 会推自己的场景配置）。`--deploy` 推送差异
+  并在各自 Arm 上重编 `libfastfill.so`。
+- `tools/lab-infra/flow_preflight.sh` / `flow_postflight.py` —— 流对可用性
+  守卫。RC 的错误完成是**终态**，被打死的 QP 不会自己回来，而每一层都
+  还在报健康——这是几次实验产出"看起来正常但结论是错的"数据的原因。
 - `tools/cc_mode.sh` —— lab CC 模式切换（DCQCN ↔ PCC+HPFT，GBN ↔ SR）。
+- `tools/lab_env.sh` —— 三套实验环境一键切换（`hpft` 生产栈 / `plain`
+  固件 DCQCN 基线 / `jakiro` VxLAN+DHTB），编排 cc_mode.sh + 拓扑装拆；
+  用法与"fw reset 不清 OVS"等坑见头注释与 `hpft-design` 的 ops_notes.md。
 - `tcp/bpf-opt3/` —— TCP 执行面（host fq+edt 的 BPF 实现）。
 - `config/lab-registry.json` —— 唯一真值配置。
 - `results/<experiment>_<UTC日期>/` —— 工程验证/回归实验产物；论文
