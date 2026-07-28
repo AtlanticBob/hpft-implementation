@@ -47,6 +47,12 @@ if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
   echo "== deploying =="
   for f in $RX_FILES; do scp -q "$f" hpft-dpu2:/opt/hpft/; done
   for f in $TX_FILES; do scp -q "$f" hpft-dpu:/opt/hpft/; done
+  # the registry too. It is compared separately (mismatch is a warning,
+  # not a fault) but it must still be PUSHED here, or --deploy silently
+  # leaves the lab on the last experiment's scenario config - which is
+  # the exact drift this tool exists to end.
+  scp -q config/lab-registry.json hpft-dpu2:/opt/hpft/
+  scp -q config/lab-registry.json hpft-dpu:/opt/hpft/
   # the shared object is per-architecture: rebuild on each Arm rather
   # than copying the x86 one that was built for the benchmark
   for h in hpft-dpu hpft-dpu2; do
@@ -58,7 +64,6 @@ if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
   for f in $RX_FILES; do cmp_one hpft-dpu2 "$f" || bad=1; done
   for f in $TX_FILES; do cmp_one hpft-dpu  "$f" || bad=1; done
 fi
-for f in $RX_FILES; do :; done
 
 # an agent that is not running is the same class of problem
 for u in "hpft-dpu2 hpft-rxagent-e" "hpft-dpu hpft-txagent-e"; do
