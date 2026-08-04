@@ -31,6 +31,25 @@ HPFT 是 DPU 边缘虚拟队列公平系统：在 BlueField-3 DPU 上用虚拟�
 
 ## 现行系统
 
+**TCP 执行面（2026-07-30 修订）**：`tcp/bpf-opt3/hpft_tcp_edt_kern.c` 的
+整形债务有 50ms 上限——超限报文丢弃（给 rate-based CC 真实信号、给 fq
+排队时延封顶），换代时只做有界赦免；`tools/host/hpft_pace_shim.py` 的
+generation 是 per-pair 稳定值（仅首装或速率跳变 >25% 换代）。两者共同
+消除了"每次预算下发赦免一次债务"导致的超发（BBR 1.22×）与由此产生的
+TSO 突发风暴。
+
+**接收端归属（2026-07-30 修订）**：`tools/dpu/rx_agent.py` 的池子划分对
+**部分可见的新成员**（年龄 < mix 窗且已有字节）改用上一拍授予额分摊，
+避免新发送方的字节被记到在位者头上、令其吃冤枉折扣。
+
+**数据面自 2026-07-29 起常驻泛化 VxLAN overlay**（P0 定案，见
+`results/p0_overlay_20260729/summary.md`）：两台 DPU 的 p1 直配 underlay
+172.16.1.x + 遥测 10.1.9.x、MTU 9000，ovsbr-p1 挂 4 个 representor +
+vxlan100（**tos=inherit 硬性要求**），VF IP 直连方案原样，p1 保持
+发送 200G/接收 100G。hpft/plain/jakiro 三环境共用这层数据面，
+`tools/lab_env.sh` 一键切换（只切 CC/agents/DHTB 轴）。rx_agent 默认桥
+= ovsbr-p1；registry `headroom=0.08`（3% 队列预警 + ~5% VxLAN 封装税）。
+
 三个服务，systemd 托管，配置来自 `config/lab-registry.json`（**repo
 副本是唯一真值**，改政策先改 repo 再下发到两台 DPU 的 `/opt/hpft/`，
 接收端 mtime 热加载 policy 段）：
@@ -51,8 +70,8 @@ $u_f=\hat e_f(1-\gamma s_f)$ 下发，发送端在对数轴上做一阶跟踪
 $R_f\leftarrow R_f(u_f/R_f)^{kT}$——无分支、无钳位、律侧只剩一个参数
 $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必须一起
 下发**。控制周期 1ms（`config/lab-registry.json` 的
-`period_ms`），现行参数 `k=20`、`gamma=0.25`、`v_seconds=0.2`
-（V=600 Mbit）。取值理由与收敛闭式见 `hpft-design` 仓库的
+`period_ms`），现行参数 `k=20`、`gamma=0.25`、`v_seconds=0.072`
+（V=576 Mbit，由 ζ 反解 V=4ζ²γê*/k 定值，与 headroom 无关）。取值理由与收敛闭式见 `hpft-design` 仓库的
 `docs/design.md` §3.4/§4.2/§6 与 `docs/design_theory.md`；离线验收
 （wire 往返 + 三条收敛闭式 + 账本自愈）跑
 `tools/tests/law_check.py`。

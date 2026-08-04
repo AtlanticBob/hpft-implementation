@@ -166,6 +166,55 @@ void doca_pcc_dev_user_port_info_changed(uint32_t portid)
 #define HPFT_PAIRS (16)
 #define HPFT_EPOCH_US (1000u)
 #define HPFT_MIN_LEVEL (2u)
+
+/* ---- congestion-control term selection -------------------------------
+ * HyperFront's rate limiting (level = budget/N) is independent of WHICH
+ * congestion control runs underneath it: the executor always applies
+ * rate = min(cc_rate, level). cc_rate is that underneath-CC. Two are
+ * implemented and picked at run time by the host (mailbox 0xccd):
+ *   0 = DCQCN-flavoured (CNP -> multiplicative decrease normalised by QP
+ *       count, additive recovery per epoch)
+ *   1 = ZTR-RTTCC (the vendor's RTT-based algorithm: decrease on NACK /
+ *       CNP / rtt above base, additive increase otherwise), ported from
+ *       the DOCA rtt_template reference with its shipped parameters.
+ * Everything else in the datapath is identical, so a comparison across
+ * this switch isolates the CC choice. */
+#define HPFT_CC_AIMD  (0u)   /* CNP -> fixed-fraction MD, fixed-step AI */
+#define HPFT_CC_DCQCN (2u)   /* the real RP state machine, see below */
+#define HPFT_CC_ZTR   (1u)   /* vendor RTT-based algorithm */
+
+/* ---- software DCQCN (RP side) ------------------------------------------
+ * Faithful to the published state machine, in rate (not window) form:
+ *   on CNP:      Rt = Rc;  Rc = Rc(1 - alpha/2);  alpha += g(1 - alpha)
+ *   alpha timer: alpha += g(0 - alpha)          (decay when no CNP)
+ *   rate timer / byte counter, both must fire to advance a stage:
+ *      stage < F   : fast recovery  Rc = (Rt + Rc)/2
+ *      stage >= F  : additive       Rt += AI ; Rc = (Rt + Rc)/2
+ *      stage >= 2F : hyper additive Rt += HAI; Rc = (Rt + Rc)/2
+ * alpha is fxp16, rates are the device's fxp20 units. The three knobs the
+ * firmware exposes as rpg_time_reset / rpg_ai_rate / rpg_hai_rate are the
+ * ones below, settable at run time by mailbox 0xcce so the algorithm can
+ * be swept the way a firmware DCQCN would be. */
+#define DQ_G_FXP16      (1024u)          /* g = 1/64 in fxp16 */
+#define DQ_ALPHA_ONE    (65536u)         /* 1.0 in fxp16 */
+#define DQ_F_STAGES     (5u)             /* F: fast-recovery steps */
+static volatile uint32_t g_dq_ai      = (1u << 20) / 400u;  /* ~0.25% line/step */
+static volatile uint32_t g_dq_hai     = (1u << 20) / 80u;   /* ~1.25% line/step */
+static volatile uint32_t g_dq_time_us = 300u;               /* rate timer, us */
+static volatile uint32_t g_dq_alpha_us = 55u;               /* alpha timer, us */
+/* ZTR parameters, values as shipped in rtt_template_algo_params.h */
+#define ZTR_UPDATE_FACTOR (((1u << 16) * 10u) / 100u)   /* fxp16 */
+#define ZTR_AI            (((1u << 20) * 5u) / 100u)    /* fxp20 rate step */
+/* Both thresholds measured on THIS fabric (2026-08-03, device clock, ns):
+ * probe rtt_min = 3006, loaded-but-uncongested band 3.3-5.7 us at 26G.
+ * BASE_RTT sits above that band so only real queueing triggers decrease;
+ * MAX_DELAY = 10x base, the order of the switch's Kmin=400KB queue. */
+#define ZTR_BASE_RTT      (7000u)                       /* ns */
+#define ZTR_MAX_DELAY     (70000u)                      /* ns */
+#define ZTR_MIN_RATE      (1u << (20 - 14))
+#define ZTR_DEC_FACTOR      ((1u << 16) - ZTR_UPDATE_FACTOR)
+#define ZTR_CNP_DEC_FACTOR  ((1u << 16) - 2u * ZTR_UPDATE_FACTOR)
+#define ZTR_NACK_DEC_FACTOR ((1u << 16) - 5u * ZTR_UPDATE_FACTOR)
 #define HPFT_MAX_THREADS (256)
 
 /* byte accumulation is sharded per DPA thread (each thread owns its slot),
@@ -188,7 +237,17 @@ typedef struct {
 	volatile uint32_t dbg_hits;	/* racy per-event counter for visibility */
 	volatile uint32_t remote_rx_rate;	/* receiver-measured RX rate (agent/NP fed) */
 	volatile uint32_t last_rrx_used;	/* control-step gating on fresh samples */
-	volatile uint32_t cc_rate;		/* pair DCQCN-lite term, 2^20 units */
+	volatile uint32_t cc_rate;		/* the underneath-CC term, 2^20 units */
+	volatile uint32_t ztr_flags;		/* bit0 was_cnp, bit1 was_nack (ZTR) */
+	volatile uint32_t rtt_last;		/* last measured RTT, device units */
+	volatile uint32_t rtt_min;		/* smallest seen (= this fabric's base) */
+	volatile uint32_t rtt_n;		/* RTT measurements taken */
+	volatile uint32_t rtt_req_n;		/* RTT requests raised (rtt_req=1) */
+	volatile uint32_t dq_target;		/* DCQCN Rt */
+	volatile uint32_t dq_alpha;		/* DCQCN alpha, fxp16 */
+	volatile uint32_t dq_stage;		/* recovery stage counter */
+	volatile uint32_t dq_t_rate;		/* last rate-timer tick, device us */
+	volatile uint32_t dq_t_alpha;		/* last alpha-timer tick */
 	volatile uint32_t remote_cap;		/* from NP RTT response payload w2 */
 	volatile uint32_t qp_count;	/* QPs sending in the last epoch */
 	volatile uint32_t qp_seen;	/* QPs counted so far in THIS epoch */
@@ -221,6 +280,9 @@ static volatile uint32_t g_qpn_map_active;
 static volatile uint32_t g_hpft_rtt_traces;
 static volatile uint32_t g_hpft_unknown_ft;
 static volatile uint32_t g_hpft_cc_freeze;
+static volatile uint32_t g_hpft_cc_algo = HPFT_CC_DCQCN;
+static volatile uint32_t g_hpft_rtt_events;   /* RTT events seen, any flowtag */
+static volatile uint32_t g_hpft_rtt_unmatched; /* ... with no pair match */
 static volatile uint32_t g_hpft_ccrate_only;  /* EXPERIMENT 2026-07-22: when set,
 	 * results->rate = cc_rate directly (bypass min(cc_rate,level)) -
 	 * isolates this PCC-reimplemented DCQCN-style cc_rate state machine's
@@ -280,6 +342,9 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					}
 					c->budget = ebud;
 					c->cc_rate = DOCA_PCC_DEV_MAX_RATE;
+					c->dq_target = DOCA_PCC_DEV_MAX_RATE;
+					c->dq_alpha = DQ_ALPHA_ONE;
+					c->dq_stage = 0;
 					if (c->flowtag != eft || c->dst_tag != edst) {
 						for (int sh = 0; sh < HPFT_MAX_THREADS; sh++)
 							c->b32_shard[sh] = 0;
@@ -383,6 +448,35 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 
+		if (ft == 0xccdu) {
+			/* CC selection: 0xccd <0|1>. 0 = DCQCN-flavoured term,
+			 * 1 = ZTR-RTTCC. Applies to every pair; the HyperFront
+			 * level control is untouched either way. Resetting the
+			 * per-pair CC state on the switch keeps the first epoch
+			 * after it from mixing the two algorithms' histories. */
+			g_hpft_cc_algo = budget;   /* 0 AIMD, 1 ZTR, 2 DCQCN */
+			for (int i = 0; i < HPFT_PAIRS; i++) {
+				g_hpft_pairs[i].cc_rate = DOCA_PCC_DEV_MAX_RATE;
+				g_hpft_pairs[i].ztr_flags = 0;
+				g_hpft_pairs[i].dq_target = DOCA_PCC_DEV_MAX_RATE;
+				g_hpft_pairs[i].dq_alpha = DQ_ALPHA_ONE;
+				g_hpft_pairs[i].dq_stage = 0;
+			}
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		if (ft == 0xcceu) {
+			/* DCQCN tunables: 0xcce <value> <which>, the three knobs
+			 * a firmware DCQCN exposes. which: 0 = AI (rpg_ai_rate),
+			 * 1 = HAI (rpg_hai_rate), 2 = rate timer us
+			 * (rpg_time_reset). Values in the device's fxp20 rate
+			 * units / microseconds. */
+			uint32_t which = ((volatile uint32_t *)request)[2];
+
+			if (which == 0) g_dq_ai = budget;
+			else if (which == 1) g_dq_hai = budget;
+			else if (which == 2) g_dq_time_us = budget ? budget : 1u;
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
 		if (ft == 0xcccu) {
 			/* validation: 0xccc <idx> <cc_value>. cc_value>0 freezes cc_rate at
 			 * that value (emulates sustained fabric congestion); 0 unfreezes. */
@@ -424,7 +518,10 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[5] = c->cc_rate;
 			rsp[6] = c->dbg_epochs;
 			rsp[7] = c->remote_cap;
-			*response_size = 8 * sizeof(uint32_t);
+			rsp[8] = c->dq_alpha;
+			rsp[9] = c->dq_target;
+			rsp[10] = c->dq_stage;
+			*response_size = 11 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		if (ft == 0xdecu) {  /* DIAG 2026-07-22: CNP dispatch/match diagnostic */
@@ -435,11 +532,14 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[1] = c->cnp_hits;
 			rsp[2] = c->qp_count;
 			rsp[3] = c->cc_rate;
+			rsp[8] = g_hpft_rtt_events;
+			rsp[9] = c->rtt_req_n;
+			rsp[10] = c->rtt_n;
 			rsp[4] = c->dbg_hits;
 			rsp[5] = c->flowtag;
-			rsp[6] = 0;
-			rsp[7] = 0;
-			*response_size = 8 * sizeof(uint32_t);
+			rsp[6] = c->rtt_last;
+			rsp[7] = c->rtt_min;
+			*response_size = 11 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 
@@ -467,6 +567,9 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			g_hpft_pairs[free_idx].budget = budget;
 			g_hpft_pairs[free_idx].level = budget;
 			g_hpft_pairs[free_idx].cc_rate = DOCA_PCC_DEV_MAX_RATE;
+			g_hpft_pairs[free_idx].dq_target = DOCA_PCC_DEV_MAX_RATE;
+			g_hpft_pairs[free_idx].dq_alpha = DQ_ALPHA_ONE;
+			g_hpft_pairs[free_idx].dq_stage = 0;
 			g_hpft_pairs[free_idx].avg_b32_x16 = 34 * 16; /* ~1088B pkts */
 			for (int s = 0; s < HPFT_MAX_THREADS; s++)
 				g_hpft_pairs[free_idx].b32_shard[s] = 0;
@@ -494,6 +597,8 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	(void)algo_ctxt;
 	(void)attr;
 	results->rtt_req = 0;
+	if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT)
+		g_hpft_rtt_events++;
 	if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT && g_hpft_rtt_traces < 8) {
 		uint32_t *w = (uint32_t *)doca_pcc_dev_get_rtt_raw_data(event);
 
@@ -609,22 +714,82 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		hpft_pair_t *c = &g_hpft_pairs[target];
 
 		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
-			/* fabric congestion: multiplicative decrease (DCQCN-style) */
 			c->cnp_hits++;  /* DIAG 2026-07-22 */
-			uint32_t nqp = c->qp_count ? c->qp_count : 1;
-			uint32_t nr = c->cc_rate - ((c->cc_rate >> 6) / nqp);
+			if (g_hpft_cc_algo == HPFT_CC_ZTR) {
+				/* ZTR applies the CNP decrease when the next RTT
+				 * measurement lands (reference behaviour): latch it */
+				c->ztr_flags |= 1u;
+			} else if (g_hpft_cc_algo == HPFT_CC_DCQCN) {
+				/* Rt = Rc ; Rc = Rc(1 - alpha/2) ; alpha += g(1-alpha) */
+				uint32_t a = c->dq_alpha;
+				uint32_t cut = (uint32_t)(((uint64_t)c->cc_rate * a) >> 17);
 
-			c->cc_rate = (nr < HPFT_MIN_LEVEL) ? HPFT_MIN_LEVEL : nr;
+				c->dq_target = c->cc_rate;
+				c->cc_rate = (c->cc_rate > cut + HPFT_MIN_LEVEL)
+						     ? (c->cc_rate - cut) : HPFT_MIN_LEVEL;
+				a += (uint32_t)(((uint64_t)(DQ_ALPHA_ONE - a) * DQ_G_FXP16) >> 16);
+				c->dq_alpha = (a > DQ_ALPHA_ONE) ? DQ_ALPHA_ONE : a;
+				c->dq_stage = 0;      /* congestion restarts recovery */
+			} else {
+				/* fabric congestion: multiplicative decrease (DCQCN-style) */
+				uint32_t nqp = c->qp_count ? c->qp_count : 1;
+				uint32_t nr = c->cc_rate - ((c->cc_rate >> 6) / nqp);
+
+				c->cc_rate = (nr < HPFT_MIN_LEVEL) ? HPFT_MIN_LEVEL : nr;
+			}
 		}
+		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_NACK &&
+		    g_hpft_cc_algo == HPFT_CC_ZTR)
+			c->ztr_flags |= 2u;
 		if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT) {
-			uint32_t *w = (uint32_t *)doca_pcc_dev_get_rtt_raw_data(event);
+			/* The RTT responder is the remote NIC's HW handler; its
+			 * payload is the standard response, NOT NP-authored data.
+			 * remote_rx_rate/remote_cap stay agent/mailbox-fed only. */
+			{
+				/* Measure first, always: ZTR's BASE_RTT has to be
+				 * this deployment's base RTT, and that is only
+				 * knowable from the device's own clock. */
+				uint32_t s0 = doca_pcc_dev_get_rtt_req_send_timestamp(event);
+				uint32_t s1 = doca_pcc_dev_get_timestamp(event);
+				uint32_t d = s1 - s0;
 
-			c->remote_rx_rate = w[1];
-			c->remote_cap = w[2];
+				c->rtt_last = d;
+				c->rtt_n++;
+				if (c->rtt_min == 0 || d < c->rtt_min)
+					c->rtt_min = d;
+			}
+			if (g_hpft_cc_algo == HPFT_CC_ZTR) {
+				/* ZTR-RTTCC core (DOCA rtt_template reference):
+				 * NACK / CNP / rtt-above-base each shrink the rate
+				 * by their own factor, an on-time measurement grows
+				 * it additively. This is the whole CC term; the
+				 * HyperFront level is applied on top by min(). */
+				uint32_t rtt = c->rtt_last;
+				uint32_t r = c->cc_rate;
+
+
+				if ((c->ztr_flags & 2u) && rtt >= ZTR_MAX_DELAY) {
+					r = doca_pcc_dev_fxp_mult(ZTR_NACK_DEC_FACTOR, r);
+					c->ztr_flags &= ~2u;
+				} else if ((c->ztr_flags & 1u) || rtt >= ZTR_MAX_DELAY) {
+					r = doca_pcc_dev_fxp_mult(ZTR_CNP_DEC_FACTOR, r);
+					c->ztr_flags &= ~1u;
+				} else if (rtt > ZTR_BASE_RTT) {
+					r = doca_pcc_dev_fxp_mult(ZTR_DEC_FACTOR, r);
+				} else {
+					r += ZTR_AI;
+				}
+				if (r > DOCA_PCC_DEV_MAX_RATE)
+					r = DOCA_PCC_DEV_MAX_RATE;
+				if (r < ZTR_MIN_RATE)
+					r = ZTR_MIN_RATE;
+				c->cc_rate = r;
+			}
 			if (g_hpft_rtt_traces < 8) {
 				g_hpft_rtt_traces++;
-				/* format 3: w0(echoed ts), rx_rate, cap, flowtag, now */
-				doca_pcc_dev_trace_5(3, w[0], w[1], w[2], ft, now);
+				/* format 3: rtt_last, rtt_min, count, flowtag, now */
+				doca_pcc_dev_trace_5(3, c->rtt_last, c->rtt_min,
+						     c->rtt_n, ft, now);
 				doca_pcc_dev_trace_flush();
 			}
 		}
@@ -788,13 +953,49 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 						want = HPFT_MIN_LEVEL;
 					c->level = want;
 				}
-				/* additive CC recovery toward line rate, every epoch,
-				 * independent of the level control step */
-				if (!g_hpft_cc_freeze) {
+				if (!g_hpft_cc_freeze && g_hpft_cc_algo == HPFT_CC_AIMD) {
+					/* AIMD backstop: fixed additive step per epoch */
 					uint32_t cr = c->cc_rate + (DOCA_PCC_DEV_MAX_RATE >> 8);
 
 					c->cc_rate = (cr < c->cc_rate || cr > DOCA_PCC_DEV_MAX_RATE)
 							     ? DOCA_PCC_DEV_MAX_RATE : cr;
+				} else if (!g_hpft_cc_freeze && g_hpft_cc_algo == HPFT_CC_DCQCN) {
+					/* alpha decays on its own timer; recovery advances
+					 * on the rate timer. The epoch is 1 ms, so both
+					 * are counted in epochs against their us periods. */
+					uint32_t us = now;   /* device timer, us granularity */
+
+					if (us - c->dq_t_alpha >= g_dq_alpha_us) {
+						uint32_t a = c->dq_alpha;
+
+						c->dq_alpha = a - (uint32_t)(((uint64_t)a * DQ_G_FXP16) >> 16);
+						c->dq_t_alpha = us;
+					}
+					if (us - c->dq_t_rate >= g_dq_time_us) {
+						uint32_t rt = c->dq_target;
+						uint32_t rc = c->cc_rate;
+
+						/* Rt is the pre-congestion rate to climb back
+						 * to; it can never sit below the current rate
+						 * (an uninitialised or stale Rt would otherwise
+						 * halve the rate on every timer tick). */
+						if (rt < rc)
+							rt = rc;
+
+						c->dq_stage++;
+						if (c->dq_stage >= 2u * DQ_F_STAGES)
+							rt += g_dq_hai;      /* hyper increase */
+						else if (c->dq_stage >= DQ_F_STAGES)
+							rt += g_dq_ai;       /* additive increase */
+						/* below F: pure fast recovery, Rt unchanged */
+						if (rt > DOCA_PCC_DEV_MAX_RATE)
+							rt = DOCA_PCC_DEV_MAX_RATE;
+						c->dq_target = rt;
+						rc = (rt >> 1) + (rc >> 1);   /* Rc = (Rt+Rc)/2 */
+						c->cc_rate = (rc > DOCA_PCC_DEV_MAX_RATE)
+								     ? DOCA_PCC_DEV_MAX_RATE : rc;
+						c->dq_t_rate = us;
+					}
 				}
 				want_rtt = 1;
 			}
@@ -804,11 +1005,15 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 
 		results->rate = g_hpft_ccrate_only ? cc : ((cc < lvl) ? cc : lvl);
 		results->rtt_req = want_rtt;
+		if (want_rtt)
+			c->rtt_req_n++;
 		return;
 	}
 	/* no pair entry for this flowtag: fail open (probe occasionally so the
 	 * receiver-driven channel can be tested on any flow) */
 	g_hpft_unknown_ft = ft;
+	if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT)
+		g_hpft_rtt_unmatched++;
 	{
 		static volatile uint32_t g_hpft_fo_cnt;
 

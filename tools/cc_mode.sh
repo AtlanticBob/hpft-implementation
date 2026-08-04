@@ -47,7 +47,7 @@ status() {
     echo "$h: UPCC current=$uc next=$un | SR current=$sc next=$sn"
   done
   echo "doca_pcc on dpu1: $(ssh hpft-dpu 'pgrep -c -x doca_pcc' 2>/dev/null || echo 0)"
-  echo "txagent=$(ssh hpft-dpu 'systemctl is-active hpft-txagent-e' 2>/dev/null) rxagent=$(ssh hpft-dpu2 'systemctl is-active hpft-rxagent-e' 2>/dev/null) shim=$(systemctl is-active hpft-pace-shim 2>/dev/null)"
+  echo "txagent=$(ssh hpft-dpu 'systemctl is-active hpft-txagent-e' 2>/dev/null) rxagent=$(ssh hpft-dpu2 'systemctl is-active hpft-rxagent-e' 2>/dev/null) shim=$(systemctl is-active hpft-pace-shim 2>/dev/null) qpnres=$(systemctl is-active hpft-qpn-resolver 2>/dev/null)"
   echo "dpu2 p1: $(ssh hpft-dpu2 'ethtool p1 2>/dev/null | grep Speed')"
   echo "swp37s0 ECN profile: $(ssh sn5600 'nv show interface swp37s0 qos congestion-control 2>/dev/null' 2>/dev/null | grep -v Welcome | awk '/profile/{print $3}' | head -1)"
   ibdev2netdev 2>/dev/null | grep -c dpu1vf | xargs echo "VFs on sgpu01:"
@@ -55,6 +55,11 @@ status() {
 
 fw_reset_both() {
   echo "== fw reset both DPUs (parallel, ~4-5 min; Arms reboot) =="
+  # ROCE_ACCL is volatile across fw reset: capture the SR state now and
+  # re-apply it after the Arms return (P12, 2026-07-29 -- eval default is
+  # SR=1 and a silent fall-back to GBN corrupted an experiment arm once).
+  SR_PRE=$(sudo mlxreg -y -d 38:00.1 --reg_name ROCE_ACCL --get 2>/dev/null \
+           | grep selective_repeat_forced_en | grep -q '0x00000001' && echo 1 || echo 0)
   sudo bash -c 'echo 0 > /sys/bus/pci/devices/0000:38:00.1/sriov_numvfs; sleep 2; mlxfwreset -d 38:00.0 --yes --sync 1 reset' &
   P1=$!
   ssh sgpu02 "sudo bash -c 'echo 0 > /sys/bus/pci/devices/0000:38:00.1/sriov_numvfs; sleep 2; mlxfwreset -d 38:00.0 --yes --sync 1 reset'" &
@@ -63,6 +68,10 @@ fw_reset_both() {
   echo "== waiting for both Arms =="
   until ssh -o ConnectTimeout=5 -o BatchMode=yes hpft-dpu 'echo x' >/dev/null 2>&1 \
      && ssh -o ConnectTimeout=5 -o BatchMode=yes hpft-dpu2 'echo x' >/dev/null 2>&1; do sleep 15; done
+  if [ "${SR_PRE:-}" = "1" ]; then
+    echo "== re-applying SR (ROCE_ACCL was 1 before the reset) =="
+    bash "$0" sr
+  fi
 }
 
 post_recover() {
@@ -108,6 +117,16 @@ set_flags() { # set_flags <UPCC or -> <SR or ->  ; returns 0 if a reset is neede
   return $((1-need))
 }
 
+restore_sr() {   # $1 = 0|1 ; re-assert the volatile ROCE_ACCL bit on both hosts
+  local want=${1:-0}
+  [ "$want" = 1 ] || return 0
+  for h in "" "ssh sgpu02"; do
+    $h sudo mlxreg -y -d 38:00.1 --reg_name ROCE_ACCL \
+       --set "selective_repeat_forced_en=1" >/dev/null 2>&1
+  done
+  echo "  SR re-applied after fw reset (register is volatile)"
+}
+
 case "${1:-}" in
 status) status ;;
 gbn|sr)
@@ -122,12 +141,19 @@ gbn|sr)
   echo "retrans mode: $1 (takes effect for newly created QPs; existing QPs unaffected)" ;;
 dcqcn)
   stop_hpft
-  if set_flags 0 -; then fw_reset_both; post_recover; else echo "flags already current; skipped fw reset"; fi
+  # ROCE_ACCL is volatile: a fw reset zeroes selective_repeat_forced_en, so
+  # a lab standing on SR silently comes back as GBN. Remember and re-apply
+  # (an explicit gbn|sr argument still wins, applied just below).
+  WANT_SR=$(sudo mlxreg -y -d 38:00.1 --reg_name ROCE_ACCL --get 2>/dev/null \
+            | awk '/^selective_repeat_forced_en  /{print $NF+0}')
+  if set_flags 0 -; then fw_reset_both; post_recover; restore_sr "${WANT_SR:-0}"; else echo "flags already current; skipped fw reset"; fi
   if [ -n "${2:-}" ]; then bash "$0" "$2"; fi
   status
   echo "NOTE: soak/watchdog cron NOT touched -- comment them out for controlled runs." ;;
 pcc)
-  if set_flags 1 -; then fw_reset_both; fi
+  WANT_SR=$(sudo mlxreg -y -d 38:00.1 --reg_name ROCE_ACCL --get 2>/dev/null \
+            | awk '/^selective_repeat_forced_en  /{print $NF+0}')
+  if set_flags 1 -; then fw_reset_both; restore_sr "${WANT_SR:-0}"; fi
   bash $REPO/tools/reboot_recover.sh
   ssh hpft-dpu 'bash /tmp/rp_service.sh start' | tail -1
   ssh hpft-dpu2 'sudo systemctl reset-failed hpft-rxagent-e 2>/dev/null; sudo rm -f /tmp/hpft_rxagent_e.jsonl; sudo systemd-run --unit hpft-rxagent-e /usr/bin/python3 /opt/hpft/rx_agent.py'
@@ -135,6 +161,10 @@ pcc)
   ssh hpft-dpu 'sudo systemctl reset-failed hpft-txagent-e 2>/dev/null; sudo systemd-run --unit hpft-txagent-e /usr/bin/python3 /opt/hpft/tx_agent_e.py'
   sudo systemctl reset-failed hpft-pace-shim 2>/dev/null
   systemctl is-active hpft-pace-shim >/dev/null 2>&1 || sudo systemd-run --unit hpft-pace-shim --property=Restart=always /usr/bin/python3 $REPO/tools/host/hpft_pace_shim.py
+  # qpn resolver feeds {qpn -> pair} to the RP via the tx agent; without it
+  # qp_count stays 0, level = budget/1 and multi-QP pairs overshoot 4x
+  sudo systemctl reset-failed hpft-qpn-resolver 2>/dev/null
+  systemctl is-active hpft-qpn-resolver >/dev/null 2>&1 || sudo systemd-run --unit hpft-qpn-resolver --property=Restart=always /usr/bin/python3 $REPO/tools/host/qpn_resolver.py
   status
   echo "NOTE: soak/watchdog cron NOT touched -- re-enable manually if wanted." ;;
 *) grep '^#' "$0" | sed -n '2,12p' ;;

@@ -213,13 +213,13 @@
     "rate_export_ms": 5
   },
   "e_params": {
-    "comment": "design.md \u00a76 (tracking-audit law). RESPONSE LAW: the receiver synthesises one target per flow-set, u_f = ceil_f*(1-gamma*s_f) (\u00a73.4), and the sender does first-order tracking in log space, R <- R*(u/R)^(k*T) (\u00a74.2). Fairness still lives entirely in the receiver's water-filling, not in the law. Params are wall-clock quantities (rate constants in s^-1, integrals in bits), so they do not need retuning when period_ms changes -- there is no ref_period_ms scaling any more. k=20 s^-1 is capped by target staleness (k*tau_eff <~ 0.4, tau_eff ~20ms); gamma=0.25 sets both the audit discount band (u >= 0.75*ceil) and the audit-loop damping (zeta = 0.5*sqrt(k*V/(gamma*ceil))); V = v_seconds*headroom*C = 600 Mbit is a wall-clock excess-integral: it must NOT scale with the control period, and it IS anchored on C, the downlink bottleneck capacity the receiver actually schedules against (100G here), not on the NIC port line rate -- ehat scales with C, so V must too or the audit loop's damping becomes link-rate dependent (design.md \u00a73.3). rx_agent reads C from the uplink and recomputes V whenever the link speed changes.2 Gbit); design_theory \u00a73 shows it lands 1% from the optimal-damping inverse V = 4*zeta^2*gamma*ehat_star/k at zeta=1/sqrt(2), which is post-hoc confirmation, not a derivation -- re-derive it if the tenant count, flow count, link rate or loop delay changes. Derivations and tuning rules: hpft-design/docs/design_theory.md.",
+    "comment": "design.md \u00a76 (tracking-audit law). RESPONSE LAW: the receiver synthesises one target per flow-set, u_f = ceil_f*(1-gamma*s_f) (\u00a73.4), and the sender does first-order tracking in log space, R <- R*(u/R)^(k*T) (\u00a74.2). Fairness still lives entirely in the receiver's water-filling, not in the law. Params are wall-clock quantities (rate constants in s^-1, integrals in bits), so they do not need retuning when period_ms changes -- there is no ref_period_ms scaling any more. k=20 s^-1 is capped by target staleness (k*tau_eff <~ 0.4, tau_eff ~20ms); gamma=0.25 sets both the audit discount band (u >= 0.75*ceil) and the audit-loop damping (zeta = 0.5*sqrt(k*V/(gamma*ceil))); V = v_seconds*headroom*C = 1.6 Gbit is a wall-clock excess-integral: it must NOT scale with the control period, and it IS anchored on C, the downlink bottleneck capacity the receiver actually schedules against (100G here), not on the NIC port line rate -- ehat scales with C, so V must too or the audit loop's damping becomes link-rate dependent (design.md \u00a73.3). rx_agent reads C from the uplink and recomputes V whenever the link speed changes. HEADROOM=0.08 (2026-07-29, overlay-resident): 3% queue-warning + ~5% VxLAN encap tax (inner-byte ledger vs outer-byte wire, measured 4.99% at 1500 MTU); covers inner packets >= ~625 B, smaller-packet overshoot falls back to tenant CC. V IS NOT DERIVED FROM HEADROOM: the real rule is V = 4*zeta^2*gamma*ehat*/k at the typical contention point (design_theory par.3; ehat*=23G, zeta=1/sqrt(2) => V=576 Mbit, revalidated by results/vtune_20260729). v_seconds=0.072 is only the dial that lands V there through the legacy v_sec*headroom*C packaging -- when headroom or C' changes, re-solve V from the zeta rule and re-set v_seconds, do NOT let V drift; design_theory \u00a73 shows it lands 1% from the optimal-damping inverse V = 4*zeta^2*gamma*ehat_star/k at zeta=1/sqrt(2), which is post-hoc confirmation, not a derivation -- re-derive it if the tenant count, flow count, link rate or loop delay changes. Derivations and tuning rules: hpft-design/docs/design_theory.md.",
     "period_ms": 1,
     "k": 20.0,
     "gamma": 0.25,
-    "v_seconds": 0.2,
+    "v_seconds": 0.072,
     "delta_demand": 0.15,
-    "headroom": 0.03,
+    "headroom": 0.08,
     "n1_freeze_s": 0.25,
     "n2_failopen_s": 2.0,
     "n3_evict_s": 30,
@@ -233,6 +233,7 @@
     "rate_window_s": 0.02,
     "fs_grace_s": 0.5,
     "backlog_congestion_aware": true,
-    "policy": null
+    "policy": null,
+    "liveness_port": 9713
   }
 }

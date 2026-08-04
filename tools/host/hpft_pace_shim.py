@@ -28,6 +28,25 @@ from tcp_shaper_lib import (  # noqa: E402
     vnic_index,
 )
 
+
+_GEN_CACHE = {}   # pair -> (rate_bps, generation)
+
+def _gen_for(pair, rate_bps):
+    """Stable generation per pair: a new generation tells the BPF side to
+    (bounded-)forgive debt, so mint one only on first install or a large
+    (>25%) rate step -- NOT on every push. Minting per push amnestied the
+    debt every ~100 ms and let deep-debt senders (BBR) run past the pace
+    (2-1-2 expM escape)."""
+    prev = _GEN_CACHE.get(pair)
+    if prev is not None:
+        prev_rate, gen = prev
+        if prev_rate > 0 and abs(rate_bps - prev_rate) <= 0.25 * prev_rate:
+            _GEN_CACHE[pair] = (rate_bps, gen)
+            return gen
+    gen = make_generation()
+    _GEN_CACHE[pair] = (rate_bps, gen)
+    return gen
+
 TCP_PIN_DIR = Path("/sys/fs/bpf/hpft_tcp_edt")
 TCP_REGISTRY = "/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-tcp-registry.json"
 BURST_BYTES = 262_144
@@ -94,7 +113,8 @@ def main():
                 dst_vnic=emap[msg["dst_vnic"]],
                 rate_bps=int(msg["rate_bps"]),
                 burst_bytes=BURST_BYTES,
-                generation=make_generation())
+                generation=_gen_for((msg["src_vnic"], msg["dst_vnic"]),
+                                    int(msg["rate_bps"])))
             writer.update(upd)
             n += 1
             reply = {"ok": True,

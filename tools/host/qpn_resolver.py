@@ -23,7 +23,7 @@ HZ = 5
 SRC = {"mlx5_6": "10.1.0.1", "mlx5_7": "10.1.1.1",
        "mlx5_8": "10.1.2.1", "mlx5_9": "10.1.3.1"}
 # peer VF: rdma device -> dst_ip (what a QP on that peer device terminates as)
-PEER_DST = {"mlx5_6": "10.1.0.2", "mlx5_7": "10.1.0.4",
+PEER_DST = {"mlx5_6": "10.1.0.2", "mlx5_7": "10.1.1.2",
             "mlx5_8": "10.1.2.2", "mlx5_9": "10.1.3.2"}
 
 

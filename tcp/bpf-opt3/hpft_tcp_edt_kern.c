@@ -21,6 +21,15 @@
 /* Per-wire-frame bytes the shaper must charge for but skb->len never
  * counts: 8 B preamble+SFD, 12 B inter-packet gap, 4 B FCS. */
 #define HPFT_FRAME_OVERHEAD 24ULL
+/* Max shaping debt a pair may carry, as future-stamp distance. Beyond it,
+ * packets are dropped (policer tail on the EDT shaper). Enforcement itself
+ * comes from the stamps + a STABLE generation; this drop is only the
+ * backstop against unbounded debt (a CC that never yields). Sized 200 ms:
+ * at 50 ms a flow-set carrying ~128 connections built past the cap on
+ * normal bursts and the resulting loss collapsed TCP to a tenth of its
+ * share (2-3-1 S2 heavy rung, 2026-07-30). fq's own horizon is 10 s, so
+ * 200 ms of queue is cheap; runaway debt still trips within a few ticks. */
+#define HPFT_DEBT_CAP_NS (200ULL * 1000 * 1000)
 
 struct hpft_vlan_hdr {
     __u16 h_vlan_TCI;
@@ -228,12 +237,26 @@ int hpft_tcp_edt(struct __sk_buff *skb)
          * identical to baseline; keeps multi-flow stable). */
         bpf_spin_lock(&state->lock);
         if (state->generation != cfg->generation) {
-            state->next_ns = now;
+            /* Reconfig: forgive only STALE debt (cap the stamp horizon),
+             * never zero it. Resetting to `now` on every generation bump
+             * amnestied the whole debt each shim push (~100 ms cadence
+             * under an oscillating target) and let a deep-debt sender run
+             * 1.6x its pace -- the BBR escape (2-1-2 expM). */
+            if (state->next_ns > now + HPFT_DEBT_CAP_NS)
+                state->next_ns = now + HPFT_DEBT_CAP_NS;
             state->generation = cfg->generation;
-        } else if (state->next_ns < min_next_ns) {
-            state->next_ns = min_next_ns;
         }
+        if (state->next_ns < min_next_ns)
+            state->next_ns = min_next_ns;
         send_ns = state->next_ns;
+        if (send_ns > now + HPFT_DEBT_CAP_NS) {
+            /* Debt beyond the cap: drop instead of stamping ever further
+             * into the future. Bounds fq queueing delay to the cap and
+             * hands rate-based CCs (BBR) a real loss signal; loss-based
+             * CCs never dig this deep. State is NOT advanced. */
+            bpf_spin_unlock(&state->lock);
+            return TC_ACT_SHOT;
+        }
         next_ns = send_ns + packet_ns;
         if (next_ns < send_ns)
             next_ns = send_ns;
@@ -269,7 +292,13 @@ int hpft_tcp_edt(struct __sk_buff *skb)
             int sparse = gap > HPFT_GAP_NS &&
                          (__u64)skb->len <= HPFT_SPARSE_MAX_LEN &&
                          (send_ns - now) <= burst_ns;
-            if (!sparse)
+            /* max(): the sock may carry its own EDT stamp (BBR's pacing
+             * writes skb->tstamp directly). Composing by max() in the
+             * time domain is min() in the rate domain -- the actual send
+             * rate is min(CC's own pacing, HPFT budget). Overwriting
+             * unconditionally discarded whichever stamp was later and
+             * let BBR run ~22% past its budget (2-1-2 expM finding). */
+            if (!sparse && send_ns > skb->tstamp)
                 skb->tstamp = send_ns;
         }
         return TC_ACT_OK;

@@ -45,3 +45,7 @@ results/*/results/*_ticks.txt
 results/*/results/*.journal
 tools/tests/results/
 results/regression/
+
+# bulky one-off captures (overlay bring-up pcaps, vtune traces)
+results/p0_overlay_20260729/
+results/vtune_20260729/

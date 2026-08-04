@@ -331,6 +331,67 @@ class VportMeter:
         return ((ib1 - ib0) * 8 / dt, (e1 - e0) * 8 / dt)
 
 
+class SenderLiveness:
+    """Receiver side of the sender-liveness feed (tx_agent_e publishes it).
+
+    The pool a dst receives is measured exactly and freshly; only its
+    DIVISION among senders is estimated, and that estimate rests on
+    megaflow byte counters the hardware caches for ~1 s. A sender that
+    stops therefore keeps a share of the pool for up to the mix window,
+    which dilutes the survivors' measured rate and makes them crawl into
+    the freed share. No receiver-side counter can do better - but the
+    sender's own vport TX counters are fresh at ~1 ms, so the sender
+    tells us. Used ONLY as a gate ("is this sender sending at all"), never
+    as the ratio: the ratio stays a receiver-side measurement.
+
+    Advisory by construction: an absent or stale feed leaves attribution
+    exactly as it was (baseline arms run no sender agent at all).
+    """
+
+    STALE_S = 0.3
+    IDLE_BPS = 50e6      # below the pace floor => not sending
+
+    def __init__(self, port):
+        self.rate = {}                 # "host/vnic|class" -> bps
+        self.t = 0.0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.sock.bind(("0.0.0.0", port))
+        except OSError:
+            self.sock = None
+            return
+        self.sock.setblocking(False)
+
+    def poll(self, now):
+        if self.sock is None:
+            return
+        while True:
+            try:
+                data, _ = self.sock.recvfrom(65536)
+            except (BlockingIOError, OSError):
+                break
+            try:
+                msg = json.loads(data.decode())
+                # keys arrive as "<vnic_id>|<class>" and vnic_id already
+                # carries the host ("sgpu01/vf0"), which is exactly the
+                # form the flow-set id uses -- store verbatim.
+                for k, v in msg["r"].items():
+                    self.rate[k] = float(v)
+                self.t = now
+            except (ValueError, KeyError):
+                continue
+
+    def idle(self, fsid, now):
+        """True only when the sender positively reports ~zero for this
+        (src, class). Unknown or stale => False (never gate on silence)."""
+        if self.sock is None or now - self.t > self.STALE_S:
+            return False
+        src, cls = fsid.split(">")[0], fsid.rsplit("|", 1)[1]
+        v = self.rate.get("%s|%s" % (src, cls))
+        return v is not None and v < self.IDLE_BPS
+
+
 class HybridRates:
     """r_f = fresh per-dst-VF vport rate x windowed megaflow byte share
     (see module docstring).
@@ -370,6 +431,8 @@ class HybridRates:
         self.host_ring = {}               # vnic -> [(t_host_ns, rx_bytes)]
         self.host_seen = {}               # vnic -> local monotonic of report
         self.attr_host = set()            # dsts host-attributed this tick
+        self.young_active = set()         # partially-visible newcomers
+        self.liveness = None              # SenderLiveness (advisory)
 
     def _rep_tx_bytes(self, dev):
         fd = self._fd.get(dev)
@@ -406,6 +469,15 @@ class HybridRates:
             del self.first_seen[f]
         shares = {}
         unmeasured = set()
+        # Partially-visible newcomers: younger than the window AND already
+        # showing bytes. Their ratio understates them (the dump is ~1 s
+        # cached), so the split must not trust it. A newcomer with NO bytes
+        # is the `unmeasured` case below; a member with no bytes that is
+        # LEAVING must not be counted here at all, or its stale prior keeps
+        # holding the survivors down (D3 leave direction, 2026-07-30).
+        self.young_active = {f for f in win
+                             if win.get(f, 0) > 0
+                             and now - self.first_seen.get(f, 0) < self.window}
         for dst, members in by_dst.items():
             # "no bytes in the window" means two completely different
             # things, and conflating them is what let one sender be
@@ -564,10 +636,10 @@ class HybridRates:
                 if not fs:
                     self.unattributed += pool
                     continue
-                self._split(fs, pool, rates)
+                self._split(fs, pool, rates, now)
         return rates
 
-    def _split(self, fs, pool, out):
+    def _split(self, fs, pool, out, now=None):
         """Divide one exactly-measured pool among its flow-sets.
 
         Which ruler splits this pool. The megaflow byte ratio is
@@ -593,7 +665,32 @@ class HybridRates:
         if not fs:
             return
         w = {f: self.mix_shares.get(f, 0.0) for f in fs}
-        if any(f in self.unmeasured for f in fs):
+        # Attribution-lag guard (2026-07-30, eval D3/vtune finding): a member
+        # YOUNGER than the mix window is unreliable even when it has bytes -
+        # the megaflow cache is ~1 s stale, so a newcomer shows a sliver of
+        # its true rate and the ratio hands the remainder to its peers, whose
+        # ledgers then charge a wrongful mark for ~2 s (u pinned at 0.75x
+        # ceiling). Young member present => split the pool by the previous
+        # tick's entitlements, same prior as the unmeasured case.
+        # A partially-visible newcomer (young AND already sending) makes the
+        # byte ratio untrustworthy: it understates the newcomer and hands its
+        # rate to the incumbents, whose ledgers then charge a wrongful mark
+        # for ~2 s. Fall back to the same prior the unmeasured case uses.
+        # Departing members are deliberately NOT counted here - they carry no
+        # bytes, and treating them as young keeps survivors from rising into
+        # the freed share (D3 leave direction).
+        # Gate on the sender's own fresh view first: a member the sender
+        # positively reports as not sending contributes nothing to this
+        # pool, so its stale megaflow bytes must not claim a share of it.
+        # This is what lets survivors take the freed capacity immediately
+        # instead of waiting out the mix window.
+        live = self.liveness
+        if live is not None and now is not None:
+            act = [f for f in fs if not live.idle(f, now)]
+            if act and len(act) < len(fs):
+                fs = act
+        young = bool(self.young_active & set(fs))
+        if young or any(f in self.unmeasured for f in fs):
             # ABSENT from the prior and PRESENT-BUT-NEAR-ZERO are different
             # again, and defaulting the absent case to 0 reproduces the very
             # bug this prior exists to fix: a flow-set created this tick has
@@ -1019,7 +1116,7 @@ class Telemetry:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--registry", default="/opt/hpft/lab-registry.json")
-    ap.add_argument("--bridge", default="underlay-p1")
+    ap.add_argument("--bridge", default="ovsbr-p1")
     ap.add_argument("--uplink", default="p1")
     ap.add_argument("--local-host", default=None)
     ap.add_argument("--log", default="/tmp/hpft_rxagent_e.jsonl")
@@ -1095,6 +1192,7 @@ def main():
                 if m:
                     vport_of_vnic[v["vnic_id"]] = int(m.group(1)) + 1
         vpm = VportMeter(args.vport_meter, vport_of_vnic)
+    liveness = SenderLiveness(int(ep.get("liveness_port", 9713)))
 
     uc = Unixctl()
     meter = FlowSetMeter(mac2vnic, local_macs)
@@ -1104,6 +1202,7 @@ def main():
         ep.get("mix_window_s", 2.0),
         rate_window_s=ep.get("rate_window_s", 0.006),
         meter=vpm)
+    hybrid.liveness = liveness
     sched = Scheduler(reg["policy"], line, ep["headroom"], ep["delta_demand"])
     last_seen = {}
     marker = VQMarker(v_full)
@@ -1156,6 +1255,7 @@ def main():
         # ---- sample vport counters FIRST, before any slow work, so the
         # sampling cadence is regular (set by the sleep schedule) ----
         hybrid.sample(now, period)
+        liveness.poll(now)      # fresh per-(src,class) sending signal
 
         # drain receiver-host kernel byte reports (class-attribution truth)
         while True:

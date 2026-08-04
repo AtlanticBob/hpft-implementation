@@ -27,9 +27,12 @@ import argparse
 import json
 import math
 import os
+import re
 import socket
 import struct
 import time
+
+import mmap
 
 import fastfill
 import hw_maxrate
@@ -350,6 +353,96 @@ class PaceShim:
                 pass
 
 
+class SenderLiveness:
+    """Fresh per-(src vnic, class) TX rates, published to the receiver.
+
+    Why: the receiver splits a dst's exactly-measured pool among its
+    senders using megaflow byte ratios, and those counters are ~1 s
+    hardware-cached. When a sender STOPS, its stale bytes keep claiming a
+    share for up to the mix window (2 s), so the survivors' measured rate
+    stays diluted and they crawl into the freed share (D3 leave, ~2.9 s).
+    The sender does not have that problem: its own vport TX counters are
+    fresh at ~1 ms. Publishing them lets the receiver gate attribution on
+    "is this sender actually sending", which no receiver-side signal can
+    answer in under a second.
+
+    Payload is tiny and advisory: {"h": host, "t": mono_ns,
+    "r": {"<vnic>|<class>": bps}}. The receiver falls back to its old
+    chain whenever this feed is absent or stale, so a sender without the
+    helper (baseline arms) behaves exactly as before.
+    """
+
+    HDR = struct.Struct("<8sII8H")
+    STALE_S = 0.1
+
+    def __init__(self, path, vport_of_vnic, dst_ip, port, host):
+        self.path, self.vport_of_vnic = path, vport_of_vnic
+        self.addr, self.host = (dst_ip, port), host
+        self.mm = None
+        self.slot = {}
+        self.prev = {}          # vnic -> (t_s, tx_ib, tx_eth)
+        self.rate = {}          # "vnic|class" -> bps
+        self._next_open = 0.0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+
+    def _open(self, now):
+        if now < self._next_open:
+            return False
+        self._next_open = now + 1.0
+        try:
+            f = open(self.path, "rb")
+            self.mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+            f.close()
+        except (OSError, ValueError):
+            self.mm = None
+            return False
+        hdr = self.HDR.unpack_from(self.mm, 0)
+        if hdr[0] != b"HPFTVPM1":
+            self.mm = None
+            return False
+        slot = {hdr[3 + i]: i for i in range(hdr[1])}
+        self.slot = {vn: slot[vp] for vn, vp in self.vport_of_vnic.items()
+                     if vp in slot}
+        return True
+
+    def tick(self, now):
+        if self.mm is None and not self._open(now):
+            return
+        for vnic, sl in self.slot.items():
+            off = 64 + 64 * sl
+            try:
+                s1 = struct.unpack_from("<Q", self.mm, off)[0]
+                if s1 & 1:
+                    continue
+                t_ns, _rx_ib, _rx_eth, tx_ib, tx_eth = struct.unpack_from(
+                    "<5Q", self.mm, off + 8)
+                if s1 != struct.unpack_from("<Q", self.mm, off)[0]:
+                    continue
+            except (ValueError, struct.error):
+                self.mm = None
+                return
+            if t_ns == 0 or now - t_ns / 1e9 > self.STALE_S:
+                continue
+            t = t_ns / 1e9
+            prev = self.prev.get(vnic)
+            self.prev[vnic] = (t, tx_ib, tx_eth)
+            if not prev or t - prev[0] <= 0:
+                continue
+            dt = t - prev[0]
+            if tx_ib >= prev[1]:
+                self.rate["%s|rdma" % vnic] = (tx_ib - prev[1]) * 8 / dt
+            if tx_eth >= prev[2]:
+                self.rate["%s|tcp" % vnic] = (tx_eth - prev[2]) * 8 / dt
+        if self.rate:
+            msg = {"h": self.host, "t": time.monotonic_ns(),
+                   "r": {k: int(v) for k, v in self.rate.items()}}
+            try:
+                self.sock.sendto(json.dumps(msg).encode(), self.addr)
+            except OSError:
+                pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--registry", default="/opt/hpft/lab-registry.json")
@@ -432,6 +525,24 @@ def main():
         st.last_step = now
         st.R = track_step(st.R, target, dt, k, floor)
     shim = PaceShim(ctl["pace_shim"][local_host])
+    # sender-liveness feed (advisory, see SenderLiveness): tells the receiver
+    # which senders are actually sending, at vport freshness (~1 ms), so its
+    # attribution does not have to wait out the ~1 s megaflow cache when a
+    # sender stops. Absent/stale feed => receiver keeps its old chain.
+    live = None
+    _rx_host = reg.get("receiver_host")
+    _live_ip = ctl.get("telemetry_ip", {}).get(_rx_host)
+    if _live_ip:
+        _vport_of_vnic = {}
+        for v in reg["vnics"]:
+            if v["host"] == local_host and v.get("representor"):
+                _m = re.search(r"vf(\d+)$", v["representor"])
+                if _m:
+                    _vport_of_vnic[v["vnic_id"]] = int(_m.group(1)) + 1
+        if _vport_of_vnic:
+            live = SenderLiveness("/dev/shm/hpft_vpm", _vport_of_vnic,
+                                  _live_ip, int(ep.get("liveness_port", 9713)),
+                                  local_host)
     mailbox = RpMailbox(line)
     flowtags = {v["vnic_id"]: int(v["flowtag"], 16)
                 for v in reg["vnics"] if "flowtag" in v}
@@ -635,6 +746,8 @@ def main():
             print("tx_agent_e: bad telemetry: %s" % e, flush=True)
             seq, recs_all = None, {}
         now = time.monotonic()
+        if live is not None:
+            live.tick(now)
         rdma_batch = []
         if recs_all:
             last_any_rx = now

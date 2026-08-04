@@ -7,8 +7,13 @@
 #     -- lost when the VF netdev is recreated. Without it TCP is UNPACED,
 #        blasts the link, and the resulting congestion crushes RDMA (which
 #        obeys ECN) -- this looked like "SR crushes RDMA 0.19" until fixed;
-#   - the telemetry underlay IP (10.1.9.x on underlay-p1) -- without it the
-#     tx_agent gets no telemetry, the RP fail-opens, and RDMA runs to line;
+#   - p1's addresses under the resident overlay (underlay 172.16.1.x + the
+#     telemetry IP 10.1.9.x live DIRECTLY on p1 since 2026-07-29), its 9000
+#     MTU, and the static telemetry ARP -- without the telemetry IP the
+#     tx_agent gets no telemetry, the RP fail-opens, and RDMA runs to line.
+#     The OVS bridge structure (ovsbr-p1 + vxlan100) is NOT volatile: it
+#     persists across fw resets and Arm reboots (lab_env.sh ensure_overlay
+#     owns the structural part);
 #   - /tmp scripts (rp_service.sh).
 # The vport-meter, pace-shim and rate-exporter are systemd units and survive.
 #
@@ -29,11 +34,11 @@ ssh sgpu02 'for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do sudo ip link set "$d" m
 echo "== 2/6 TCP EDT (fq + BPF) on sender =="
 sudo bash "$REPO/tools/host/edt_ensure.sh"
 
-echo "== 3/6 telemetry underlay-p1 (10.1.9.x) + static ARP =="
-ssh hpft-dpu  'sudo ip addr add 10.1.9.1/24 dev underlay-p1 2>/dev/null; sudo ip link set underlay-p1 up'
-ssh hpft-dpu2 'sudo ip addr add 10.1.9.2/24 dev underlay-p1 2>/dev/null; sudo ip link set underlay-p1 up'
-M1=$(ssh hpft-dpu  'cat /sys/class/net/underlay-p1/address' 2>/dev/null)
-M2=$(ssh hpft-dpu2 'cat /sys/class/net/underlay-p1/address' 2>/dev/null)
+echo "== 3/6 overlay volatile state on p1 (underlay + telemetry IPs, MTU 9000, ARP) =="
+ssh hpft-dpu  'sudo ip addr add 172.16.1.1/24 dev p1 2>/dev/null; sudo ip addr add 10.1.9.1/24 dev p1 2>/dev/null; sudo ip link set p1 up mtu 9000'
+ssh hpft-dpu2 'sudo ip addr add 172.16.1.2/24 dev p1 2>/dev/null; sudo ip addr add 10.1.9.2/24 dev p1 2>/dev/null; sudo ip link set p1 up mtu 9000'
+M1=$(ssh hpft-dpu  'cat /sys/class/net/p1/address' 2>/dev/null)
+M2=$(ssh hpft-dpu2 'cat /sys/class/net/p1/address' 2>/dev/null)
 [ -n "$M2" ] && ssh hpft-dpu  "sudo arp -s 10.1.9.2 $M2 2>/dev/null"
 [ -n "$M1" ] && ssh hpft-dpu2 "sudo arp -s 10.1.9.1 $M1 2>/dev/null"
 
@@ -43,6 +48,10 @@ ssh hpft-dpu2 'sudo ethtool -s p1 speed 100000 duplex full 2>/dev/null; sudo mln
 
 echo "== 5/6 restart pace shim (re-seed pair state after EDT re-apply) =="
 sudo systemctl restart hpft-pace-shim; sleep 2
+
+# vport_meter holds a DEVX context: a fw reset kills the context but not
+# the process, so is-active lies. Restart unconditionally.
+ssh hpft-dpu2 'sudo systemctl reset-failed hpft-vport-meter 2>/dev/null; sudo systemctl restart hpft-vport-meter 2>/dev/null; true'
 
 echo "== 6/6 sanity =="
 echo -n "  EDT: "; sudo bash "$REPO/tools/host/edt_ensure.sh" 2>/dev/null | tr '\n' ' '; echo

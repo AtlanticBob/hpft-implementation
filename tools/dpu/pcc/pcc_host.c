@@ -218,8 +218,10 @@ int main(int argc, char **argv)
 				uint32_t *rsp = NULL;
 
 				if (doca_pcc_mailbox_get_response_buffer(resources.doca_pcc, (void **)&rsp) == DOCA_SUCCESS && rsp != NULL)
-					printf("HPFT_RSP ft=0x%x bud=%u lvl=%u avg16=%u r=%u s16=%u ep=%u evb32=%u\n",
-					       rsp[0], rsp[1], rsp[2], rsp[3], rsp[4], rsp[5], rsp[6], rsp[7]);
+					printf("HPFT_RSP ft=0x%x bud=%u lvl=%u avg16=%u r=%u s16=%u ep=%u evb32=%u"
+					       " w8=%u w9=%u w10=%u\n",
+					       rsp[0], rsp[1], rsp[2], rsp[3], rsp[4], rsp[5], rsp[6], rsp[7],
+					       rsp[8], rsp[9], rsp[10]);
 			}
 			printf("HPFT_SET ft=0x%x rate=%u rc=%d cb=%u t0=%lld.%09ld send_ns=%lld\n",
 			       ft, rate, (int)result, mb_cb_ret_val,
