@@ -39,7 +39,11 @@ reg_restore() {
 # ---- HPFT stack -------------------------------------------------------
 agents_restart() {  # both agents only, fresh jsonl. RP (and its per-flowtag
                     # budgets) untouched -- use between points of one group.
-  ssh hpft-dpu2 'sudo systemctl stop hpft-rxagent-e 2>/dev/null; sudo systemctl reset-failed hpft-rxagent-e 2>/dev/null
+  # vport_meter FIRST: it wedges silently (DEVX context death), and a fresh
+  # rx_agent mmaps whatever shm inode exists at startup -- restarting the
+  # meter after the agent leaves the agent reading a dead file.
+  ssh hpft-dpu2 'sudo systemctl restart hpft-vport-meter 2>/dev/null; sleep 1
+    sudo systemctl stop hpft-rxagent-e 2>/dev/null; sudo systemctl reset-failed hpft-rxagent-e 2>/dev/null
     sudo rm -f /tmp/hpft_rxagent_e.jsonl; sudo systemd-run --unit hpft-rxagent-e /usr/bin/python3 /opt/hpft/rx_agent.py' >/dev/null
   ssh hpft-dpu 'sudo systemctl stop hpft-txagent-e 2>/dev/null; sudo systemctl reset-failed hpft-txagent-e 2>/dev/null
     sudo rm -f /tmp/hpft_txagent_e.jsonl; sudo systemd-run --unit hpft-txagent-e /usr/bin/python3 /opt/hpft/tx_agent_e.py' >/dev/null

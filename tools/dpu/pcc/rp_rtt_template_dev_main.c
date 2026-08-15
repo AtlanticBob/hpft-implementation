@@ -713,7 +713,9 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	if (target >= 0) {
 		hpft_pair_t *c = &g_hpft_pairs[target];
 
-		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
+		/* freeze gates the MD side too: 0xccc <MAX> pins cc_rate so
+		 * rate == level exactly (pure policy plane, no CC term) */
+		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP && !g_hpft_cc_freeze) {
 			c->cnp_hits++;  /* DIAG 2026-07-22 */
 			if (g_hpft_cc_algo == HPFT_CC_ZTR) {
 				/* ZTR applies the CNP decrease when the next RTT
