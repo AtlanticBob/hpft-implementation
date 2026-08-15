@@ -31,8 +31,11 @@ sleep 4
 for d in $VFS; do sudo ip link set "$d" mtu 1500 2>/dev/null; done
 ssh sgpu02 'for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do sudo ip link set "$d" mtu 1500 2>/dev/null; done'
 
+# tenant TCP CC choices used by the CC-matrix experiments must be loadable
+sudo modprobe tcp_bbr 2>/dev/null; true
 echo "== 2/6 TCP EDT (fq + BPF) on sender =="
 sudo bash "$REPO/tools/host/edt_ensure.sh"
+bash "$REPO/tools/host/edt_maps_ensure.sh"
 
 echo "== 3/6 overlay volatile state on p1 (underlay + telemetry IPs, MTU 9000, ARP) =="
 ssh hpft-dpu  'sudo ip addr add 172.16.1.1/24 dev p1 2>/dev/null; sudo ip addr add 10.1.9.1/24 dev p1 2>/dev/null; sudo ip link set p1 up mtu 9000'
