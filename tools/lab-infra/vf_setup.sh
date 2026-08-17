@@ -26,3 +26,16 @@ for i in {0..3}; do
     sudo ip addr add 10.1.${i}.${IPSUF}/24 dev dpu1vf${i}
     sudo ip link set dpu1vf${i} mtu 8192 up
 done
+
+# All four VFs share one L2 (the VxLAN overlay bridges every representor),
+# so an ARP request for 10.1.i.<host> reaches every VF of that host and,
+# with the kernel default arp_ignore=0, every VF answers with its OWN MAC;
+# the peer keeps whichever reply lands last. TCP/ICMP still work (weak
+# host model) but RoCE frames delivered to the wrong VF are dropped by the
+# NIC (its GID table lacks that IP): "QP connects, zero iterations".
+# arp_ignore=1: answer only for IPs configured on the receiving interface;
+# arp_announce=2: source ARP from the interface that owns the address.
+for d in all dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do
+    sudo sysctl -q -w net.ipv4.conf.$d.arp_ignore=1 net.ipv4.conf.$d.arp_announce=2
+done
+sudo ip neigh flush to 10.1.0.0/16 2>/dev/null || true

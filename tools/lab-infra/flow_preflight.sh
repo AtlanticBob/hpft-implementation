@@ -26,8 +26,11 @@ for ij in $PAIRS; do
   sleep 1.2
   bw=$(timeout 12 $PT -d mlx5_$((6+i)) -p $PORT --report_gbits -D 3 10.1.$j.2 2>&1 \
        | grep -A1 "BW average" | tail -1 | awk '{print $4}')
-  if [ -z "$bw" ] || [ "$bw" = "BW" ]; then
-    echo "  vf$i>vf$j  DEAD"; fail=1
+  # a pair that connects but moves nothing (0 iterations) is just as dead
+  # as one that never connects: e.g. RoCE frames landing on the wrong VF
+  # after a mis-learned ARP entry (TCP/ICMP fine, NIC drops the RoCE).
+  if [ -z "$bw" ] || [ "$bw" = "BW" ] || awk "BEGIN{exit !($bw < 0.01)}"; then
+    echo "  vf$i>vf$j  DEAD (bw=${bw:-none})"; fail=1
   else
     echo "  vf$i>vf$j  ok ${bw}G"
   fi

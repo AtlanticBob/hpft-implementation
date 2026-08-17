@@ -84,6 +84,11 @@ post_recover() {
   sleep 4
   for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do sudo ip link set "$d" mtu "$VF_MTU" 2>/dev/null; done
   ssh sgpu02 "for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do sudo ip link set \$d mtu $VF_MTU 2>/dev/null; done"
+  # single-L2 overlay: every VF of a host hears every ARP request; only the
+  # VF owning the IP may answer, else RoCE frames land on the wrong VF and
+  # the NIC drops them (TCP/ICMP unaffected). See vf_setup.sh.
+  ARPFIX='for d in all dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do sudo sysctl -q -w net.ipv4.conf.$d.arp_ignore=1 net.ipv4.conf.$d.arp_announce=2; done; sudo ip neigh flush to 10.1.0.0/16 2>/dev/null; true'
+  bash -c "$ARPFIX"; ssh sgpu02 "$ARPFIX"
   ssh hpft-dpu2 "sudo ethtool -s p1 speed $P1_SPEED duplex full 2>/dev/null"
   for h in hpft-dpu hpft-dpu2; do
     ssh $h 'for p in p0 p1; do sudo ethtool -A $p rx off tx off 2>/dev/null; sudo mlnx_qos -i $p --pfc 0,0,0,0,0,0,0,0 >/dev/null 2>&1; done'
