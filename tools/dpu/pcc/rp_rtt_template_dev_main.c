@@ -30,113 +30,6 @@
 #include "rtt_template.h"
 
 #define DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK (1 << DOCA_PCC_DEV_EVNT_ROCE_ACK)
-#define SAMPLER_THREAD_RANK (0)
-#define COUNTERS_SAMPLE_WINDOW_IN_MICROSEC (10)
-
-/**< Counters IDs to configure and read from */
-uint32_t counter_ids[DOCA_PCC_DEV_MAX_NUM_PORTS] = {0};
-/**< Table of TX bytes counters to sample to */
-uint32_t current_sampled_tx_bytes[DOCA_PCC_DEV_MAX_NUM_PORTS] = {0};
-/**< Table of TX bytes counters that was last sampled */
-uint32_t previous_sampled_tx_bytes[DOCA_PCC_DEV_MAX_NUM_PORTS] = {0};
-/**< Last timestamp of sampled counters */
-uint32_t last_sample_ts;
-/**< Ports active bandwidth. Units of MB/s */
-uint32_t ports_bw[DOCA_PCC_DEV_MAX_NUM_PORTS];
-/**< Number of available and initiated logical ports */
-uint32_t ports_num = 0;
-/**< Percentage of the current active ports utilized bandwidth. Saved in FXP 16 format */
-uint32_t g_utilized_bw[DOCA_PCC_DEV_MAX_NUM_PORTS];
-/**< Flag to indicate that the counters have been initiated */
-uint32_t counters_started = 0;
-
-#ifdef DOCA_PCC_SAMPLE_TX_BYTES
-/*
- * Dedicate one thread to sample tx bytes counters on a defined time frame,
- * calculate current bandwidth and compare with maximum port bandwidth.
- * This call is enabled by user option to sample TX bytes counter
- */
-__attribute__((unused)) FORCE_INLINE void thread0_calc_ports_utilization(void)
-{
-	uint32_t tx_bytes_delta[DOCA_PCC_DEV_MAX_NUM_PORTS], current_bw[DOCA_PCC_DEV_MAX_NUM_PORTS], ts_delta,
-		current_ts;
-
-	if ((doca_pcc_dev_thread_rank() == SAMPLER_THREAD_RANK) && counters_started) {
-		current_ts = doca_pcc_dev_get_timer_lo();
-		ts_delta = diff_with_wrap32(current_ts, last_sample_ts);
-		if (ts_delta >= COUNTERS_SAMPLE_WINDOW_IN_MICROSEC) {
-			doca_pcc_dev_nic_counters_sample();
-			for (uint32_t i = 0; i < ports_num; i++) {
-				tx_bytes_delta[i] =
-					diff_with_wrap32(current_sampled_tx_bytes[i], previous_sampled_tx_bytes[i]);
-				previous_sampled_tx_bytes[i] = current_sampled_tx_bytes[i];
-				current_bw[i] =
-					(doca_pcc_dev_fxp_mult(tx_bytes_delta[i], doca_pcc_dev_fxp_recip(ts_delta)) >>
-					 16);
-				g_utilized_bw[i] = (1 << 16);
-				if (current_bw[i] < ports_bw[i])
-					g_utilized_bw[i] = doca_pcc_dev_fxp_mult(current_bw[i],
-										 doca_pcc_dev_fxp_recip(ports_bw[i]));
-			}
-			last_sample_ts = current_ts;
-		}
-	}
-}
-
-/**
- * @brief Count the number of available logical ports from queried mask
- *
- * @param[in] ports_mask - ports_mask
- *
- * @return - number of available logical ports initiated in mask
- */
-FORCE_INLINE uint32_t count_ports(uint32_t ports_mask)
-{
-	// find maximum port id enabled. Assume enabled ports are continuous
-	return doca_pcc_dev_fls(ports_mask);
-}
-
-/**
- * @brief Initiate counter IDs global array on port for TX bytes counter type
- */
-FORCE_INLINE void init_counter_ids(void)
-{
-	for (uint32_t i = 0; i < DOCA_PCC_DEV_MAX_NUM_PORTS; i++)
-		counter_ids[i] = DOCA_PCC_DEV_GET_PORT_COUNTER_ID(i, DOCA_PCC_DEV_NIC_COUNTER_TYPE_TX_BYTES, 0);
-}
-
-/*
- * Initialize TX counters sampling
- */
-FORCE_INLINE void tx_counters_sampling_init(uint32_t portid)
-{
-	/* number of ports to initiate counters for */
-	ports_num = count_ports(doca_pcc_dev_get_logical_ports());
-	/* Configure counters to read */
-	doca_pcc_dev_nic_counters_config(counter_ids, ports_num, current_sampled_tx_bytes);
-	/* save port speed in MBps units */
-	ports_bw[portid] = (doca_pcc_dev_mult(doca_pcc_dev_get_port_speed(portid), 1000) >> 3);
-	/* Sample counters and save in global table */
-	doca_pcc_dev_nic_counters_sample();
-	last_sample_ts = doca_pcc_dev_get_timer_lo();
-	/* Save sampled TX bytes */
-	for (uint32_t i = 0; i < ports_num; i++)
-		previous_sampled_tx_bytes[i] = current_sampled_tx_bytes[i];
-	counters_started = 1;
-}
-
-/*
- * Called on link or port info state change.
- * This callback is used to configure port counters to query TX bytes on
- *
- * @return - void
- */
-void doca_pcc_dev_user_port_info_changed(uint32_t portid)
-{
-	tx_counters_sampling_init(portid);
-}
-#endif
-
 /*
  * Main entry point to user CC algorithm (Reference code)
  * This function starts the algorithm code of a single event
@@ -296,12 +189,8 @@ typedef struct {
 	volatile uint32_t level;
 	volatile uint32_t epoch_ts;	/* us, timer_lo domain */
 	volatile uint32_t avg_b32_x16;	/* EWMA of 32B-units per packet, x16 fixed point */
-	volatile uint32_t port;		/* port this pair was last seen on */
-	volatile uint32_t port_cnt_snap;	/* HW port TX-bytes counter snapshot */
-	volatile uint32_t port_ev_snap;	/* per-port event-bytes running-total snapshot */
 	volatile uint32_t r_ewma;	/* smoothed measured rate, units */
 	volatile uint32_t dbg_r_units;
-	volatile uint32_t dbg_s_x16;
 	volatile uint32_t dbg_epochs;
 	volatile uint32_t dbg_ev_b32;
 	volatile uint32_t dbg_hits;	/* racy per-event counter for visibility */
@@ -405,21 +294,9 @@ static volatile uint32_t g_qpn_epoch[HPFT_QPMAP_SIZE];
 static volatile uint32_t g_qpn_map_active;
 static volatile uint32_t g_hpft_rtt_traces;
 static volatile uint32_t g_hpft_unknown_ft;
-static volatile uint32_t g_hpft_cc_freeze;
 static volatile uint32_t g_hpft_cc_algo = HPFT_CC_DCQCN;
 static volatile uint32_t g_hpft_rtt_events;   /* RTT events seen, any flowtag */
 static volatile uint32_t g_hpft_rtt_unmatched; /* ... with no pair match */
-static volatile uint32_t g_hpft_ccrate_only;  /* EXPERIMENT 2026-07-22: when set,
-	 * results->rate = cc_rate directly (bypass min(cc_rate,level)) -
-	 * isolates this PCC-reimplemented DCQCN-style cc_rate state machine's
-	 * own convergence behavior from the software budget (level),
-	 * for a clean "software DCQCN" comparison point against plain
-	 * firmware DCQCN (UPCC=0) and the full HPFT system (production
-	 * min(cc_rate,level)). Default 0 = production behavior unchanged. */
-/* event-observed bytes per port (32B units, running totals, sharded).
- * The HW port counter gives exact TX bytes; the ratio port_true/port_ev is
- * the event-undersampling factor used to correct per-pair estimates. */
-static volatile uint32_t g_port_ev[DOCA_PCC_DEV_MAX_NUM_PORTS][HPFT_MAX_THREADS];
 
 doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 						      uint32_t request_size,
@@ -435,57 +312,6 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 		uint32_t budget = ((volatile uint32_t *)request)[1];
 		int free_idx = -1;
 
-		if ((ft & 0xffff0000u) == 0xb48d0000u) {
-			/* explicit pair config: word0=0xB48D|n, then n x
-			 * {pair_idx, flowtag, dst_tag, budget, rx_rate}. budget=0 frees. */
-			uint32_t n = ft & 0xffffu;
-			volatile uint32_t *req = (volatile uint32_t *)request;
-
-			if (request_size < (1 + 5 * n) * sizeof(uint32_t))
-				return DOCA_PCC_DEV_STATUS_OK;
-			for (uint32_t e = 0; e < n; e++) {
-				uint32_t pidx = req[1 + 5 * e] % HPFT_PAIRS;
-				uint32_t eft = req[2 + 5 * e];
-				uint32_t edst = req[3 + 5 * e];
-				uint32_t ebud = req[4 + 5 * e];
-				uint32_t erx = req[5 + 5 * e];
-				hpft_pair_t *c = &g_hpft_pairs[pidx];
-
-				if (ebud == 0) {
-					c->flowtag = 0;
-					continue;
-				}
-				if (c->flowtag != eft || c->dst_tag != edst || c->budget != ebud) {
-					/* a cap change lands on the level immediately:
-					 * budget/N, the same assignment the epoch makes */
-					{
-						uint32_t n = c->qp_count ? c->qp_count : 1;
-						uint32_t w = ebud / n;
-
-						c->level = w < HPFT_MIN_LEVEL
-							? HPFT_MIN_LEVEL : w;
-						c->last_rrx_used = erx;
-					}
-					c->budget = ebud;
-					c->cc_rate = DOCA_PCC_DEV_MAX_RATE;
-					c->dq_target = DOCA_PCC_DEV_MAX_RATE;
-					c->dq_alpha = DQ_ALPHA_ONE;
-					c->dq_stage = 0;
-					c->d = HPFT_D_ONE;
-					c->cc_prev = DOCA_PCC_DEV_MAX_RATE;
-					c->paced = 0;
-					if (c->flowtag != eft || c->dst_tag != edst) {
-						for (int sh = 0; sh < HPFT_MAX_THREADS; sh++)
-							c->b32_shard[sh] = 0;
-						c->epoch_ts = 0;
-					}
-					c->dst_tag = edst;
-					c->flowtag = eft;
-				}
-				c->remote_rx_rate = erx;
-			}
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
 		if ((ft & 0xffff0000u) == 0xb48e0000u) {
 			/* qpn map: word0=0xB48E|n, then n x {qpn, pair_idx}. */
 			uint32_t n = ft & 0xffffu;
@@ -644,26 +470,6 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 4) g_d_floor = budget;
 			else if (which == 5) g_d_recover_us = budget ? budget : 1u;
 			else if (which == 6) g_pace_pct = budget;
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xcccu) {
-			/* validation: 0xccc <idx> <cc_value>. cc_value>0 freezes cc_rate at
-			 * that value (emulates sustained fabric congestion); 0 unfreezes. */
-			hpft_pair_t *c = &g_hpft_pairs[((volatile uint32_t *)request)[2] % HPFT_PAIRS];
-			uint32_t val = budget;
-
-			if (val > 0) {
-				c->cc_rate = val;
-				g_hpft_cc_freeze = 1;
-			} else {
-				g_hpft_cc_freeze = 0;
-			}
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xb4a0u) {  /* EXPERIMENT 2026-07-22: 0xb4a0 <0|1> toggles
-					 * g_hpft_ccrate_only (rate=cc_rate directly vs
-					 * min(cc_rate,level)). Global, all pairs. */
-			g_hpft_ccrate_only = budget;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		if (ft == 0xdeau) {
@@ -884,7 +690,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 
 		/* freeze gates the MD side too: 0xccc <MAX> pins cc_rate so
 		 * rate == level exactly (pure policy plane, no CC term) */
-		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP && !g_hpft_cc_freeze) {
+		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
 			c->cnp_hits++;  /* DIAG 2026-07-22 */
 			if (g_hpft_cc_algo == HPFT_CC_ZTR) {
 				/* ZTR applies the CNP decrease when the next RTT
@@ -989,8 +795,6 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				uint32_t est = (pkts * avg) >> 4;
 
 				c->b32_shard[rank] += est;
-				g_port_ev[a.port_num & 3][rank] += est;
-				c->port = a.port_num & 3;
 			}
 		}
 		c->dbg_hits++;
@@ -1012,34 +816,8 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 					c->b32_shard[s] = 0;
 				}
 				uint32_t dt = (uint32_t)(now - old);
-				/* correct event undersampling with the exact HW port counter */
-				uint32_t prt = c->port;
-				uint32_t ev_now = 0;
-
-				for (int s = 0; s < HPFT_MAX_THREADS; s++)
-					ev_now += g_port_ev[prt][s];
-				uint32_t cnt_now = 0; /* port-counter correction disabled:
-							 * counters API faults outside event ctx;
-							 * receiver-side RX measurement replaces
-							 * this (P2-3 channel) */
-				uint32_t true_bytes = cnt_now - c->port_cnt_snap;
-				uint32_t ev_d32 = ev_now - c->port_ev_snap;
-
-				c->port_cnt_snap = cnt_now;
-				c->port_ev_snap = ev_now;
-
-				uint64_t s_x16 = 16; /* undersampling factor, x16 fixed point */
-
-				if (ev_d32 > 0 && true_bytes > 0) {
-					s_x16 = ((uint64_t)true_bytes << 4) / ((uint64_t)ev_d32 * 32u);
-					if (s_x16 < 16)
-						s_x16 = 16;	/* events can only undercount */
-					if (s_x16 > 16 * 64)
-						s_x16 = 16 * 64;
-				}
-				uint64_t b32_corr = ((uint64_t)b32 * s_x16) >> 4;
 				/* R in 2^20-of-200G units: bytes32*32B*8b / dt_us / 200e9 * 2^20 */
-				uint64_t r_units = (b32_corr << 28) / ((uint64_t)dt * 200000u);
+				uint64_t r_units = ((uint64_t)b32 << 28) / ((uint64_t)dt * 200000u);
 				uint32_t bud = c->budget;
 				uint32_t rrx = c->remote_rx_rate;
 				uint32_t rs;
@@ -1064,7 +842,6 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				}
 
 				c->dbg_r_units = rs;
-				c->dbg_s_x16 = (uint32_t)s_x16;
 				c->dbg_epochs++;
 				c->dbg_ev_b32 = b32;
 
@@ -1124,13 +901,13 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 						want = HPFT_MIN_LEVEL;
 					c->level = want;
 				}
-				if (!g_hpft_cc_freeze && g_hpft_cc_algo == HPFT_CC_AIMD) {
+				if (g_hpft_cc_algo == HPFT_CC_AIMD) {
 					/* AIMD backstop: fixed additive step per epoch */
 					uint32_t cr = c->cc_rate + (DOCA_PCC_DEV_MAX_RATE >> 8);
 
 					c->cc_rate = (cr < c->cc_rate || cr > DOCA_PCC_DEV_MAX_RATE)
 							     ? DOCA_PCC_DEV_MAX_RATE : cr;
-				} else if (!g_hpft_cc_freeze && g_hpft_cc_algo == HPFT_CC_DCQCN) {
+				} else if (g_hpft_cc_algo == HPFT_CC_DCQCN) {
 					/* alpha decays on its own timer; recovery advances
 					 * on the rate timer. The epoch is 1 ms, so both
 					 * are counted in epochs against their us periods. */
@@ -1174,9 +951,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		uint32_t cc = c->cc_rate;
 		uint32_t lvl = c->level;
 
-		if (g_hpft_ccrate_only) {
-			results->rate = cc;
-		} else if (g_hpft_couple == HPFT_COUPLE_D) {
+		if (g_hpft_couple == HPFT_COUPLE_D) {
 			/* reading the CC is work only this arm needs; the min()
 			 * arm must not pay for it, or it stops being the
 			 * baseline its measurements are taken as */
@@ -1234,10 +1009,6 @@ void doca_pcc_dev_user_init(uint32_t *disable_event_bitmask)
 		doca_pcc_dev_trace_5(0, port_num, algo_idx, algo_slot, algo_en, DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK);
 	}
 
-#ifdef DOCA_PCC_SAMPLE_TX_BYTES
-	/** Assuming this is called prior to doca_pcc_dev_user_port_info_changed() */
-	init_counter_ids();
-#endif
 
 	/* disable events of below type */
 	*disable_event_bitmask = DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK;
