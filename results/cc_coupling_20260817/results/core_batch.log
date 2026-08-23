@@ -1,0 +1,5 @@
+core1-incast8-write-couple1-done
+aggregate=57.3G util=62%  RDMA_tot=2.0G TCP_tot=55.3G  Jain=0.535  min=0.5 max=13.9  conv=Nones
+core2-incast8-write-couple1-done
+aggregate=57.3G util=62%  RDMA_tot=2.4G TCP_tot=54.9G  Jain=0.543  min=0.6 max=13.8  conv=Nones
+ALL-CORE-DONE

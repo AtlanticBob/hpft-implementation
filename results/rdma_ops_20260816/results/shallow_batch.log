@@ -1,0 +1,17 @@
+write_shallow1-incast8-write-done
+stall seconds (any RDMA <3G, t in [5,84]): 0  at []
+clean window (46 s): aggregate=89.5G Jain=1.000 min=11.0 max=11.2
+clean per-flow (G): vf0.rdma=11.0  vf0.tcp=11.2  vf1.rdma=11.2  vf1.tcp=11.2  vf2.rdma=11.2  vf2.tcp=11.2  vf3.rdma=11.2  vf3.tcp=11.2
+write_shallow2-incast8-write-done
+stall seconds (any RDMA <3G, t in [5,84]): 22  at [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+clean window (46 s): aggregate=88.0G Jain=1.000 min=10.8 max=11.1
+clean per-flow (G): vf0.rdma=11.0  vf0.tcp=11.1  vf1.rdma=11.0  vf1.tcp=11.1  vf2.rdma=10.9  vf2.tcp=11.1  vf3.rdma=10.8  vf3.tcp=11.1
+write_shallow3-incast8-write-done
+stall seconds (any RDMA <3G, t in [5,84]): 9  at [76, 77, 78, 79, 80, 81, 82, 83, 84]
+clean window (37 s): aggregate=89.4G Jain=0.998 min=10.6 max=12.0
+clean per-flow (G): vf0.rdma=10.7  vf0.tcp=11.3  vf1.rdma=10.7  vf1.tcp=12.0  vf2.rdma=10.6  vf2.tcp=11.8  vf3.rdma=10.6  vf3.tcp=11.8
+write_shallow4-incast8-write-done
+stall seconds (any RDMA <3G, t in [5,84]): 0  at []
+clean window (46 s): aggregate=88.6G Jain=1.000 min=11.0 max=11.1
+clean per-flow (G): vf0.rdma=11.0  vf0.tcp=11.1  vf1.rdma=11.1  vf1.tcp=11.1  vf2.rdma=11.0  vf2.tcp=11.1  vf3.rdma=11.1  vf3.tcp=11.1
+ALL-SHALLOW-DONE

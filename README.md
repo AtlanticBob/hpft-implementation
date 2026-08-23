@@ -62,8 +62,13 @@ vxlan100（**tos=inherit 硬性要求**），VF IP 直连方案原样，p1 保�
   PCC mailbox，TCP 经 UDP 发给 sgpu01 上的 `hpft-pace-shim` 写 BPF
   map）。
 - RDMA 侧执行面是 `tools/dpu/pcc/rp_rtt_template_dev_main.c`（DOCA PCC
-  device 代码，跑在 DPA 上），`rate = min(cc_rate, level)`；`cc_rate`
-  是 PCC 里自实现的 DCQCN 风格状态机，独立于响应律。
+  device 代码，跑在 DPA 上）。执行面**只读租户 CC、不改它**：`cc_rate` 是
+  PCC 里自实现的 DCQCN 风格状态机（另有 ZTR 可切），原样运行；执行面累积它的
+  **下降**成一个相对政策份额的偏离 d，自己把 d 收回 1，下发 `rate = d * level`。
+  被自己的整形卡住时（实发 ≈ 已下发）那次降速不计入，否则会自己驱动自己。
+  取小值的旧组合 `min(cc_rate, level)` 作为对照臂保留（邮箱 `0xcca 0`）。
+  TCP 侧同一形态：`tcp/bpf-opt3/hpft_tcp_edt_kern.c` 读内核 CC 的
+  `snd_cwnd*mss`，同一合成器，落到 EDT 时间戳。
 
 **响应律（跟踪-审计）**：接收端把政策裁定与审计账本压成一个目标
 $u_f=\hat e_f(1-\gamma s_f)$ 下发，发送端在对数轴上做一阶跟踪
@@ -74,7 +79,8 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
 （V=576 Mbit，由 ζ 反解 V=4ζ²γê*/k 定值，与 headroom 无关）。取值理由与收敛闭式见 `hpft-design` 仓库的
 `docs/design.md` §3.4/§4.2/§6 与 `docs/design_theory.md`；离线验收
 （wire 往返 + 三条收敛闭式 + 账本自愈）跑
-`tools/tests/law_check.py`。
+`tools/tests/law_check.py`，执行面与 CC 的合成（棘轮的 CC 仍拿满份额、
+归因、上限、标定无关性）跑 `tools/tests/couple_check.py`。
 
 ## 硬性规则
 
@@ -85,6 +91,10 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
 - TCP shaper 叫 "host fq+edt"；DPU 侧 TCP 卸载已暂停（架构性负结论：
   OVS 占据 representor ingress，没有既透明又保持 pacing 语义的挂载点），
   除非用户重提不要重启。
+- TCP 执行面的 BPF map 布局改过（`hpft_pair_state` 现在 56 B）。**重新 apply
+  之前必须先 `rm -rf /sys/fs/bpf/hpft_tcp_edt`**：pin 还在时 `bpftool prog
+  load` 失败，而 `tcp-shaper-apply` 只把失败记进结果、tc 仍指着旧程序——表现是
+  改动"部署完了却没生效"，而每一层都报健康。
 - dpu2 underlay-p1 上的分类 OpenFlow 规则、遥测通道等运行时状态，
   重启会丢，`rx_agent`/`cc_mode.sh` 的恢复流程会自动重装，不要手工删。
 - lab 默认停留态、切换 CC 模式：`tools/cc_mode.sh status`/`dcqcn`/`pcc`

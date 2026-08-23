@@ -1,0 +1,41 @@
+ WARNING: BW peak won't be measured in this run.
+
+************************************
+* Waiting for client to connect... *
+************************************
+---------------------------------------------------------------------------------------
+                    RDMA_Read BW Test
+ Dual-port       : OFF		Device         : mlx5_8
+ Number of qps   : 4		Transport type : IB
+ Connection type : RC		Using SRQ      : OFF
+ PCIe relax order: ON		Lock-free      : OFF
+ ibv_wr* API     : ON		Using Enhanced Reorder      : OFF
+ CQ Moderation   : 1
+ CQE Poll Batch  : Dynamic
+ Mtu             : 1024[B]
+ Link type       : Ethernet
+ GID index       : 3
+ Outstand reads  : 16
+ rdma_cm QPs	 : OFF
+ Data ex. method : Ethernet
+---------------------------------------------------------------------------------------
+ local address: LID 0000 QPN 0x02b7 PSN 0x7f2bf6 OUT 0x10 RKey 0x074400 VAddr 0x007f142372e000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:01
+ local address: LID 0000 QPN 0x02b8 PSN 0x3425a8 OUT 0x10 RKey 0x074400 VAddr 0x007f142373e000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:01
+ local address: LID 0000 QPN 0x02b9 PSN 0x5a79d2 OUT 0x10 RKey 0x074400 VAddr 0x007f142374e000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:01
+ local address: LID 0000 QPN 0x02ba PSN 0xb729b9 OUT 0x10 RKey 0x074400 VAddr 0x007f142375e000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:01
+ remote address: LID 0000 QPN 0x032b PSN 0xd23776 OUT 0x10 RKey 0x074f00 VAddr 0x007f350bbee000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:02
+ remote address: LID 0000 QPN 0x032c PSN 0xe50b28 OUT 0x10 RKey 0x074f00 VAddr 0x007f350bbfe000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:02
+ remote address: LID 0000 QPN 0x032d PSN 0xdd3152 OUT 0x10 RKey 0x074f00 VAddr 0x007f350bc0e000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:02
+ remote address: LID 0000 QPN 0x032e PSN 0x3c4b39 OUT 0x10 RKey 0x074f00 VAddr 0x007f350bc1e000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:02
+---------------------------------------------------------------------------------------
+ #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
+ 65536      727722           0.00               8.29   		     0.015820
+---------------------------------------------------------------------------------------

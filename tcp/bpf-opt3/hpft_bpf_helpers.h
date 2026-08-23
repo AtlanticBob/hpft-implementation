@@ -25,6 +25,8 @@ static long (*bpf_map_update_elem)(void *map, const void *key, const void *value
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 static void (*bpf_spin_lock)(struct bpf_spin_lock *lock) = (void *)93;
 static void (*bpf_spin_unlock)(struct bpf_spin_lock *lock) = (void *)94;
+static struct bpf_sock *(*bpf_sk_fullsock)(struct bpf_sock *sk) = (void *)95;
+static struct bpf_tcp_sock *(*bpf_tcp_sock)(struct bpf_sock *sk) = (void *)96;
 
 #endif
 

@@ -1,0 +1,42 @@
+ethernet_read_keys: Couldn't read remote address
+ Unable to read to socket/rdma_cm
+ Failed to exchange data between server and clients
+ WARNING: BW peak won't be measured in this run.
+
+************************************
+* Waiting for client to connect... *
+************************************
+---------------------------------------------------------------------------------------
+                    RDMA_Read BW Test
+ Dual-port       : OFF		Device         : mlx5_7
+ Number of qps   : 4		Transport type : IB
+ Connection type : RC		Using SRQ      : OFF
+ PCIe relax order: ON		Lock-free      : OFF
+ ibv_wr* API     : ON		Using Enhanced Reorder      : OFF
+ CQ Moderation   : 1
+ CQE Poll Batch  : Dynamic
+ Mtu             : 1024[B]
+ Link type       : Ethernet
+ GID index       : 3
+ Outstand reads  : 16
+ rdma_cm QPs	 : OFF
+ Data ex. method : Ethernet
+---------------------------------------------------------------------------------------
+ local address: LID 0000 QPN 0x0168 PSN 0xd6db28 OUT 0x10 RKey 0x034f00 VAddr 0x007f1e99bc4000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:01:01
+ local address: LID 0000 QPN 0x0169 PSN 0x8a9f2 OUT 0x10 RKey 0x034f00 VAddr 0x007f1e99bd4000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:01:01
+ local address: LID 0000 QPN 0x016a PSN 0xe94954 OUT 0x10 RKey 0x034f00 VAddr 0x007f1e99be4000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:01:01
+ local address: LID 0000 QPN 0x016b PSN 0xcc5013 OUT 0x10 RKey 0x034f00 VAddr 0x007f1e99bf4000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:01:01
+ remote address: LID 0000 QPN 0x0168 PSN 0xdac9d1 OUT 0x10 RKey 0x034f00 VAddr 0x007f8906483000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:01:02
+ remote address: LID 0000 QPN 0x0169 PSN 0x63911e OUT 0x10 RKey 0x034f00 VAddr 0x007f8906493000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:01:02
+ remote address: LID 0000 QPN 0x016a PSN 0x68cbda OUT 0x10 RKey 0x034f00 VAddr 0x007f89064a3000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:01:02
+ remote address: LID 0000 QPN 0x016b PSN 0x6cd3ea OUT 0x10 RKey 0x034f00 VAddr 0x007f89064b3000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:01:02
+---------------------------------------------------------------------------------------
+ #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]

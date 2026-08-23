@@ -1,0 +1,42 @@
+ WARNING: BW peak won't be measured in this run.
+
+************************************
+* Waiting for client to connect... *
+************************************
+---------------------------------------------------------------------------------------
+                    Send BW Test
+ Dual-port       : OFF		Device         : mlx5_6
+ Number of qps   : 4		Transport type : IB
+ Connection type : RC		Using SRQ      : OFF
+ PCIe relax order: ON		Lock-free      : OFF
+ ibv_wr* API     : ON		Using Enhanced Reorder      : OFF
+ RX depth        : 512
+ CQ Moderation   : 1
+ CQE Poll Batch  : Dynamic
+ Mtu             : 1024[B]
+ Link type       : Ethernet
+ GID index       : 3
+ Max inline data : 0[B]
+ rdma_cm QPs	 : OFF
+ Data ex. method : Ethernet
+---------------------------------------------------------------------------------------
+ local address: LID 0000 QPN 0x01e4 PSN 0x2d8bb6
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:02
+ local address: LID 0000 QPN 0x01e5 PSN 0x796a68
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:02
+ local address: LID 0000 QPN 0x01e6 PSN 0x9d3f92
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:02
+ local address: LID 0000 QPN 0x01e7 PSN 0xcfdc79
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:02
+ remote address: LID 0000 QPN 0x01e4 PSN 0x1a2e8a
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:01
+ remote address: LID 0000 QPN 0x01e5 PSN 0xf536ac
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:01
+ remote address: LID 0000 QPN 0x01e6 PSN 0x885086
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:01
+ remote address: LID 0000 QPN 0x01e7 PSN 0x114c5d
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:00:01
+---------------------------------------------------------------------------------------
+ #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
+ 65536      925559           0.00               10.55  		     0.020121
+---------------------------------------------------------------------------------------

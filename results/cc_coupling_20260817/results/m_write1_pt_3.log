@@ -1,0 +1,38 @@
+ WARNING: BW peak won't be measured in this run.
+---------------------------------------------------------------------------------------
+                    RDMA_Write BW Test
+ Dual-port       : OFF		Device         : mlx5_9
+ Number of qps   : 4		Transport type : IB
+ Connection type : RC		Using SRQ      : OFF
+ PCIe relax order: ON		Lock-free      : OFF
+ ibv_wr* API     : ON		Using Enhanced Reorder      : OFF
+ TX depth        : 128
+ CQ Moderation   : 1
+ CQE Poll Batch  : Dynamic
+ Mtu             : 1024[B]
+ Link type       : Ethernet
+ GID index       : 3
+ Max inline data : 0[B]
+ rdma_cm QPs	 : OFF
+ Data ex. method : Ethernet
+---------------------------------------------------------------------------------------
+ local address: LID 0000 QPN 0x0120 PSN 0x4a1804 RKey 0x00c400 VAddr 0x007f1ab33e4000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:03:01
+ local address: LID 0000 QPN 0x0121 PSN 0x973b9e RKey 0x00c400 VAddr 0x007f1ab33f4000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:03:01
+ local address: LID 0000 QPN 0x0122 PSN 0xdd790 RKey 0x00c400 VAddr 0x007f1ab3404000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:03:01
+ local address: LID 0000 QPN 0x0123 PSN 0x76c79f RKey 0x00c400 VAddr 0x007f1ab3414000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:03:01
+ remote address: LID 0000 QPN 0x0135 PSN 0x1fc849 RKey 0x00cf00 VAddr 0x007fa37a423000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:03:02
+ remote address: LID 0000 QPN 0x0136 PSN 0x8d46ff RKey 0x00cf00 VAddr 0x007fa37a433000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:03:02
+ remote address: LID 0000 QPN 0x0137 PSN 0x75d5dd RKey 0x00cf00 VAddr 0x007fa37a443000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:03:02
+ remote address: LID 0000 QPN 0x0138 PSN 0x333c68 RKey 0x00cf00 VAddr 0x007fa37a453000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:03:02
+---------------------------------------------------------------------------------------
+ #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
+ 65536      914387           0.00               10.42  		     0.019878
+---------------------------------------------------------------------------------------

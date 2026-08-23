@@ -1,0 +1,15 @@
+v_ztr1-incast8-write-couple1-done
+aggregate=90.1G util=98%  RDMA_tot=44.8G TCP_tot=45.3G  Jain=1.000  min=11.2 max=11.3  conv=3s
+v_ztr2-incast8-write-couple1-done
+aggregate=90.0G util=98%  RDMA_tot=44.7G TCP_tot=45.3G  Jain=1.000  min=11.2 max=11.3  conv=3s
+v_send1-incast8-send-couple1-done
+aggregate=89.0G util=97%  RDMA_tot=44.6G TCP_tot=44.4G  Jain=1.000  min=11.1 max=11.2  conv=3s
+o_write5-incast8-write-couple1-done
+aggregate=89.0G util=97%  RDMA_tot=44.7G TCP_tot=44.3G  Jain=1.000  min=11.1 max=11.2  conv=3s
+o_write6-incast8-write-couple1-done
+aggregate=89.2G util=97%  RDMA_tot=44.8G TCP_tot=44.4G  Jain=1.000  min=11.1 max=11.2  conv=3s
+o_write7-incast8-write-couple1-done
+aggregate=89.0G util=97%  RDMA_tot=44.7G TCP_tot=44.3G  Jain=1.000  min=11.1 max=11.2  conv=3s
+o_write8-incast8-write-couple1-done
+aggregate=89.7G util=98%  RDMA_tot=44.8G TCP_tot=44.9G  Jain=1.000  min=11.2 max=11.3  conv=3s
+ALL-V-DONE

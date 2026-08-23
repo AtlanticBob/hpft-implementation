@@ -25,6 +25,7 @@ from tcp_shaper_lib import (  # noqa: E402
     DirectBpfMapWriter,
     build_pair_cfg_update,
     make_generation,
+    pack_pair_state,
     vnic_index,
 )
 
@@ -84,7 +85,9 @@ def seed_pair_states(tcp_reg):
             cmd = (["bpftool", "map", "update", "pinned", str(state_pin),
                     "key", "hex"]
                    + ["%02x" % b for b in struct.pack("<Q", key)]
-                   + ["value", "hex"] + ["00"] * 24 + ["noexist"])
+                   + ["value", "hex"]
+                   + ["00"] * len(pack_pair_state())
+                   + ["noexist"])
             if subprocess.run(cmd, capture_output=True).returncode == 0:
                 seeded += 1
     print("pace_shim: pair_state seeded %d new" % seeded, flush=True)

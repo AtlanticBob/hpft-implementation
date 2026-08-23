@@ -167,6 +167,76 @@ void doca_pcc_dev_user_port_info_changed(uint32_t portid)
 #define HPFT_EPOCH_US (1000u)
 #define HPFT_MIN_LEVEL (2u)
 
+/* ---- reading a CC instead of editing it -------------------------------
+ * The executor holds two numbers per flow pair: `level`, the policy share
+ * the receiver computed (budget/N), and whatever rate the tenant's
+ * congestion control has arrived at. HyperFront's whole involvement with
+ * the CC is three steps - read its rate, combine that with the share, and
+ * shape the wire to the result. It never writes into the CC, and the CC
+ * runs exactly as its author wrote it.
+ *
+ * That constraint decides the combiner, it does not leave it open.
+ *
+ *   min(cc, level) - HPFT_COUPLE_MIN, kept as the comparison arm - gives
+ *   the CC an unconditional veto over the share, and a CC whose recovery
+ *   target is its own pre-congestion rate will use it: every cut moves the
+ *   target down with the rate, so a run of cuts walks the pair towards
+ *   zero and holds it there for as long as anything keeps the queue
+ *   marked. Measured 2026-08-16 on incast8: 4 of 8 runs, 7-22 s with RDMA
+ *   at zero while TCP ran at twice its share, and the READ arm lost its
+ *   QPs outright to requester timeouts.
+ *
+ * The lesson is not about DCQCN. A CC's rate is calibrated against the
+ * LINK, not against a share the CC has never been told about, and it is
+ * free to ratchet. So its absolute value carries nothing the executor can
+ * use, and any combiner that reads that value inherits the ratchet. What
+ * a CC's rate does carry is its DECREASES: each one is that CC's own
+ * judgement, in its own units, that the network asked it to yield.
+ *
+ * So the executor accumulates the decreases and owns the return:
+ *
+ *      rate = d * level,   d in [f, 1]
+ *      d <- d * (cc / cc_prev)   when the CC lowered its rate
+ *      d <- (1 + d) / 2          otherwise, once per recovery period
+ *
+ * Reading only ratios also means the reading need not be calibrated: any
+ * constant factor between "what we sample" and "what the CC would have
+ * paced at" cancels. That is what lets the same combiner sit on a
+ * DCQCN-style rate in fixed point here and on cwnd/srtt in the TCP
+ * shaper.
+ *
+ * ATTRIBUTION. Letting the CC free-run introduces a loop the edited
+ * version did not have: our own shaping makes a queue, the CC reads that
+ * queue as congestion and cuts, and if we counted that cut we would shape
+ * harder still. The test that breaks it is local - is this flow held back
+ * by us, or by the network?
+ *
+ *   pace-limited (achieved ~= what we programmed): the queue the CC is
+ *   reacting to is one we made by holding the flow at its share, and the
+ *   share is already the answer to it. The cut is not counted.
+ *   below its pace: something other than us is limiting the flow, and
+ *   that is exactly the case the executor cannot see or divide. The cut
+ *   is counted in full.
+ *
+ * The rule is self-limiting - as d falls the flow becomes pace-limited
+ * again, its cuts stop counting, and d recovers - so the floor f is a
+ * backstop rather than the mechanism. It also needs nothing from the
+ * receiver: it is per flow and entirely local to the sender.
+ *
+ * Safety rests where the executor has authority: d <= 1 bounds a flow by
+ * its own share, and the shares sum to the root capacity by construction,
+ * so no d can put more on that bottleneck than the policy already allows.
+ * Where the capacity is not what the allocator thinks, flows cannot reach
+ * their pace, stop being pace-limited, and the CC gets its say back.
+ */
+#define HPFT_D_ONE       (DOCA_PCC_DEV_MAX_RATE)  /* 1.0 in the rates' own fxp20 */
+#define HPFT_COUPLE_MIN  (0u)   /* rate = min(cc, level) */
+#define HPFT_COUPLE_D    (1u)   /* rate = d * level */
+static volatile uint32_t g_hpft_couple = HPFT_COUPLE_D;
+static volatile uint32_t g_d_floor = HPFT_D_ONE >> 6;   /* backstop only */
+static volatile uint32_t g_d_recover_us = 300u;         /* one half-gap step */
+static volatile uint32_t g_pace_pct = 90u;              /* achieved/programmed */
+
 /* ---- congestion-control term selection -------------------------------
  * HyperFront's rate limiting (level = budget/N) is independent of WHICH
  * congestion control runs underneath it: the executor always applies
@@ -249,6 +319,14 @@ typedef struct {
 	volatile uint32_t dq_t_rate;		/* last rate-timer tick, device us */
 	volatile uint32_t dq_t_alpha;		/* last alpha-timer tick */
 	volatile uint32_t remote_cap;		/* from NP RTT response payload w2 */
+	volatile uint32_t d;		/* the observer's deviation from the share,
+					 * fxp20; 1<<20 = the share itself */
+	volatile uint32_t cc_prev;	/* last cc_rate read, to see its decreases */
+	volatile uint32_t d_ts;		/* us, last recovery step */
+	volatile uint32_t paced;	/* rate last programmed, for the pace test */
+	volatile uint32_t d_cuts;	/* decreases the observer counted; d recovers
+					 * in about a millisecond, so sampling d
+					 * alone cannot show the branch working */
 	volatile uint32_t qp_count;	/* QPs sending in the last epoch */
 	volatile uint32_t qp_seen;	/* QPs counted so far in THIS epoch */
 	volatile uint32_t epoch_id;	/* bumped once per epoch, ages the map */
@@ -264,6 +342,54 @@ typedef struct {
 } hpft_pair_t;
 
 static hpft_pair_t g_hpft_pairs[HPFT_PAIRS];
+
+/* Is the executor itself what is holding this flow back? Compares what the
+ * flow achieved (receiver-measured where available, the event estimate
+ * otherwise) against what we last programmed. Both are in the same units,
+ * so this is a ratio test and needs no calibration. */
+static inline int hpft_pace_limited(volatile hpft_pair_t *c)
+{
+	uint32_t paced = c->paced;
+
+	if (paced == 0)
+		return 0;
+	return (uint64_t)c->dbg_r_units * 100u >= (uint64_t)paced * g_pace_pct;
+}
+
+/* Read the CC and fold its decreases into d; recover d towards the share on
+ * its own period. The CC is never written to - cc_prev is our copy of what
+ * we last saw it at. */
+static inline void hpft_observe(volatile hpft_pair_t *c, uint32_t now)
+{
+	uint32_t cc = c->cc_rate;
+	uint32_t prev = c->cc_prev;
+
+	if (cc < prev) {
+		if (!hpft_pace_limited(c)) {
+			/* d <- d * cc/prev. Normalise first so the divide stays
+			 * 32-bit: prev is a rate in fxp20, so one shift is
+			 * enough to bring it inside 16 bits. */
+			uint32_t sh = (prev > 0xffffu) ? 5u : 0u;
+			uint32_t pn = prev >> sh;
+			uint32_t cn = cc >> sh;
+			uint32_t ratio = pn ? ((cn << 16) / pn) : (1u << 16);
+			uint32_t nd = (uint32_t)(((uint64_t)c->d * ratio) >> 16);
+
+			c->d = (nd < g_d_floor) ? g_d_floor : nd;
+			c->d_cuts++;
+		}
+		c->cc_prev = cc;
+	} else if (cc > prev) {
+		/* the CC's own increase is about its own free-running rate,
+		 * which nothing is pacing to; it says nothing about ours */
+		c->cc_prev = cc;
+	}
+	if ((uint32_t)(now - c->d_ts) >= g_d_recover_us) {
+		c->d_ts = now;
+		if (c->d < HPFT_D_ONE)
+			c->d = (HPFT_D_ONE >> 1) + (c->d >> 1);
+	}
+}
 static volatile uint32_t g_hpft_cnp_any;  /* DIAG: any ROCE_CNP event seen by the callback */
 #define HPFT_QPMAP_SIZE (8192)
 #define HPFT_QPMAP_PROBE (8)
@@ -345,6 +471,9 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					c->dq_target = DOCA_PCC_DEV_MAX_RATE;
 					c->dq_alpha = DQ_ALPHA_ONE;
 					c->dq_stage = 0;
+					c->d = HPFT_D_ONE;
+					c->cc_prev = DOCA_PCC_DEV_MAX_RATE;
+					c->paced = 0;
 					if (c->flowtag != eft || c->dst_tag != edst) {
 						for (int sh = 0; sh < HPFT_MAX_THREADS; sh++)
 							c->b32_shard[sh] = 0;
@@ -437,6 +566,9 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					c->budget = ebud;
 					c->level = ebud;
 					c->cc_rate = DOCA_PCC_DEV_MAX_RATE;
+					c->d = HPFT_D_ONE;
+					c->cc_prev = DOCA_PCC_DEV_MAX_RATE;
+					c->paced = 0;
 					c->qp_count = 0;	/* relearned from events */
 					c->remote_rx_rate = erx;
 					for (int s = 0; s < HPFT_MAX_THREADS; s++)
@@ -448,6 +580,40 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 
+		if (ft == 0xccau) {
+			/* combiner arm: 0xcca <0|1>. 0 = min(cc, level), 1 = the
+			 * observed-decrease coupling. Neither touches the CC; the
+			 * switch resets only the observer's own state. */
+			g_hpft_couple = budget ? HPFT_COUPLE_D : HPFT_COUPLE_MIN;
+			for (int i = 0; i < HPFT_PAIRS; i++) {
+				g_hpft_pairs[i].d = HPFT_D_ONE;
+				g_hpft_pairs[i].cc_prev = g_hpft_pairs[i].cc_rate;
+				g_hpft_pairs[i].paced = 0;
+			}
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		if (ft == 0xdedu) {
+			/* observer readback: 0xded <pair>. The host prints a fixed
+			 * eleven words, so the slots are reused - in its output
+			 * ft=flowtag bud=level lvl=paced avg16=achieved r=d
+			 * s16=cc_rate ep=cc_prev evb32=pace_limited. */
+			hpft_pair_t *c = &g_hpft_pairs[budget % HPFT_PAIRS];
+			volatile uint32_t *rsp = (volatile uint32_t *)response;
+
+			rsp[0] = c->flowtag;
+			rsp[1] = c->level;
+			rsp[2] = c->paced;
+			rsp[3] = c->dbg_r_units;
+			rsp[4] = c->d;
+			rsp[5] = c->cc_rate;
+			rsp[6] = c->cc_prev;
+			rsp[7] = (uint32_t)hpft_pace_limited(c);
+			rsp[8] = c->dbg_hits;   /* events the DPA processed for this pair */
+			rsp[9] = c->d_cuts;
+			rsp[10] = 0;
+			*response_size = 11 * sizeof(uint32_t);
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
 		if (ft == 0xccdu) {
 			/* CC selection: 0xccd <0|1>. 0 = DCQCN-flavoured term,
 			 * 1 = ZTR-RTTCC. Applies to every pair; the HyperFront
@@ -475,6 +641,9 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			if (which == 0) g_dq_ai = budget;
 			else if (which == 1) g_dq_hai = budget;
 			else if (which == 2) g_dq_time_us = budget ? budget : 1u;
+			else if (which == 4) g_d_floor = budget;
+			else if (which == 5) g_d_recover_us = budget ? budget : 1u;
+			else if (which == 6) g_pace_pct = budget;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		if (ft == 0xcccu) {
@@ -1005,7 +1174,23 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		uint32_t cc = c->cc_rate;
 		uint32_t lvl = c->level;
 
-		results->rate = g_hpft_ccrate_only ? cc : ((cc < lvl) ? cc : lvl);
+		if (g_hpft_ccrate_only) {
+			results->rate = cc;
+		} else if (g_hpft_couple == HPFT_COUPLE_D) {
+			/* reading the CC is work only this arm needs; the min()
+			 * arm must not pay for it, or it stops being the
+			 * baseline its measurements are taken as */
+			uint32_t r;
+
+			hpft_observe(c, now);
+			r = (uint32_t)(((uint64_t)c->d * lvl) >> 20);
+			if (r < HPFT_MIN_LEVEL)
+				r = HPFT_MIN_LEVEL;
+			c->paced = r;
+			results->rate = r;
+		} else {
+			results->rate = (cc < lvl) ? cc : lvl;
+		}
 		results->rtt_req = want_rtt;
 		if (want_rtt)
 			c->rtt_req_n++;

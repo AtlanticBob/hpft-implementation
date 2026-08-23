@@ -1165,6 +1165,18 @@ def main():
         return ep["v_seconds"] * ep["headroom"] * capacity
 
     def uplink_speed():
+        # The capacity to schedule against is the one that can actually be
+        # delivered, which is the port's own speed only while nothing
+        # downstream is narrower. Where something is - a shaped switch
+        # egress, a slower next hop - the port nameplate overstates it, and
+        # an allocator working from the overstatement hands out shares the
+        # path cannot carry: the excess turns into queueing that the
+        # tenants' own CCs then have to absorb, unequally, which is the
+        # contention HPFT exists to take off them. capacity_bps in the
+        # e_params config states the deliverable figure when it is known.
+        cap = ep.get("capacity_bps")
+        if cap:
+            return float(cap)
         try:
             spd = int(open("/sys/class/net/%s/speed" % args.uplink).read())
             return spd * 1e6 if spd > 0 else None

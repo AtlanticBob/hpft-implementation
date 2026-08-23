@@ -1,0 +1,17 @@
+  read vf0 ok 26.67G
+  read vf1 ok 88.33G
+  read vf2 ok 88.27G
+  read vf3 ok 88.19G
+read_aimd3-incast8-read-done
+stall seconds (any RDMA <3G, t in [5,84]): 0  at []
+clean window (46 s): aggregate=89.2G Jain=1.000 min=10.9 max=11.3
+clean per-flow (G): vf0.rdma=10.9  vf0.tcp=11.3  vf1.rdma=10.9  vf1.tcp=11.3  vf2.rdma=11.2  vf2.tcp=11.3  vf3.rdma=11.0  vf3.tcp=11.3
+  read vf0 ok 26.64G
+  read vf1 ok 26.63G
+  read vf2 ok 26.65G
+  read vf3 ok 26.62G
+read_aimd4-incast8-read-done
+stall seconds (any RDMA <3G, t in [5,84]): 0  at []
+clean window (46 s): aggregate=89.4G Jain=1.000 min=11.2 max=11.2
+clean per-flow (G): vf0.rdma=11.2  vf0.tcp=11.2  vf1.rdma=11.2  vf1.tcp=11.2  vf2.rdma=11.2  vf2.tcp=11.2  vf3.rdma=11.2  vf3.tcp=11.2
+ALL-READAIMD2-DONE

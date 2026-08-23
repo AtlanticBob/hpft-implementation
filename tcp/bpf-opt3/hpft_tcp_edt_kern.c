@@ -31,6 +31,38 @@
  * 200 ms of queue is cheap; runaway debt still trips within a few ticks. */
 #define HPFT_DEBT_CAP_NS (200ULL * 1000 * 1000)
 
+/* ---- reading the tenant's CC instead of editing it --------------------
+ * Same three steps as the RDMA executor, on the same terms: read what the
+ * connection's congestion control has arrived at, combine that with the
+ * policy share, shape the wire to the result. The kernel CC is never
+ * touched - it is not even aware of this - and only its DECREASES are
+ * read, because a CC's absolute rate is calibrated against the link and
+ * says nothing about a share it has never been told about.
+ *
+ *      rate = d * share,   d in [f, 1]
+ *      d <- d * (cc / cc_prev)   when the CC lowered its window
+ *      d <- (1 + d) / 2          otherwise, once per recovery period
+ *
+ * What is sampled here is snd_cwnd * mss summed over the flow-set's
+ * connections. cwnd is the CC's own decision variable, so a cut in it is
+ * the CC acting rather than the network being noisy; srtt deliberately
+ * does not enter, since it is a measurement and would put its jitter into
+ * every sample. The window is not a rate, but only ratios are read and
+ * the RTT that would convert one to the other cancels out of a ratio
+ * taken across a cut.
+ *
+ * ATTRIBUTION. The shaper's own queue is a congestion signal to the CC
+ * above it - that is what the debt cap's drops are for - so counting a cut
+ * we caused would let shaping drive more shaping. A cut is counted only
+ * when the shaper is NOT holding the flow-set back, i.e. when the EDT
+ * stamp is not already in the future. At a bottleneck the allocator owns,
+ * the share is the answer to the queue and the CC's opinion of it is not
+ * needed; where something the allocator cannot see is the limit, the
+ * flow-set cannot reach its stamp, and the CC is heard in full. */
+#define HPFT_D_ONE 1048576ULL       /* 1.0, matching the RDMA executor's fxp20 */
+#define HPFT_D_FLOOR (HPFT_D_ONE >> 6)
+#define HPFT_D_RECOVER_NS 300000ULL /* one half-gap step, as on the DPA */
+
 struct hpft_vlan_hdr {
     __u16 h_vlan_TCI;
     __u16 h_vlan_encapsulated_proto;
@@ -48,6 +80,18 @@ struct hpft_pair_state {
     __u32 reserved0;
     __u64 next_ns;
     __u64 generation;
+    /* observer: cc_sum is this flow-set's aggregate CC window, maintained
+     * incrementally as each connection reports its own; cc_prev is the last
+     * aggregate acted on. */
+    __u64 cc_sum;
+    __u64 cc_prev;
+    __u64 d_ts;
+    __u32 d;
+    /* cuts the observer actually counted. d recovers in about a
+     * millisecond, so point-sampling d almost always reads 1.0 even while
+     * the active branch is working; this counter is the evidence that it
+     * is. */
+    __u32 cuts;
 };
 
 struct {
@@ -83,6 +127,7 @@ struct {
  * bypasses the shared pair pacing; a continuous bulk flow does not. */
 struct hpft_flow_state {
     __u64 last_send_ns;
+    __u64 cc_win;      /* this connection's last cwnd*mss, in the pair sum */
 };
 
 struct {
@@ -192,6 +237,9 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         __u64 flow_key, gap = HPFT_GAP_NS + 1;
         struct hpft_flow_state *fs;
         struct hpft_flow_state fs_new;
+        __u64 eff_rate, wire = 0;
+        __s64 cc_delta = 0;
+        __u32 d;
 
         if ((void *)(tcph + 1) > data_end)
             return TC_ACT_OK;
@@ -212,13 +260,11 @@ int hpft_tcp_edt(struct __sk_buff *skb)
             __u32 segs = skb->gso_segs ? skb->gso_segs : 1;
             __u32 hdr = ETH_HLEN + (__u32)iph->ihl * 4 +
                         (__u32)tcph->doff * 4;
-            __u64 wire = (__u64)skb->len +
-                         (__u64)(segs - 1) * (__u64)hdr +
-                         (__u64)segs * HPFT_FRAME_OVERHEAD;
-            packet_ns = hpft_bytes_to_ns(wire, cfg->rate_bps);
+
+            wire = (__u64)skb->len +
+                   (__u64)(segs - 1) * (__u64)hdr +
+                   (__u64)segs * HPFT_FRAME_OVERHEAD;
         }
-        burst_ns = hpft_bytes_to_ns((__u64)cfg->burst_bytes, cfg->rate_bps);
-        min_next_ns = now > burst_ns ? now - burst_ns : 0;
 
         /* inter-packet gap per flow (5-tuple) */
         flow_key = ((__u64)(iph->saddr ^ iph->daddr) << 32) |
@@ -230,12 +276,43 @@ int hpft_tcp_edt(struct __sk_buff *skb)
             fs->last_send_ns = now;
         } else {
             fs_new.last_send_ns = now;
+            fs_new.cc_win = 0;
             bpf_map_update_elem(&hpft_flow_state_map, &flow_key, &fs_new, BPF_ANY);
+        }
+
+        /* Step 1: read the CC. cwnd*mss is this connection's contribution to
+         * the flow-set's aggregate window; cc_delta is what it changed by,
+         * which is what the pair's running sum needs. */
+        {
+            struct bpf_sock *sk = skb->sk;
+
+            if (sk) {
+                struct bpf_sock *full = bpf_sk_fullsock(sk);
+
+                if (full) {
+                    struct bpf_tcp_sock *tp = bpf_tcp_sock(full);
+
+                    if (tp) {
+                        __u64 win = (__u64)tp->snd_cwnd * (__u64)tp->mss_cache;
+
+                        if (fs) {
+                            cc_delta = (__s64)win - (__s64)fs->cc_win;
+                            fs->cc_win = win;
+                        } else {
+                            cc_delta = (__s64)win;
+                        }
+                    }
+                }
+            }
         }
 
         /* shared pair debt: always accumulate (cap + fairness + smooth pacing,
          * identical to baseline; keeps multi-flow stable). */
         bpf_spin_lock(&state->lock);
+        if (state->d == 0) {
+            state->d = (__u32)HPFT_D_ONE;
+            state->d_ts = now;
+        }
         if (state->generation != cfg->generation) {
             /* Reconfig: forgive only STALE debt (cap the stamp horizon),
              * never zero it. Resetting to `now` on every generation bump
@@ -246,6 +323,50 @@ int hpft_tcp_edt(struct __sk_buff *skb)
                 state->next_ns = now + HPFT_DEBT_CAP_NS;
             state->generation = cfg->generation;
         }
+        /* Step 2: combine the CC's reading with the policy share. A stamp
+         * already in the future means the shaper is the reason this
+         * flow-set is not sending faster, so a cut taken now is one we
+         * caused and is not counted against the share. */
+        {
+            __u64 sum = state->cc_sum;
+            __u64 prev = state->cc_prev;
+            __u64 nsum;
+            int pace_limited = state->next_ns > now;
+
+            if (cc_delta >= 0) {
+                nsum = sum + (__u64)cc_delta;
+            } else {
+                __u64 drop = (__u64)(-cc_delta);
+
+                nsum = sum > drop ? sum - drop : 0;
+            }
+            state->cc_sum = nsum;
+            if (nsum < prev) {
+                if (!pace_limited && prev) {
+                    __u64 nd = ((__u64)state->d * nsum) / prev;
+
+                    state->d = nd < HPFT_D_FLOOR ? (__u32)HPFT_D_FLOOR
+                                                 : (__u32)nd;
+                    state->cuts++;
+                }
+                state->cc_prev = nsum;
+            } else if (nsum > prev) {
+                state->cc_prev = nsum;
+            }
+            if (now - state->d_ts >= HPFT_D_RECOVER_NS) {
+                state->d_ts = now;
+                if (state->d < HPFT_D_ONE)
+                    state->d = (__u32)((HPFT_D_ONE >> 1) + (state->d >> 1));
+            }
+            d = state->d;
+        }
+        /* Step 3: shape to it. */
+        eff_rate = (cfg->rate_bps * (__u64)d) >> 20;
+        if (!eff_rate)
+            eff_rate = 1;
+        packet_ns = hpft_bytes_to_ns(wire, eff_rate);
+        burst_ns = hpft_bytes_to_ns((__u64)cfg->burst_bytes, eff_rate);
+        min_next_ns = now > burst_ns ? now - burst_ns : 0;
         if (state->next_ns < min_next_ns)
             state->next_ns = min_next_ns;
         send_ns = state->next_ns;

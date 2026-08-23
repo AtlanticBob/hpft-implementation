@@ -1,0 +1,40 @@
+ Completion with error at client
+ Failed status-transport retry counter exceeded (12): wr_id 3 syndrom 0x81
+ scnt=512, ccnt=0
+ Failed to complete run_iter_bw function successfully
+ WARNING: BW peak won't be measured in this run.
+---------------------------------------------------------------------------------------
+                    RDMA_Read BW Test
+ Dual-port       : OFF		Device         : mlx5_8
+ Number of qps   : 4		Transport type : IB
+ Connection type : RC		Using SRQ      : OFF
+ PCIe relax order: ON		Lock-free      : OFF
+ ibv_wr* API     : ON		Using Enhanced Reorder      : OFF
+ TX depth        : 128
+ CQ Moderation   : 1
+ CQE Poll Batch  : Dynamic
+ Mtu             : 1024[B]
+ Link type       : Ethernet
+ GID index       : 3
+ Outstand reads  : 16
+ rdma_cm QPs	 : OFF
+ Data ex. method : Ethernet
+---------------------------------------------------------------------------------------
+ local address: LID 0000 QPN 0x02a8 PSN 0xd79aaf OUT 0x10 RKey 0x074f00 VAddr 0x007f52f2da9000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:02
+ local address: LID 0000 QPN 0x02a9 PSN 0xe1806d OUT 0x10 RKey 0x074f00 VAddr 0x007f52f2db9000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:02
+ local address: LID 0000 QPN 0x02aa PSN 0x531db3 OUT 0x10 RKey 0x074f00 VAddr 0x007f52f2dc9000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:02
+ local address: LID 0000 QPN 0x02ab PSN 0x3d1686 OUT 0x10 RKey 0x074f00 VAddr 0x007f52f2dd9000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:02
+ remote address: LID 0000 QPN 0x02a8 PSN 0xb90c2b OUT 0x10 RKey 0x074f00 VAddr 0x007ffb29493000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:01
+ remote address: LID 0000 QPN 0x02a9 PSN 0x243a39 OUT 0x10 RKey 0x074f00 VAddr 0x007ffb294a3000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:01
+ remote address: LID 0000 QPN 0x02aa PSN 0xb9818f OUT 0x10 RKey 0x074f00 VAddr 0x007ffb294b3000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:01
+ remote address: LID 0000 QPN 0x02ab PSN 0x5d4332 OUT 0x10 RKey 0x074f00 VAddr 0x007ffb294c3000
+ GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:01:02:01
+---------------------------------------------------------------------------------------
+ #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]

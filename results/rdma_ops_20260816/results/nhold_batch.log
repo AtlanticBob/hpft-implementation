@@ -1,0 +1,19 @@
+write_nhold1-incast8-write-done
+stall seconds (any RDMA <3G, t in [5,84]): 0  at []
+clean window (46 s): aggregate=88.8G Jain=1.000 min=11.0 max=11.3
+write_nhold2-incast8-write-done
+stall seconds (any RDMA <3G, t in [5,84]): 0  at []
+clean window (46 s): aggregate=89.1G Jain=1.000 min=11.1 max=11.2
+write_nhold3-incast8-write-done
+stall seconds (any RDMA <3G, t in [5,84]): 39  at [46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+clean window (7 s): aggregate=86.9G Jain=0.981 min=9.3 max=13.1
+write_nhold4-incast8-write-done
+stall seconds (any RDMA <3G, t in [5,84]): 9  at [20, 23, 24, 25, 26, 27, 28, 29, 30]
+clean window (46 s): aggregate=88.2G Jain=1.000 min=10.9 max=11.1
+read_nhold1-incast8-read-done
+stall seconds (any RDMA <3G, t in [5,84]): 80  at [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+clean window (1 s): aggregate=90.6G Jain=0.500 min=0.0 max=22.7
+read_nhold2-incast8-read-done
+stall seconds (any RDMA <3G, t in [5,84]): 80  at [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
+clean window (1 s): aggregate=30.4G Jain=0.499 min=0.0 max=7.9
+ALL-NHOLD-DONE

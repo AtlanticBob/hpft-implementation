@@ -180,7 +180,10 @@ def pack_rate_cfg(rate_bps: int, generation: int, burst_bytes: int, flags: int =
 
 
 def pack_pair_state(next_ns: int = 0, generation: int = 0) -> bytes:
-    return struct.pack("<IIQQ", 0, 0, next_ns, generation)
+    """struct hpft_pair_state: lock, reserved0, next_ns, generation, then the
+    observer's cc_sum, cc_prev, d_ts, d, reserved1. The datapath initialises
+    d itself when it reads zero, so seeding zeros stays correct."""
+    return struct.pack("<IIQQQQQII", 0, 0, next_ns, generation, 0, 0, 0, 0, 0)
 
 
 def normalize_positive_int(value: Any, field: str) -> int:
@@ -412,6 +415,10 @@ def build_compile_command(source: Path, output: Path) -> CommandSpec:
             "-Wall",
             "-target",
             "bpf",
+            # linux/types.h pulls asm/types.h, which lives under the
+            # arch-specific include root; a bpf target does not add it
+            "-I",
+            "/usr/include/x86_64-linux-gnu",
             "-I",
             str(source.parent),
             "-c",

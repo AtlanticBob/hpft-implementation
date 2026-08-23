@@ -43,6 +43,37 @@ for f in $TX_FILES; do cmp_one hpft-dpu  "$f" || bad=1; done
 cmp_one hpft-dpu2 config/lab-registry.json || warn=1
 cmp_one hpft-dpu  config/lab-registry.json || warn=1
 
+# The two executors are not Python and were not covered here, which is
+# exactly backwards: the policy plane fails loudly, an executor built from
+# stale source fails silently at full plausibility.
+PCC_DEV=/home/ubuntu/bzx/doca34-apps/pcc/device/rp/rtt_template/rp_rtt_template_dev_main.c
+want=$(md5sum tools/dpu/pcc/rp_rtt_template_dev_main.c | cut -d' ' -f1)
+have=$(ssh hpft-dpu "md5sum $PCC_DEV 2>/dev/null" | cut -d' ' -f1)
+if [ "$want" != "$have" ]; then
+  echo "  DIFFERS  hpft-dpu:$PCC_DEV (rebuild: meson setup --reconfigure build && ninja -C build pcc/doca_pcc)"
+  bad=1
+fi
+
+# The BPF program cannot be md5'd against a source, but its map layout is
+# derived from that source, so a stale program shows up as the wrong value
+# size. This is the failure that already happened once: a pin left in place
+# makes `bpftool prog load` fail, tc keeps pointing at the old program, and
+# every layer reports healthy.
+PIN=/sys/fs/bpf/hpft_tcp_edt/maps/hpft_pair_state
+B=${HPFT_BPFTOOL:-/usr/lib/linux-tools-5.15.0-185/bpftool}
+if sudo test -e "$PIN"; then
+  want_sz=$(python3 -c "import sys; sys.path.insert(0,'tools/tcp_shaper/tools'); from tcp_shaper_lib import pack_pair_state; print(len(pack_pair_state()))")
+  have_sz=$(sudo "$B" map show pinned "$PIN" 2>/dev/null | grep -o 'value [0-9]*B' | grep -o '[0-9]*')
+  if [ "$want_sz" != "$have_sz" ]; then
+    echo "  DIFFERS  loaded TCP shaper is stale (hpft_pair_state ${have_sz}B, source says ${want_sz}B)"
+    echo "           rm -rf /sys/fs/bpf/hpft_tcp_edt, then re-apply (see README)"
+    bad=1
+  fi
+else
+  echo "  WARN  TCP shaper not loaded (no $PIN)"
+  warn=1
+fi
+
 if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
   echo "== deploying =="
   for f in $RX_FILES; do scp -q "$f" hpft-dpu2:/opt/hpft/; done
