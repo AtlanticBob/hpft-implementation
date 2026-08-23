@@ -96,7 +96,9 @@ for s in $SENDERS; do
   SRV=""
   for n in 0 1 2 3; do
     SRV+="setsid nohup $PT -d $(dev_of $RECV $n) -p $((26400+si*10+n)) -q $QN --report_gbits -D $D >/tmp/i8_${si}_$n 2>&1 </dev/null & "
-    SRV+="setsid nohup iperf3 -s -p $((5301+si*10+n)) -1 >/dev/null 2>&1 </dev/null & "
+    # NOT -1: a one-shot server is gone the moment a client retries, and the
+    # flow-set then simply never appears while the run reports success.
+    SRV+="setsid nohup iperf3 -s -p $((5301+si*10+n)) >/dev/null 2>&1 </dev/null & "
   done
   on_host "$RECV" "$SRV true"
   si=$((si+1))
@@ -111,17 +113,22 @@ print(' '.join(next(v['ip'] for v in r['vnics'] if v['host']=='$RECV' and v['net
 # inside an ssh command is not enough: the session closes as soon as the
 # command returns and takes the job with it, which showed up as a run that
 # reported cleanly with a third of its flow-sets simply absent.
+# ONE ssh per sender carrying all eight launches. Eight separate ssh
+# connections per sender in a tight loop is enough to hit the daemon's
+# rate limit, and the ones that lose leave their flow-sets missing from an
+# otherwise clean-looking run.
 si=0
 for s in $SENDERS; do
-  i=0
+  CLI=""; i=0
   for ip in $RIP; do
     sip=$(python3 -c "
 import json;r=json.load(open('config/lab-registry.json'))
 print(next(v['ip'] for v in r['vnics'] if v['host']=='$s' and v['netdev']=='dpu1vf$i'))")
-    on_host "$s" "setsid nohup $PT -d $(dev_of $s $i) -p $((26400+si*10+i)) -q $QN --report_gbits -D $D $ip >/tmp/i8c_${si}_$i.log 2>&1 </dev/null &"
-    on_host "$s" "setsid nohup iperf3 -B $sip%dpu1vf$i -c $ip -p $((5301+si*10+i)) -P$QN -b 0 -t $((D-5)) -J >/tmp/i8t_${si}_$i.log 2>&1 </dev/null &"
+    CLI+="setsid nohup $PT -d $(dev_of $s $i) -p $((26400+si*10+i)) -q $QN --report_gbits -D $D $ip >/tmp/i8c_${si}_$i.log 2>&1 </dev/null & "
+    CLI+="setsid nohup iperf3 -B $sip%dpu1vf$i -c $ip -p $((5301+si*10+i)) -P$QN -b 0 -t $((D-5)) -J >/tmp/i8t_${si}_$i.log 2>&1 </dev/null & "
     i=$((i+1))
   done
+  on_host "$s" "$CLI true"
   si=$((si+1))
 done
 sleep $((D-4))
