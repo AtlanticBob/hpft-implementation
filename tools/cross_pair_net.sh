@@ -9,6 +9,17 @@
 # answering ARP for each other's IPs; rp_filter=2 (loose) accepts ingress from
 # foreign subnets.
 #
+# NOT ENOUGH ON ITS OWN FOR rdma_cm (2026-08-23). With perftest's -R the
+# kernel resolves the route from the DESTINATION first and picks the VF that
+# owns that subnet, whatever -d says, and these rules never see a source
+# address to match on. The flow is then a STRAIGHT pair: the receiver
+# attributes it to the wrong sender VF, the RP tags it as the destination's
+# own pair, and the experiment measures a topology nobody asked for while
+# reporting normally. Cross-pair traffic must use the NON-CM path -- e.g.
+# `ib_write_bw -d <src dev> -x 3 ... <dst ip>` -- which binds the source GID
+# to the device and produces the pair the runner intended. Verified by the
+# receiver's own MAC classification: -R gave vf1>vf1, -x 3 gave vf0>vf1.
+#
 # Usage: bash cross_pair_net.sh apply|revert|status
 # Run on each host. Not persistent across reboot - reapply after host reboot.
 set -u
@@ -45,7 +56,10 @@ for i in 0 1 2 3; do
         sudo ip route flush table "$tbl" 2>/dev/null
         ;;
     status)
-        ip rule show | grep -q "from $src lookup $tbl" && st=on || st=off
+        # match by TABLE, not by the string "lookup <n>": a table with a
+        # name in /etc/iproute2/rt_tables prints the name, and the check
+        # then reports a rule that is installed and working as absent.
+        ip rule show table "$tbl" 2>/dev/null | grep -q "from $src" && st=on || st=off
         echo "$dev $src table=$tbl rule=$st" \
              "arp_ignore=$(sysctl -n net.ipv4.conf.$dev.arp_ignore)" \
              "rp_filter=$(sysctl -n net.ipv4.conf.$dev.rp_filter)"

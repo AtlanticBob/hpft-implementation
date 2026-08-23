@@ -25,6 +25,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 mkdir -p "$OUT"; cd "$REPO"
+# One run at a time. Two overlapping runs share the lab: the second one's
+# roles.sh reassert restarts the first one's agents mid-flight, and the first
+# still writes a full set of artefacts -- a complete-looking result measured
+# across a stack restart.
+LOCK=/tmp/hpft_run.lock
+exec 9>"$LOCK"
+flock -n 9 || { echo "ABORT: another run holds $LOCK"; exit 1; }
+echo "$TAG $$" >&9
 RECV=${RECV:-$(python3 -c "import json;print(json.load(open('config/lab-registry.json'))['receiver_host'])")}
 SENDERS=${SENDERS:-$(python3 -c "import json;print(json.load(open('config/lab-registry.json'))['sender_host'])")}
 RECV_DPU=$(python3 -c "
