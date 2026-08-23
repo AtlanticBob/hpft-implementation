@@ -1,4 +1,0 @@
-ocore1-incast8-write-couple1-done
-aggregate=57.2G util=62%  RDMA_tot=10.1G TCP_tot=47.1G  Jain=0.705  min=2.5 max=12.0  conv=Nones
-per-flow (G):  vf0.rdma=2.5  vf0.tcp=11.2  vf1.rdma=2.5  vf1.tcp=12.0  vf2.rdma=2.5  vf2.tcp=11.8  vf3.rdma=2.5  vf3.tcp=12.0
-ALL-OCORE-DONE
