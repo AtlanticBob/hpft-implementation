@@ -149,6 +149,166 @@
       "gids": [
         "00000000000000000000ffff0a010302"
       ]
+    },
+    {
+      "vnic_id": "sgpu03/0000:b8:00.1/vf0",
+      "host": "sgpu03",
+      "pf_bdf": "0000:b8:00.1",
+      "vf_index": 0,
+      "vf_pci_bdf": "0000:b8:02.3",
+      "rdma_devs": [
+        "mlx5_4"
+      ],
+      "netdevs": [
+        "dpu1vf0",
+        "pf1vf0"
+      ],
+      "ips": [
+        "10.1.0.3"
+      ],
+      "gids": [
+        "00000000000000000000ffff0a010003"
+      ]
+    },
+    {
+      "vnic_id": "sgpu03/0000:b8:00.1/vf1",
+      "host": "sgpu03",
+      "pf_bdf": "0000:b8:00.1",
+      "vf_index": 1,
+      "vf_pci_bdf": "0000:b8:02.4",
+      "rdma_devs": [
+        "mlx5_5"
+      ],
+      "netdevs": [
+        "dpu1vf1",
+        "pf1vf1"
+      ],
+      "ips": [
+        "10.1.1.3"
+      ],
+      "gids": [
+        "00000000000000000000ffff0a010103"
+      ]
+    },
+    {
+      "vnic_id": "sgpu03/0000:b8:00.1/vf2",
+      "host": "sgpu03",
+      "pf_bdf": "0000:b8:00.1",
+      "vf_index": 2,
+      "vf_pci_bdf": "0000:b8:02.5",
+      "rdma_devs": [
+        "mlx5_6"
+      ],
+      "netdevs": [
+        "dpu1vf2",
+        "pf1vf2"
+      ],
+      "ips": [
+        "10.1.2.3"
+      ],
+      "gids": [
+        "00000000000000000000ffff0a010203"
+      ]
+    },
+    {
+      "vnic_id": "sgpu03/0000:b8:00.1/vf3",
+      "host": "sgpu03",
+      "pf_bdf": "0000:b8:00.1",
+      "vf_index": 3,
+      "vf_pci_bdf": "0000:b8:02.6",
+      "rdma_devs": [
+        "mlx5_7"
+      ],
+      "netdevs": [
+        "dpu1vf3",
+        "pf1vf3"
+      ],
+      "ips": [
+        "10.1.3.3"
+      ],
+      "gids": [
+        "00000000000000000000ffff0a010303"
+      ]
+    },
+    {
+      "vnic_id": "sgpu04/0000:b8:00.1/vf0",
+      "host": "sgpu04",
+      "pf_bdf": "0000:b8:00.1",
+      "vf_index": 0,
+      "vf_pci_bdf": "0000:b8:02.3",
+      "rdma_devs": [
+        "mlx5_4"
+      ],
+      "netdevs": [
+        "dpu1vf0",
+        "pf1vf0"
+      ],
+      "ips": [
+        "10.1.0.4"
+      ],
+      "gids": [
+        "00000000000000000000ffff0a010004"
+      ]
+    },
+    {
+      "vnic_id": "sgpu04/0000:b8:00.1/vf1",
+      "host": "sgpu04",
+      "pf_bdf": "0000:b8:00.1",
+      "vf_index": 1,
+      "vf_pci_bdf": "0000:b8:02.4",
+      "rdma_devs": [
+        "mlx5_5"
+      ],
+      "netdevs": [
+        "dpu1vf1",
+        "pf1vf1"
+      ],
+      "ips": [
+        "10.1.1.4"
+      ],
+      "gids": [
+        "00000000000000000000ffff0a010104"
+      ]
+    },
+    {
+      "vnic_id": "sgpu04/0000:b8:00.1/vf2",
+      "host": "sgpu04",
+      "pf_bdf": "0000:b8:00.1",
+      "vf_index": 2,
+      "vf_pci_bdf": "0000:b8:02.5",
+      "rdma_devs": [
+        "mlx5_6"
+      ],
+      "netdevs": [
+        "dpu1vf2",
+        "pf1vf2"
+      ],
+      "ips": [
+        "10.1.2.4"
+      ],
+      "gids": [
+        "00000000000000000000ffff0a010204"
+      ]
+    },
+    {
+      "vnic_id": "sgpu04/0000:b8:00.1/vf3",
+      "host": "sgpu04",
+      "pf_bdf": "0000:b8:00.1",
+      "vf_index": 3,
+      "vf_pci_bdf": "0000:b8:02.6",
+      "rdma_devs": [
+        "mlx5_7"
+      ],
+      "netdevs": [
+        "dpu1vf3",
+        "pf1vf3"
+      ],
+      "ips": [
+        "10.1.3.4"
+      ],
+      "gids": [
+        "00000000000000000000ffff0a010304"
+      ]
     }
   ],
   "rdma_rules": [
