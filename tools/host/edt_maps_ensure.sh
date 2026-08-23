@@ -8,7 +8,11 @@
 # the law, the shim and pair_cfg all look healthy.
 set -u
 REPO=/home/zhaoxiang/hyperfront/hpft-implementation
-B=${HPFT_BPFTOOL:-/usr/lib/linux-tools-5.15.0-185/bpftool}
+# bpftool: hosts do not all run the same kernel, so the versioned path that
+# is right on one is absent on the next. Prefer an explicit HPFT_BPFTOOL,
+# else the newest linux-tools build present, else whatever is on PATH.
+B=${HPFT_BPFTOOL:-$(ls -1 /usr/lib/linux-tools-*/bpftool 2>/dev/null | sort -V | tail -1)}
+B=${B:-$(command -v bpftool)}
 PIN=/sys/fs/bpf/hpft_tcp_edt/maps
 sudo HPFT_BPFTOOL=$B python3 $REPO/tools/tcp_shaper/tools/tcp-shaper-apply \
   --registry $REPO/config/lab-tcp-registry.json --local-host "$(hostname)" \
