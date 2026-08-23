@@ -42,6 +42,15 @@ TSO 突发风暴。
 **部分可见的新成员**（年龄 < mix 窗且已有字节）改用上一拍授予额分摊，
 避免新发送方的字节被记到在位者头上、令其吃冤枉折扣。
 
+**四节点（2026-08-23）**：`sgpu01`–`sgpu04`，每台一块 BF3 挂在 SN5600 上，
+四个口统一 **200G**（swp37s1 / swp37s0 / swp3s1 / swp4s1）。sgpu03/sgpu04 用的是
+各自的第二块 BF3（PCI `b8:00`，host netdev `bf1_1`），原本是 NIC mode，现已切到
+DPU mode 并刷成与现役同版的 BFB（固件 32.49.1014）。overlay 是**以接收端为中心
+的星型**——一个桥上的 VxLAN 全互联没有 split-horizon，会成环并串学 MAC；星型无环，
+每条 sender→receiver 都是直达隧道，spoke 之间经 hub 的 eswitch 硬件转发也是线速。
+三打一的 RDMA incast 实测：6 个流集合、2 个目的 VM，各判 20.00G，实测总
+112.7G、Jain 0.9988。
+
 **数据面自 2026-07-29 起常驻泛化 VxLAN overlay**（P0 定案，见
 `results/p0_overlay_20260729/summary.md`）：两台 DPU 的 p1 直配 underlay
 172.16.1.x + 遥测 10.1.9.x、MTU 9000，ovsbr-p1 挂 4 个 representor +
@@ -92,6 +101,14 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
   `meson setup --reconfigure build && ninja -C build pcc/doca_pcc`
   （在 hpft-dpu 上）才会真正生效——`ninja` 单独不重编设备码（dpacc 是
   configure 步），改完不重编是常见坑。
+- **重启发送端 agent 必须一并重启该节点的 RP**（`bash /opt/hpft/rp_service.sh
+  start`）。tx agent 被换掉之后 RP 仍然收预算、仍然按 `0xdeb` 回读出正确的
+  level，但不再把速率作用到线上——20G 授权实测跑 52.9G，重启 RP 后同一授权
+  变 18.5G。`tools/lab-infra/roles.sh` 已经按这个顺序编排（RP 先、agent 后），
+  手工起 agent 时要自己补。
+- **RDMA 源 vf1 与 vf2 的 flowtag 相同**，不能同时作为源调度：两者的预算在 RP
+  里不可分离，同时跑会让整组流集合被错误配速（12 流场景实测总吞吐塌到 4.7G）。
+  这是 flowtag 只哈希 function 索引的后果，**每个发送节点一视同仁**。
 - TCP shaper 叫 "host fq+edt"；DPU 侧 TCP 卸载已暂停（架构性负结论：
   OVS 占据 representor ingress，没有既透明又保持 pacing 语义的挂载点），
   除非用户重提不要重启。
@@ -122,10 +139,18 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
   两者全仓无人调用。
 - `tools/lab-infra/vf_setup.sh` —— VF 重建脚本（`cc_mode.sh` 的
   `post_recover` 调用）。
-- `tools/lab-infra/deploy_check.sh` —— **跑实验前必过**：repo 与两台 DPU
-  的代码一致、两个 agent 健康且近期无 traceback。代码不一致是致命的、
-  配置不一致只是警告（runner 会推自己的场景配置）。`--deploy` 推送差异
-  并在各自 Arm 上重编 `libfastfill.so`。
+- `tools/lab-infra/roles.sh` —— 角色编排：`set --receiver <host>
+  [--senders h1,h2]` / `status` / `stop`。每台 DPU 装的是同一份载荷（收发两侧
+  都有），谁当接收端是**每场实验的决定**，不是节点的属性。它按正确顺序拉起
+  一个角色需要的全部东西：接收端 = vport-meter + rx agent；发送端 = RP +
+  tx agent + host 侧的 pace-shim 与 qpn-resolver。
+- `tools/lab-infra/deploy_check.sh` —— **跑实验前必过**：repo 与四台 DPU
+  的代码一致、启用的 agent 健康且近期无 traceback。代码不一致是致命的、
+  配置不一致只是警告（runner 会推自己的场景配置）。`--deploy` 推送差异并在各自 Arm 上重编 `libfastfill.so`
+  / `vport_meter` / `doca_pcc`。节点表读 `config/lab-registry.json` 的
+  `nodes`——**加一台机器只需改那一处**。host 侧载荷（pace-shim、TCP shaper
+  库、BPF 对象、两个 registry）按仓库的同一绝对路径镜像到每台 host，因为它们
+  互相按绝对路径引用。
 - `tools/lab-infra/flow_preflight.sh` / `flow_postflight.py` —— 流对可用性
   守卫。RC 的错误完成是**终态**，被打死的 QP 不会自己回来，而每一层都
   还在报健康——这是几次实验产出"看起来正常但结论是错的"数据的原因。
