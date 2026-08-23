@@ -55,31 +55,43 @@ ZTR_BIN=/home/ubuntu/bzx/pcc_ztr_stock/build/pcc/doca_pcc   # on hpft-dpu
 UL_SENDER=172.16.1.1; UL_RECV=172.16.1.2         # VxLAN underlay on p1
 
 # ---------------------------------------------------------------- status ----
+# Who is who comes from the registry: the lab is four machines and any of
+# them can be the receiver, so a name written here would be a second opinion.
+SENDER=${HPFT_SENDER:-$(python3 -c "import json;print(json.load(open('$REPO/config/lab-registry.json'))['sender_host'])")}
+RECEIVER=${HPFT_RECEIVER:-$(python3 -c "import json;print(json.load(open('$REPO/config/lab-registry.json'))['receiver_host'])")}
+all_hosts() { python3 -c "
+import json;print(' '.join(n['host'] for n in json.load(open('$REPO/config/lab-registry.json'))['nodes']))"; }
+all_dpus()  { python3 -c "
+import json;print(' '.join(n['dpu'] for n in json.load(open('$REPO/config/lab-registry.json'))['nodes']))"; }
+dpu_of()    { python3 -c "
+import json;print({n['host']:n['dpu'] for n in json.load(open('$REPO/config/lab-registry.json'))['nodes']}['$1'])"; }
+
 upcc_of() { ssh "$1" "sudo mlxconfig -d $MST q USER_PROGRAMMABLE_CC 2>/dev/null" \
   | awk '/USER_PROGRAMMABLE_CC/{print $NF}' | tr -dc '01'; }
 
 status() {
-  local u1 u2 pcc rx tx shim ovs jak
-  u1=$(upcc_of hpft-dpu); u2=$(upcc_of hpft-dpu2)
-  pcc=$(ssh hpft-dpu 'pgrep -c -x doca_pcc' 2>/dev/null || echo 0)
-  rx=$(ssh hpft-dpu2 'systemctl is-active hpft-rxagent-e' 2>/dev/null)
-  tx=$(ssh hpft-dpu 'systemctl is-active hpft-txagent-e' 2>/dev/null)
-  shim=$(systemctl is-active hpft-pace-shim 2>/dev/null)
-  ovs=$(ssh hpft-dpu2 'sudo ovs-vsctl list-ports ovsbr-p1 2>/dev/null | tr "\n" "," ')
-  jak=$(ssh hpft-dpu2 'pgrep -cf "build/jakiro_dht[b]" || true' 2>/dev/null | head -1)
+  local u1 pcc rx tx jak
+  local SDPU RDPU
+  SDPU=$(dpu_of "$SENDER"); RDPU=$(dpu_of "$RECEIVER")
+  u1=$(upcc_of "$SDPU")
+  pcc=$(ssh "$SDPU" 'pgrep -c -x doca_pcc 2>/dev/null; true' 2>/dev/null | head -1)
+  rx=$(ssh "$RDPU" 'systemctl is-active hpft-rxagent-e' 2>/dev/null)
+  tx=$(ssh "$SDPU" 'systemctl is-active hpft-txagent-e' 2>/dev/null)
+  jak=$(ssh "$RDPU" 'pgrep -cf "build/jakiro_dht[b]" || true' 2>/dev/null | head -1)
   jak=${jak:-0}
-  echo "UPCC:            dpu=$u1 dpu2=$u2   (1=PCC device, 0=firmware DCQCN)"
-  echo "HPFT agents:     rx=$rx tx=$tx shim=$shim  doca_pcc=$pcc"
-  echo "ovsbr-p1 ports:  ${ovs:-<none>}"
+  # UPCC, doca_pcc and the planes, per node -- with four machines a single
+  # dpu/dpu2 line cannot say which of them is misconfigured.
+  bash "$REPO/tools/cc_mode.sh" status
+  echo -n "overlay ports:   "; for n in $(all_dpus); do printf "%s[%s] " "$n" "$(ssh "$n" 'sudo ovs-vsctl list-ports ovsbr-p1 2>/dev/null | tr "\n" "," ' 2>/dev/null)"; done; echo
   echo "jakiro_dhtb:     $([ "$jak" -gt 0 ] && echo running || echo stopped)"
-  echo "doca_pcc bin:    $(ssh hpft-dpu 'pgrep -a -x doca_pcc | head -1 | sed "s/^[0-9]* //"' 2>/dev/null || echo none)"
-  echo "rx meters:       $(ssh hpft-dpu2 'sudo ovs-ofctl -O OpenFlow13 dump-meters ovsbr-p1 2>/dev/null | grep -c "meter=1[1-4]" || true' 2>/dev/null)"
+  echo "doca_pcc bin:    $(ssh "$SDPU" 'pgrep -a -x doca_pcc | head -1 | sed "s/^[0-9]* //"' 2>/dev/null || echo none)"
+  echo "rx meters:       $(ssh "$RDPU" 'sudo ovs-ofctl -O OpenFlow13 dump-meters ovsbr-p1 2>/dev/null | grep -c "meter=1[1-4]" || true' 2>/dev/null)"
   echo -n "receiver VF IPs: "
-  ssh sgpu02 'for i in 0 1 2 3; do printf "vf%s=%s " $i "$(ip -4 addr show dpu1vf$i 2>/dev/null | grep -oE "inet [0-9.]+" | awk "{print \$2}" | head -1)"; done; echo'
+  ssh "$RECEIVER" 'for i in 0 1 2 3; do printf "vf%s=%s " $i "$(ip -4 addr show dpu1vf$i 2>/dev/null | grep -oE "inet [0-9.]+" | awk "{print \$2}" | head -1)"; done; echo'
   # verdict
   if [ "$u1" = 1 ] && [ "$rx" = active ] && [ "$tx" = active ]; then
     echo "==> environment: HPFT"
-  elif [ "$u1" = 1 ] && ssh hpft-dpu 'pgrep -a -x doca_pcc | grep -q pcc_ztr_stock' 2>/dev/null; then
+  elif [ "$u1" = 1 ] && ssh "$SDPU" 'pgrep -a -x doca_pcc | grep -q pcc_ztr_stock' 2>/dev/null; then
     echo "==> environment: ZTR (stock RTT template, no HPFT)"
   elif [ "$jak" -gt 0 ]; then
     echo "==> environment: JAKIRO (DHTB up)"
@@ -123,69 +135,21 @@ jakiro_start() {
 # VF IPs untouched, telemetry on p1, tos=inherit, p1 stays 100G. Idempotent:
 # full build only when vxlan100 is missing; the volatile parts (p1 IPs, MTU,
 # ARP, representor membership, tos option) are re-asserted on every call.
-ensure_overlay() {
-  echo "== ensure VxLAN overlay (ovsbr-p1 + vxlan100, tos=inherit) =="
-  if ! overlay_present; then
-    _setup_dpu hpft-dpu  "$UL_SENDER" "$UL_RECV" 10.1.9.1
-    _setup_dpu hpft-dpu2 "$UL_RECV"   "$UL_SENDER" 10.1.9.2
-  else
-    _assert_dpu hpft-dpu  "$UL_SENDER" 10.1.9.1
-    _assert_dpu hpft-dpu2 "$UL_RECV"   10.1.9.2
-  fi
-  M1=$(ssh hpft-dpu  'cat /sys/class/net/p1/address'); M2=$(ssh hpft-dpu2 'cat /sys/class/net/p1/address')
-  ssh hpft-dpu  "sudo arp -s 10.1.9.2 $M2 2>/dev/null; true"
-  ssh hpft-dpu2 "sudo arp -s 10.1.9.1 $M1 2>/dev/null; true"
-  sudo ip -s -s neigh flush all >/dev/null 2>&1; ssh sgpu02 'sudo ip -s -s neigh flush all >/dev/null 2>&1'
-}
-_setup_dpu() { # host underlay_local underlay_remote telemetry_ip
-  # p1 must leave underlay-p1 and become a standalone L3 netdev: the VxLAN
-  # underlay IP sits straight on p1 and the kernel routes encap traffic over
-  # it, which an OVS bridge PORT (pure L2) cannot do (also the documented
-  # precondition for VxLAN hw offload). The telemetry IP rides p1 as a
-  # second address (its old home, the underlay-p1 bridge port, has no uplink
-  # in overlay mode). teardown_overlay is the exact inverse.
-  ssh "$1" "sudo ovs-vsctl --if-exists del-port underlay-p1 p1
-    sudo ip addr flush dev underlay-p1 2>/dev/null; sudo ip addr flush dev p1 2>/dev/null
-    sudo ip addr add $2/24 dev p1; sudo ip addr add $4/24 dev p1; sudo ip link set p1 up mtu 9000
-    sudo ovs-vsctl --if-exists del-br ovsbr-p1; sudo ovs-vsctl add-br ovsbr-p1
-    for i in 0 1 2 3; do sudo ovs-vsctl --if-exists del-port underlay-p1 pf1vf\$i; sudo ovs-vsctl --may-exist add-port ovsbr-p1 pf1vf\$i; done
-    sudo ovs-vsctl add-port ovsbr-p1 vxlan100 -- set interface vxlan100 type=vxlan options:local_ip=$2 options:remote_ip=$3 options:key=100 options:dst_port=4789 options:tos=inherit
-    sudo ip link set ovsbr-p1 up"
-}
-_assert_dpu() { # host underlay_local telemetry_ip -- volatile state only
-  ssh "$1" "sudo ip addr add $2/24 dev p1 2>/dev/null
-    sudo ip addr add $3/24 dev p1 2>/dev/null
-    sudo ip link set p1 up mtu 9000
-    for i in 0 1 2 3; do sudo ovs-vsctl --may-exist add-port ovsbr-p1 pf1vf\$i 2>/dev/null; done
-    sudo ovs-vsctl set interface vxlan100 options:tos=inherit
-    sudo ip link set ovsbr-p1 up; true"
-}
-# Tear the overlay down and restore the DIRECT data path: delete ovsbr-p1,
-# move the VF representors back onto underlay-p1, AND put the p1 uplink back
-# into underlay-p1, dropping the underlay L3 IP from p1.
-# (reboot_recover.sh restores the telemetry IP + VFs but NOT representor NOR
-# uplink placement, so this inverse of build_overlay is mandatory before
-# hpft/plain.) The p1 add-back is essential: build_overlay turns p1 into a
-# standalone L3 netdev (underlay IP straight on p1), so after teardown the
-# underlay-p1 bridge has the representors but NO uplink to the wire -- the
-# "cc all correct, data plane totally broken" symptom is exactly p1 missing
-# from the bridge (2026-07-24, found by the impl agent; teardown alone did
-# not fix a live instance of this state until p1 was re-added).
+ensure_overlay() { bash "$REPO/tools/lab-infra/overlay.sh" --hub "$RECEIVER"; }
 teardown_overlay() {
-  echo "== teardown VxLAN overlay -> direct data path =="
-  for h in hpft-dpu hpft-dpu2; do
-    ssh "$h" 'sudo ovs-vsctl --if-exists del-br ovsbr-p1
-      sudo ip addr flush dev p1 2>/dev/null
-      sudo ovs-vsctl --may-exist add-port underlay-p1 p1
-      for i in 0 1 2 3; do sudo ovs-vsctl --may-exist add-port underlay-p1 pf1vf$i; done
-      sudo ip link set p1 up'
+  bash "$REPO/tools/lab-infra/overlay.sh" --teardown
+  # restore direct VF IPs on every host
+  for h in $(all_hosts); do
+    if [ "$h" = "$(hostname)" ]; then
+      for i in 0 1 2 3; do sudo ip addr flush dev dpu1vf$i 2>/dev/null; done
+      bash "$REPO/tools/lab-infra/vf_setup.sh" >/dev/null 2>&1
+    else
+      ssh "$h" "bash $REPO/tools/lab-infra/vf_setup.sh >/dev/null 2>&1"
+    fi
   done
-  # restore direct VF IPs on both hosts (sender vf_i=10.1.i.1, recv vf_i=10.1.i.2)
-  for i in 0 1 2 3; do sudo ip addr flush dev dpu1vf$i 2>/dev/null; sudo ip addr add 10.1.$i.1/24 dev dpu1vf$i; sudo ip link set dpu1vf$i up; done
-  ssh sgpu02 'for i in 0 1 2 3; do sudo ip addr flush dev dpu1vf$i 2>/dev/null; sudo ip addr add 10.1.$i.2/24 dev dpu1vf$i; sudo ip link set dpu1vf$i up; done'
 }
 
-overlay_present() { ssh hpft-dpu2 'sudo ovs-vsctl list-ports ovsbr-p1 2>/dev/null | grep -q vxlan100'; }
+overlay_present() { ssh "$(dpu_of "$RECEIVER")" 'sudo ovs-vsctl list-ports ovsbr-p1 2>/dev/null | grep -qE "^(vx|vxlan)"'; }
 
 # ------------------------------------------------------------- targets ------
 case "${1:-}" in

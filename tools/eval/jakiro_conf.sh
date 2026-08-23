@@ -14,16 +14,17 @@
 # point). lab_env.sh jakiro (re)starts the DHTB with whatever this wrote.
 # DHTB_CFG log line check happens at DHTB start (batch 4), not here.
 set -eu
+RDPU=${RDPU:-$(python3 -c "import json;r=json.load(open('/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-registry.json'));print({n['host']:n['dpu'] for n in r['nodes']}[r['receiver_host']])")}
 CONF='~/bzx/jakiro_dhtb/jakiro_dhtb.conf'
 case "${1:-}" in
-  show) ssh hpft-dpu2 "grep -E '^(CAPACITY_GBPS|ROCE_WEIGHT_PERMILLE|TCP_DST_PORT|OVERLAY_DST_IP)=' $CONF" ;;
+  show) ssh "$RDPU" "grep -E '^(CAPACITY_GBPS|ROCE_WEIGHT_PERMILLE|TCP_DST_PORT|OVERLAY_DST_IP)=' $CONF" ;;
   set)
     CAP=$2; PERM=$3; TPORT=${4:-5201}
-    ssh hpft-dpu2 "[ -f $CONF.orig ] || cp $CONF $CONF.orig
+    ssh "$RDPU" "[ -f $CONF.orig ] || cp $CONF $CONF.orig
       sed -i -e 's/^CAPACITY_GBPS=.*/CAPACITY_GBPS=$CAP/' \
              -e 's/^ROCE_WEIGHT_PERMILLE=.*/ROCE_WEIGHT_PERMILLE=$PERM/' \
              -e 's/^TCP_DST_PORT=.*/TCP_DST_PORT=$TPORT/' $CONF
       grep -E '^(CAPACITY_GBPS|ROCE_WEIGHT_PERMILLE|TCP_DST_PORT)=' $CONF" ;;
-  restore) ssh hpft-dpu2 "[ -f $CONF.orig ] && cp $CONF.orig $CONF && echo restored || echo 'no backup'" ;;
+  restore) ssh "$RDPU" "[ -f $CONF.orig ] && cp $CONF.orig $CONF && echo restored || echo 'no backup'" ;;
   *) sed -n '2,16p' "$0"; exit 2 ;;
 esac

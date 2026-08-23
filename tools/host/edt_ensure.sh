@@ -34,8 +34,15 @@ for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do
     # rdma_rules rates (4G/2G/2G) from the old cfg map while the new map
     # showed the correct 12G, and a single TCP pair on an idle 100G link
     # sat at exactly 2.00 Gb/s. Cost me most of an incast investigation.
-    want=$(sudo bpftool prog show pinned "$PIN/hpft_tcp_edt" 2>/dev/null \
+    # bpftool: hosts do not all run the same kernel, and the one on PATH is
+    # not always new enough to read a pinned program. An empty `want` makes
+    # the comparison below unfalsifiable, which is how a check meant to catch
+    # a stale program starts re-attaching on every run instead.
+    B=${HPFT_BPFTOOL:-$(ls -1 /usr/lib/linux-tools-*/bpftool 2>/dev/null | sort -V | tail -1)}
+    B=${B:-$(command -v bpftool)}
+    want=$(sudo "$B" prog show pinned "$PIN/hpft_tcp_edt" 2>/dev/null \
            | head -1 | cut -d: -f1)
+    [ -n "$want" ] || echo "  WARN $d: cannot read the pinned program id ($B)"
     have=$(tc filter show dev "$d" egress 2>/dev/null \
            | grep -o 'id [0-9]*' | head -1 | cut -d' ' -f2)
     [ -n "$want" ] && [ "$have" = "$want" ] \

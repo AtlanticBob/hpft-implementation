@@ -19,6 +19,26 @@ REPO=${REPO:-/home/zhaoxiang/hyperfront/hpft-implementation}
 PT=${PT:-$HOME/hyperfront/perftest-enhanced/ib_write_bw}
 IPERF=${IPERF:-iperf3}
 
+# Who is who, and how many. Every helper below loops over these instead of
+# naming a DPU: the lab is four machines, any of them can receive, and a
+# scenario registry pushed to two of four is the quietest way to run an
+# experiment whose senders disagree about the policy.
+EVAL_SENDER=${EVAL_SENDER:-$(python3 -c "import json;print(json.load(open('$REPO/config/lab-registry.json'))['sender_host'])")}
+EVAL_RECEIVER=${EVAL_RECEIVER:-$(python3 -c "import json;print(json.load(open('$REPO/config/lab-registry.json'))['receiver_host'])")}
+_all_dpus() { python3 -c "
+import json;print(' '.join(n['dpu'] for n in json.load(open('$REPO/config/lab-registry.json'))['nodes']))"; }
+_dpu_of()   { python3 -c "
+import json;print({n['host']:n['dpu'] for n in json.load(open('$REPO/config/lab-registry.json'))['nodes']}['$1'])"; }
+# senders default to the registry's single sender so existing runners keep
+# their meaning; a four-node runner sets EVAL_SENDERS.
+EVAL_SENDERS=${EVAL_SENDERS:-$EVAL_SENDER}
+_dev_of() { python3 -c "
+import json;r=json.load(open('$REPO/config/lab-registry.json'))
+print(next(v['rdma_dev'] for v in r['vnics'] if v['host']=='$1' and v['netdev']=='dpu1vf$2'))"; }
+_ip_of()  { python3 -c "
+import json;r=json.load(open('$REPO/config/lab-registry.json'))
+print(next(v['ip'] for v in r['vnics'] if v['host']=='$1' and v['netdev']=='dpu1vf$2'))"; }
+
 # ---- scenario registry ------------------------------------------------
 # reg_push "<python mutations on dict d>"   (empty string = repo values)
 reg_push() {
@@ -28,12 +48,10 @@ d=json.load(open('$REPO/config/lab-registry.json'))
 $1
 json.dump(d,open('/tmp/eval_scenario_registry.json','w'),indent=2)
 EOF
-  scp -q /tmp/eval_scenario_registry.json hpft-dpu:/opt/hpft/lab-registry.json
-  scp -q /tmp/eval_scenario_registry.json hpft-dpu2:/opt/hpft/lab-registry.json
+  for d in $(_all_dpus); do scp -q /tmp/eval_scenario_registry.json "$d:/opt/hpft/lab-registry.json"; done
 }
 reg_restore() {
-  scp -q "$REPO/config/lab-registry.json" hpft-dpu:/opt/hpft/lab-registry.json
-  scp -q "$REPO/config/lab-registry.json" hpft-dpu2:/opt/hpft/lab-registry.json
+  for d in $(_all_dpus); do scp -q "$REPO/config/lab-registry.json" "$d:/opt/hpft/lab-registry.json"; done
 }
 
 # ---- HPFT stack -------------------------------------------------------
@@ -42,25 +60,32 @@ agents_restart() {  # both agents only, fresh jsonl. RP (and its per-flowtag
   # vport_meter FIRST: it wedges silently (DEVX context death), and a fresh
   # rx_agent mmaps whatever shm inode exists at startup -- restarting the
   # meter after the agent leaves the agent reading a dead file.
-  ssh hpft-dpu2 'sudo systemctl restart hpft-vport-meter 2>/dev/null; sleep 1
+  ssh "$(_dpu_of $EVAL_RECEIVER)" 'sudo systemctl restart hpft-vport-meter 2>/dev/null; sleep 1
     sudo systemctl stop hpft-rxagent-e 2>/dev/null; sudo systemctl reset-failed hpft-rxagent-e 2>/dev/null
-    sudo rm -f /tmp/hpft_rxagent_e.jsonl; sudo systemd-run --unit hpft-rxagent-e /usr/bin/python3 /opt/hpft/rx_agent.py' >/dev/null
-  ssh hpft-dpu 'sudo systemctl stop hpft-txagent-e 2>/dev/null; sudo systemctl reset-failed hpft-txagent-e 2>/dev/null
-    sudo rm -f /tmp/hpft_txagent_e.jsonl; sudo systemd-run --unit hpft-txagent-e /usr/bin/python3 /opt/hpft/tx_agent_e.py' >/dev/null
+    sudo rm -f /tmp/hpft_rxagent_e.jsonl; sudo systemd-run --unit hpft-rxagent-e /usr/bin/python3 /opt/hpft/rx_agent.py --local-host '"$EVAL_RECEIVER" >/dev/null
+  for h in $EVAL_SENDERS; do
+    ssh "$(_dpu_of $h)" "sudo systemctl stop hpft-txagent-e 2>/dev/null; sudo systemctl reset-failed hpft-txagent-e 2>/dev/null
+      sudo rm -f /tmp/hpft_txagent_e.jsonl; sudo systemd-run --unit hpft-txagent-e /usr/bin/python3 /opt/hpft/tx_agent_e.py --local-host $h" >/dev/null
+  done
   sleep 5
 }
 stack_restart() {   # RP + both agents, fresh jsonl. RP restart CLEARS device
                     # budgets: seed them before any unpaced multi-QP launch.
-  ssh hpft-dpu 'bash /tmp/rp_service.sh start >/dev/null 2>&1; true'
-  ssh hpft-dpu2 'sudo systemctl stop hpft-rxagent-e 2>/dev/null; sudo systemctl reset-failed hpft-rxagent-e 2>/dev/null
-    sudo rm -f /tmp/hpft_rxagent_e.jsonl; sudo systemd-run --unit hpft-rxagent-e /usr/bin/python3 /opt/hpft/rx_agent.py' >/dev/null
-  ssh hpft-dpu 'sudo systemctl stop hpft-txagent-e 2>/dev/null; sudo systemctl reset-failed hpft-txagent-e 2>/dev/null
-    sudo rm -f /tmp/hpft_txagent_e.jsonl; sudo systemd-run --unit hpft-txagent-e /usr/bin/python3 /opt/hpft/tx_agent_e.py' >/dev/null
+  # roles.sh restarts each sender's RP before its agent, in that order: an
+  # executor left from the previous point keeps taking budgets and quietly
+  # stops pacing.
+  bash "$REPO/tools/lab-infra/roles.sh" set --receiver "$EVAL_RECEIVER" \
+       --senders "$(echo $EVAL_SENDERS | tr ' ' ',')" >/dev/null
   sleep 5
 }
 agents_grab() {     # agents_grab <outdir> <tag>
-  scp -q hpft-dpu2:/tmp/hpft_rxagent_e.jsonl "$1/${2}_rx.jsonl" 2>/dev/null || true
-  scp -q hpft-dpu:/tmp/hpft_txagent_e.jsonl "$1/${2}_tx.jsonl" 2>/dev/null || true
+  scp -q "$(_dpu_of $EVAL_RECEIVER):/tmp/hpft_rxagent_e.jsonl" "$1/${2}_rx.jsonl" 2>/dev/null || true
+  for h in $EVAL_SENDERS; do
+    # one tx log per sender; the single-sender name is kept so the existing
+    # analyzers still find it.
+    if [ "$EVAL_SENDERS" = "$h" ]; then n="$1/${2}_tx.jsonl"; else n="$1/${2}_tx_${h}.jsonl"; fi
+    scp -q "$(_dpu_of $h):/tmp/hpft_txagent_e.jsonl" "$n" 2>/dev/null || true
+  done
 }
 
 dataplane_guard() { # ops disease: the VF<->VF inner path can drop dead after
@@ -107,38 +132,39 @@ rp_fresh() {  # budget-freshness probe (ops_notes family 3, form "stale
               # Returns 1 if the executor did not track the change.
   traffic_clear
   local REPO=/home/zhaoxiang/hyperfront/hpft-implementation
-  python3 - <<'EOF'
-import json
+  python3 - "$EVAL_SENDER" "$EVAL_RECEIVER" <<'EOF'
+import json, sys
+snd, rcv = sys.argv[1], sys.argv[2]
 d = json.load(open("/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-registry.json"))
-for h in ("sgpu01", "sgpu02"):
+for h in (snd, rcv):
     d["policy"]["vms"][h + "/vf0"]["max_rate_bps"] = 20000000000
 json.dump(d, open("/tmp/rpfresh_a.json", "w"), indent=2)
-for h in ("sgpu01", "sgpu02"):
+for h in (snd, rcv):
     d["policy"]["vms"][h + "/vf0"]["max_rate_bps"] = 8000000000
 json.dump(d, open("/tmp/rpfresh_b.json", "w"), indent=2)
 EOF
-  scp -q /tmp/rpfresh_a.json hpft-dpu:/opt/hpft/lab-registry.json
-  scp -q /tmp/rpfresh_a.json hpft-dpu2:/opt/hpft/lab-registry.json
+  for d in $(_all_dpus); do scp -q /tmp/rpfresh_a.json "$d:/opt/hpft/lab-registry.json"; done
   sleep 2
-  rdma_server mlx5_6 28905 4 26; sleep 1.2
-  rdma_client mlx5_6 28905 4 26 10.1.0.2 /tmp/rpfresh.log &
+  local sdev rdev rip
+  sdev=$(_dev_of "$EVAL_SENDER" 0); rdev=$(_dev_of "$EVAL_RECEIVER" 0); rip=$(_ip_of "$EVAL_RECEIVER" 0)
+  rdma_server "$rdev" 28905 4 26; sleep 1.2
+  rdma_client "$sdev" 28905 4 26 "$rip" /tmp/rpfresh.log &
   sleep 12
-  scp -q /tmp/rpfresh_b.json hpft-dpu:/opt/hpft/lab-registry.json
-  scp -q /tmp/rpfresh_b.json hpft-dpu2:/opt/hpft/lab-registry.json
+  for d in $(_all_dpus); do scp -q /tmp/rpfresh_b.json "$d:/opt/hpft/lab-registry.json"; done
   sleep 10
   local late
-  late=$(ssh hpft-dpu2 "tail -400 /tmp/hpft_rxagent_e.jsonl" 2>/dev/null | python3 -c "
-import sys, json
+  late=$(ssh "$(_dpu_of $EVAL_RECEIVER)" "tail -400 /tmp/hpft_rxagent_e.jsonl" 2>/dev/null | FS="$EVAL_SENDER/vf0>$EVAL_RECEIVER/vf0|rdma" python3 -c "
+import sys, json, os
+key = os.environ['FS']
 vals = []
 for line in sys.stdin:
     try: r = json.loads(line)
     except ValueError: continue
-    v = (r.get('r') or {}).get('sgpu01/vf0>sgpu02/vf0|rdma')
+    v = (r.get('r') or {}).get(key)
     if v: vals.append(v/1e9)
 print(round(sum(vals[-40:])/max(len(vals[-40:]),1), 2) if vals else 99)")
   wait
-  scp -q "$REPO/config/lab-registry.json" hpft-dpu:/opt/hpft/lab-registry.json
-  scp -q "$REPO/config/lab-registry.json" hpft-dpu2:/opt/hpft/lab-registry.json
+  reg_restore
   traffic_clear
   echo "rp_fresh: wire ${late}G after 20G->8G step (want <9.5)"
   python3 -c "import sys; sys.exit(0 if float('$late') < 9.5 else 1)"
@@ -146,19 +172,22 @@ print(round(sum(vals[-40:])/max(len(vals[-40:]),1), 2) if vals else 99)")
 
 # ---- traffic ----------------------------------------------------------
 traffic_clear() {
-  ssh sgpu02 'pkill -f "ib_write_[b]"; pkill -f "iperf[3]"; true' 2>/dev/null || true
+  for h in $EVAL_RECEIVER $EVAL_SENDERS; do
+    [ "$h" = "$(hostname)" ] && continue
+    ssh "$h" 'pkill -f "ib_write_[b]"; pkill -f "iperf[3]"; true' 2>/dev/null || true
+  done
   pkill -f "ib_write_b[w]" 2>/dev/null || true
   sleep 1
 }
 rdma_server() {     # rdma_server <mlx5_N> <port> <qps> <dur>
-  ssh -f sgpu02 "nohup $PT -d $1 -p $2 -q $3 --report_gbits -D $4 >/tmp/eval_rs_$2.log 2>&1"
+  ssh -f "$EVAL_RECEIVER" "nohup $PT -d $1 -p $2 -q $3 --report_gbits -D $4 >/tmp/eval_rs_$2.log 2>&1"
 }
 rdma_client() {     # rdma_client <mlx5_N> <port> <qps> <dur> <dst_ip> <log> [extra...]
   local d=$1 p=$2 q=$3 dur=$4 ip=$5 log=$6; shift 6
   "$PT" -d "$d" -p "$p" -q "$q" --report_gbits -D "$dur" "$@" "$ip" > "$log" 2>&1
 }
 tcp_server() {      # tcp_server <port>
-  ssh -f sgpu02 "nohup $IPERF -s -p $1 >/tmp/eval_is_$1.log 2>&1"
+  ssh -f "$EVAL_RECEIVER" "nohup $IPERF -s -p $1 >/tmp/eval_is_$1.log 2>&1"
 }
 tcp_client() {      # tcp_client <port> <flows> <dur> <src_vf_idx> <dst_ip> <json_out>
   "$IPERF" -c "$5" -p "$1" -P "$2" -t "$3" -J -B "10.1.$4.1%dpu1vf$4" > "$6" 2>&1
@@ -169,21 +198,28 @@ tcp_client_cc() {   # same + 7th arg: congestion control (reno|cubic|bbr)
 
 # ---- sampling / counters ----------------------------------------------
 vpm_start() {       # vpm_start <dur_s> <interval_ms> -> remote csv /tmp/eval_vpm.csv
-  scp -q "$REPO/tools/dpu/vpm_sample.py" hpft-dpu2:/tmp/vpm_sample.py
-  ssh -f hpft-dpu2 "nohup python3 /tmp/vpm_sample.py $1 /tmp/eval_vpm.csv ${2:-1000} >/dev/null 2>&1"
+  scp -q "$REPO/tools/dpu/vpm_sample.py" "$(_dpu_of $EVAL_RECEIVER):/tmp/vpm_sample.py"
+  ssh -f "$(_dpu_of $EVAL_RECEIVER)" "nohup python3 /tmp/vpm_sample.py $1 /tmp/eval_vpm.csv ${2:-1000} >/dev/null 2>&1"
 }
-vpm_grab() { scp -q hpft-dpu2:/tmp/eval_vpm.csv "$1/${2}_vpm.csv" 2>/dev/null || true; }
-armstat_start() {   # armstat_start <host:hpft-dpu|hpft-dpu2> <dur>
+vpm_grab() { scp -q "$(_dpu_of $EVAL_RECEIVER):/tmp/eval_vpm.csv" "$1/${2}_vpm.csv" 2>/dev/null || true; }
+armstat_start() {   # armstat_start <dpu alias> <dur>
   scp -q "$REPO/tools/dpu/arm_stat.py" "$1":/tmp/arm_stat.py
   ssh -f "$1" "nohup python3 /tmp/arm_stat.py --duration $2 >/tmp/eval_armstat.csv 2>/dev/null"
 }
 armstat_grab() { scp -q "$2":/tmp/eval_armstat.csv "$1/${3}_armstat_${2}.csv" 2>/dev/null || true; }
 counters_snap() {   # counters_snap <outfile>  (receiver IB + p1 phy + CNP set)
-  { ssh sgpu02 'for c in port_rcv_data np_ecn_marked_roce_packets np_cnp_sent out_of_buffer; do
-      echo "rx_$c $(cat /sys/class/infiniband/mlx5_3/ports/1/hw_counters/$c 2>/dev/null || cat /sys/class/infiniband/mlx5_3/ports/1/counters/$c 2>/dev/null)"; done'
+  # The PF's rdma device index is not the same on every machine, so it is
+  # resolved from the registry's vnic list rather than pinned to mlx5_3.
+  local RPF SPF
+  RPF=$(ssh "$EVAL_RECEIVER" "readlink -f /sys/class/net/dpu1vf0/device/physfn 2>/dev/null | xargs -r basename")
+  RPF=$(ssh "$EVAL_RECEIVER" "for d in /sys/class/infiniband/*; do [ \"\$(basename \$(readlink -f \$d/device))\" = \"$RPF\" ] && basename \$d && break; done")
+  SPF=$(for d in /sys/class/infiniband/*; do
+          [ -e "$d/device/net/dpu1vf0" ] || continue; done; echo mlx5_3)
+  { ssh "$EVAL_RECEIVER" 'for c in port_rcv_data np_ecn_marked_roce_packets np_cnp_sent out_of_buffer; do
+      echo "rx_$c $(cat /sys/class/infiniband/'"${RPF:-mlx5_3}"'/ports/1/hw_counters/$c 2>/dev/null || cat /sys/class/infiniband/'"${RPF:-mlx5_3}"'/ports/1/counters/$c 2>/dev/null)"; done'
     for c in rp_cnp_handled rp_cnp_ignored; do
-      echo "tx_$c $(cat /sys/class/infiniband/mlx5_3/ports/1/hw_counters/$c 2>/dev/null)"; done
-    echo "p1_rx_phy $(ssh hpft-dpu2 "ethtool -S p1 | awk '/rx_bytes_phy:/{print \$2}'")"
+      echo "tx_$c $(cat /sys/class/infiniband/${SPF:-mlx5_3}/ports/1/hw_counters/$c 2>/dev/null)"; done
+    echo "p1_rx_phy $(ssh "$(_dpu_of $EVAL_RECEIVER)" "ethtool -S p1 | awk '/rx_bytes_phy:/{print \$2}'")"
   } > "$1"
 }
 stamp() { date +%s.%N > "$1"; }   # host stamp: coarse bookkeeping ONLY,

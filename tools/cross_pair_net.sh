@@ -10,15 +10,22 @@
 # foreign subnets.
 #
 # Usage: bash cross_pair_net.sh apply|revert|status
-# Run on each host (sgpu01: last octet .1, sgpu02: last octet .2). Not
-# persistent across reboot - reapply after host reboot.
+# Run on each host. Not persistent across reboot - reapply after host reboot.
 set -u
+REPO=/home/zhaoxiang/hyperfront/hpft-implementation
 
-case "$(hostname)" in
-    sgpu01) OCT=1 ;;
-    sgpu02) OCT=2 ;;
-    *) echo "unknown host $(hostname)"; exit 1 ;;
-esac
+# The host's last octet is its VF addressing, and that is in the registry;
+# with four machines a case list here would just be a second copy of it that
+# nobody remembers to extend.
+OCT=$(python3 -c "
+import json, socket, sys
+r = json.load(open('$REPO/config/lab-registry.json'))
+me = socket.gethostname()
+ips = [v['ip'] for v in r['vnics'] if v['host'] == me]
+if not ips: sys.exit('cross_pair_net: %s has no vnics in the registry' % me)
+oct4 = {ip.split('.')[-1] for ip in ips}
+if len(oct4) != 1: sys.exit('cross_pair_net: %s vnics do not share a last octet' % me)
+print(oct4.pop())") || exit 1
 
 cmd=${1:-status}
 for i in 0 1 2 3; do

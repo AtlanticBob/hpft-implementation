@@ -181,6 +181,7 @@ done
 # exactly the files below, kept identical to it.
 HOST_FILES="tools/host/hpft_pace_shim.py tools/host/qpn_resolver.py
             tools/host/edt_ensure.sh tools/host/edt_maps_ensure.sh
+            tools/lab-infra/vf_setup.sh tools/cross_pair_net.sh
             tools/tcp_shaper/tools/tcp_shaper_lib.py tools/tcp_shaper/tools/tcp-shaper-apply
             tcp/bpf-opt3/hpft_tcp_edt_kern.o tcp/bpf-opt3/hpft_tcp_edt_kern.c
             tcp/bpf-opt3/hpft_bpf_helpers.h tools/dpu-timesync.sh

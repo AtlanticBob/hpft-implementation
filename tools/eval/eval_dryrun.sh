@@ -4,6 +4,7 @@
 # Verifies: registry push/restore, stack restart, traffic helpers, vpm +
 # armstat sampling, counters snap, collection, quick Jain analysis.
 set -eu
+RDPU=${RDPU:-$(python3 -c "import json;r=json.load(open('/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-registry.json'));print({n['host']:n['dpu'] for n in r['nodes']}[r['receiver_host']])")}
 REPO=/home/zhaoxiang/hyperfront/hpft-implementation
 . "$REPO/tools/eval/eval_lib.sh"
 D=${1:-/tmp/eval_dryrun}; mkdir -p "$D"
@@ -15,7 +16,7 @@ stack_restart
 traffic_clear
 counters_snap "$D/ctr_pre"
 vpm_start $((DUR+8)) 50
-armstat_start hpft-dpu2 $((DUR+8))
+armstat_start "$RDPU" $((DUR+8))
 
 for j in 0 1 2 3; do rdma_server mlx5_$((6+j)) $((28100+j)) 4 $DUR; tcp_server $((5480+j)); done
 sleep 2; stamp "$D/t0"
@@ -28,7 +29,7 @@ wait; stamp "$D/t1"
 counters_snap "$D/ctr_post"
 agents_grab "$D" cell
 vpm_grab "$D" cell
-armstat_grab "$D" hpft-dpu2 cell
+armstat_grab "$D" "$RDPU" cell
 traffic_clear
 
 python3 - "$D" <<'EOF'
@@ -48,7 +49,7 @@ rd=sum(v for f,v in means.items() if f.endswith("rdma")); tc=tot-rd
 print(f"dryrun: fs={len(vals)} agg={tot/G:.1f}G Jain={jain:.4f} rdma:tcp={rd/G:.1f}:{tc/G:.1f}")
 import csv, os
 vpm=sum(1 for _ in open(f"{D}/cell_vpm.csv")) if os.path.exists(f"{D}/cell_vpm.csv") else 0
-arm=sum(1 for _ in open(f"{D}/cell_armstat_hpft-dpu2.csv")) if os.path.exists(f"{D}/cell_armstat_hpft-dpu2.csv") else 0
+arm=sum(1 for _ in open(f"{D}/cell_armstat_{os.environ.get('RDPU','hpft-dpu2')}.csv")) if os.path.exists(f"{D}/cell_armstat_{os.environ.get('RDPU','hpft-dpu2')}.csv") else 0
 print(f"artifacts: vpm_rows={vpm} armstat_rows={arm} "
       f"ctr={'ok' if os.path.getsize(f'{D}/ctr_post')>0 else 'MISSING'}")
 EOF

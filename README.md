@@ -48,8 +48,8 @@ TSO 突发风暴。
 DPU mode 并刷成与现役同版的 BFB（固件 32.49.1014）。overlay 是**以接收端为中心
 的星型**——一个桥上的 VxLAN 全互联没有 split-horizon，会成环并串学 MAC；星型无环，
 每条 sender→receiver 都是直达隧道，spoke 之间经 hub 的 eswitch 硬件转发也是线速。
-三打一的 RDMA incast 实测：6 个流集合、2 个目的 VM，各判 20.00G，实测总
-112.7G、Jain 0.9988。
+三打一的 RDMA incast 实测：12 个流集合（3 发送端 × 4 直连对）打 4 个目的 VM，
+**根层绑定**，各判 15.33G（C′≈184G ÷ 12），实测总 175.8G、**Jain 1.0000**。
 
 **数据面自 2026-07-29 起常驻泛化 VxLAN overlay**（P0 定案，见
 `results/p0_overlay_20260729/summary.md`）：两台 DPU 的 p1 直配 underlay
@@ -99,16 +99,22 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
 
 - PCC device 码（`tools/dpu/pcc/`）改完要
   `meson setup --reconfigure build && ninja -C build pcc/doca_pcc`
-  （在 hpft-dpu 上）才会真正生效——`ninja` 单独不重编设备码（dpacc 是
-  configure 步），改完不重编是常见坑。
+  **在每一台 DPU 上**才会真正生效——`ninja` 单独不重编设备码（dpacc 是
+  configure 步）。`deploy_check.sh --deploy` 会在源码变化的节点上自动做这件事，
+  手工改的话四台都要做。
 - **重启发送端 agent 必须一并重启该节点的 RP**（`bash /opt/hpft/rp_service.sh
   start`）。tx agent 被换掉之后 RP 仍然收预算、仍然按 `0xdeb` 回读出正确的
   level，但不再把速率作用到线上——20G 授权实测跑 52.9G，重启 RP 后同一授权
   变 18.5G。`tools/lab-infra/roles.sh` 已经按这个顺序编排（RP 先、agent 后），
   手工起 agent 时要自己补。
-- **RDMA 源 vf1 与 vf2 的 flowtag 相同**，不能同时作为源调度：两者的预算在 RP
-  里不可分离，同时跑会让整组流集合被错误配速（12 流场景实测总吞吐塌到 4.7G）。
-  这是 flowtag 只哈希 function 索引的后果，**每个发送节点一视同仁**。
+- **RDMA 源 vf1 与 vf2 打同一个目的时 flowtag 相同**，那一对预算在 RP 里不可
+  分离，不能同时调度。**只在目的相同时成立**：直连对 vf_i→vf_i 的四个 tag 互不
+  相同（0x74249a41 / 0x11f4386b / 0xde985a90 / 0x7973f1b0），照常并跑。这是
+  flowtag 只哈希 function 索引的后果，**每个发送节点一视同仁**。
+- **每场实验开跑前重启 RP**。执行面会随时间/跨实验失去限速能力（表现同上一条：
+  预算照收、level 照读、就是不作用到线上）。`incast8_regression.sh` 和
+  `cc_mode.sh pcc` 一直是这么做的，`roles.sh set` 也是；手工起流之前要自己补
+  一次 `roles.sh set` 或 `rp_service.sh start`。
 - TCP shaper 叫 "host fq+edt"；DPU 侧 TCP 卸载已暂停（架构性负结论：
   OVS 占据 representor ingress，没有既透明又保持 pacing 语义的挂载点），
   除非用户重提不要重启。
@@ -120,6 +126,30 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
   重启会丢，`rx_agent`/`cc_mode.sh` 的恢复流程会自动重装，不要手工删。
 - lab 默认停留态、切换 CC 模式：`tools/cc_mode.sh status`/`dcqcn`/`pcc`
   （用法见脚本头注释）。
+
+## 怎么跑实验
+
+四节点上开跑一场实验的完整顺序（每一步都幂等）：
+
+```bash
+tools/reboot_recover.sh                       # 只在 DPU 重启/fw reset 之后需要
+tools/lab_env.sh hpft                         # 环境：PCC+HPFT（plain / jakiro / ztr 同理）
+tools/lab-infra/roles.sh set --receiver sgpu02 --senders sgpu01,sgpu03,sgpu04
+tools/lab-infra/deploy_check.sh               # 必须通过，否则数据无意义
+tools/lab-infra/flow_preflight.sh "0,0 1,1 2,2 3,3" sgpu03 sgpu02   # 每个发送端各验一次
+tools/tests/incast8_regression.sh <tag> --receiver sgpu02 --senders sgpu01,sgpu03,sgpu04
+python3 tools/tests/analyze_incast8.py <tag>
+```
+
+`roles.sh` 和 `deploy_check.sh` 的默认节点集都来自 registry 的 `nodes`；
+`incast8_regression.sh`、`flow_preflight.sh`、`eval_lib.sh` 不带参数时退回
+registry 的 `sender_host`/`receiver_host`，所以历史上的两节点跑法原样可用。
+评估战役的 runner 通过环境变量 `EVAL_RECEIVER` / `EVAL_SENDERS` 选节点。
+
+**读结果**：`analyze_incast8.py` 按**类内**和**按目的 VM** 报公平性，不是一个
+扁平 Jain——类权重把每个目的 VM 在 TCP 与 RDMA 之间对半分，所以当两类的发送端
+数量不同时，发送端少的那一类每条流**本来就该**拿得多；扁平 Jain 会把正确的策略
+行为报成不公平。
 
 ## 代码地图
 
@@ -137,8 +167,12 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
   import。第一代实现的 `-controller` 与 `-update-rate` 两个 CLI 已删：
   控制环归 `tx_agent_e`、速率下发归 pace-shim 的 `DirectBpfMapWriter`，
   两者全仓无人调用。
-- `tools/lab-infra/vf_setup.sh` —— VF 重建脚本（`cc_mode.sh` 的
-  `post_recover` 调用）。
+- `tools/lab-infra/vf_setup.sh` —— VF 重建，registry 驱动（PF 地址、VF 功能、
+  IP 都从两个 registry 读，四台机器同一份脚本）。
+- `tools/lab-infra/overlay.sh` —— 常驻 VxLAN overlay 的唯一实现：**以接收端为
+  中心的星型**，幂等，`--teardown` 回到直连数据面。`lab_env.sh` 调它。
+- `tools/reboot_recover.sh` —— DPU 重启/fw reset 之后恢复易失状态：VF、TCP EDT、
+  p1 的 200G/MTU/underlay+遥测 IP/ARP 全互联/PFC。**链路速率是断言而非假设**。
 - `tools/lab-infra/roles.sh` —— 角色编排：`set --receiver <host>
   [--senders h1,h2]` / `status` / `stop`。每台 DPU 装的是同一份载荷（收发两侧
   都有），谁当接收端是**每场实验的决定**，不是节点的属性。它按正确顺序拉起
@@ -154,7 +188,9 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
 - `tools/lab-infra/flow_preflight.sh` / `flow_postflight.py` —— 流对可用性
   守卫。RC 的错误完成是**终态**，被打死的 QP 不会自己回来，而每一层都
   还在报健康——这是几次实验产出"看起来正常但结论是错的"数据的原因。
-- `tools/cc_mode.sh` —— lab CC 模式切换（DCQCN ↔ PCC+HPFT，GBN ↔ SR）。
+- `tools/cc_mode.sh` —— lab CC 模式切换（DCQCN ↔ PCC+HPFT，GBN ↔ SR），四节点，
+  每台的 PF 地址从 registry 读；角色编排交给 `roles.sh`，易失状态恢复交给
+  `reboot_recover.sh`。
 - `tools/lab_env.sh` —— 三套实验环境一键切换（`hpft` 生产栈 / `plain`
   固件 DCQCN 基线 / `jakiro` VxLAN+DHTB），编排 cc_mode.sh + 拓扑装拆；
   用法与"fw reset 不清 OVS"等坑见头注释与 `hpft-design` 的 ops_notes.md。

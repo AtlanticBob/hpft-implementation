@@ -71,6 +71,7 @@ start_sender() { # $1 = host
   ssh -o BatchMode=yes "$d" "bash /opt/hpft/rp_service.sh start" >/dev/null 2>&1 \
     || echo "  WARN $h ($d): RP restart failed - the executor will not pace"
   ssh -o BatchMode=yes "$d" "sudo systemctl reset-failed hpft-txagent-e 2>/dev/null
+    sudo rm -f /tmp/hpft_txagent_e.jsonl
     sudo systemd-run --unit hpft-txagent-e /usr/bin/python3 /opt/hpft/tx_agent_e.py --local-host $h" >/dev/null 2>&1 \
     && echo "  sender    $h ($d): RP + txagent --local-host $h" || echo "  FAILED sender $h ($d)"
   # Two host-side services, both required for a sender to actually be one:
@@ -125,6 +126,12 @@ case "${1:-status}" in
     # shrink the lab back to the pair it used to be.
     [ -n "$SENDERS" ] || SENDERS=$(for h in $(all_hosts); do [ "$h" = "$RECV" ] || echo -n "$h "; done)
     echo "== roles: receiver=$RECV senders=$SENDERS =="
+    # Re-hub the overlay onto whoever receives. The star's hub carries every
+    # spoke-to-spoke frame, so a hub that is not the receiver turns the hub's
+    # uplink into the experiment's real bottleneck while the receiver's link
+    # sits idle - the measurement would be of the wrong link. Idempotent, so
+    # this is a no-op when the receiver has not changed.
+    bash "$REPO/tools/lab-infra/overlay.sh" --hub "$RECV" >/dev/null
     stop_all
     RECEIVER=$RECV
     start_receiver "$RECV"
