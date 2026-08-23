@@ -212,18 +212,18 @@ check("F3 ascent is immediate",
 
 
 def _meter(mix, unmeasured, prev_ents, r_d, by_dst):
-    m = rx_agent.HybridRates.__new__(rx_agent.HybridRates)
+    # Run the real constructor and override what the case under test needs.
+    # Building this with __new__ and hand-setting a subset meant the helper
+    # broke every time HybridRates gained a field, silently taking the
+    # receiver's decision logic out of test coverage until someone ran it.
+    m = rx_agent.HybridRates({}, 2.0)
     m.mix_shares, m.unmeasured, m.prev_ents = mix, set(unmeasured), prev_ents
     m.r_d, m.by_dst, m.meter = r_d, by_dst, None
-    m.unattributed = 0.0
-    m.host_seen, m.host_ring = {}, {}
     return m
 
 
 def mix_of(members_bytes, window=2.0, now=100.0):
-    m = rx_agent.HybridRates.__new__(rx_agent.HybridRates)
-    m.window, m.hist, m.first_seen = window, [], {}
-    m.mix_shares, m.by_dst, m.unmeasured = {}, {}, set()
+    m = rx_agent.HybridRates({}, window)
     m.update_mix(members_bytes, list(members_bytes), now)
     return m
 

@@ -80,7 +80,11 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
 `docs/design.md` §3.4/§4.2/§6 与 `docs/design_theory.md`；离线验收
 （wire 往返 + 三条收敛闭式 + 账本自愈）跑
 `tools/tests/law_check.py`，执行面与 CC 的合成（棘轮的 CC 仍拿满份额、
-归因、上限、标定无关性）跑 `tools/tests/couple_check.py`。
+归因、上限、标定无关性）跑 `tools/tests/couple_check.py`。`tools/tests/`
+下另有四组不需要 lab 的离线检查，都能直接跑：`rx_check.py`（接收端的
+判定逻辑）、`loop_dryrun.py`（tx_agent_e 对合成遥测跑整环）、
+`fastfill_test.py`（C 与 Python 分配器对拍）、`hw_maxrate_test.py`
+（硬件层单位）。
 
 ## 硬性规则
 
@@ -111,11 +115,11 @@ $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步格式，必
   采样常驻进程（`hpft-vport-meter` systemd unit）。
 - `tools/dpu/pcc/` —— DOCA PCC device 代码（RDMA 执行面，跑在 DPA 上）。
 - `tools/host/hpft_pace_shim.py` —— host 侧 BPF 写入桥（sgpu01）。
-- `tools/tcp_shaper/` —— TCP shaper 库+CLI（`tcp_shaper_lib.py`、
-  `tcp-shaper-apply`/`-controller`/`-update-rate`），`hpft_pace_shim.py`、
-  `hpft-unified-controller`、几个 `tools/tcp_*` 脚本都从这里 import；
-  原是第一代实现（`hpft-exp-deprecated`）的一部分，2026-07-23 完整迁移
-  进本仓库，源码原样保留。
+- `tools/tcp_shaper/` —— TCP shaper 库 + 装载工具（`tcp_shaper_lib.py`、
+  `tcp-shaper-apply`）。`hpft_pace_shim.py` 和 `deploy_check.sh` 从库里
+  import。第一代实现的 `-controller` 与 `-update-rate` 两个 CLI 已删：
+  控制环归 `tx_agent_e`、速率下发归 pace-shim 的 `DirectBpfMapWriter`，
+  两者全仓无人调用。
 - `tools/lab-infra/vf_setup.sh` —— VF 重建脚本（`cc_mode.sh` 的
   `post_recover` 调用）。
 - `tools/lab-infra/deploy_check.sh` —— **跑实验前必过**：repo 与两台 DPU
