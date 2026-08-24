@@ -1051,6 +1051,58 @@ class VQMarker:
         return marks
 
 
+class VirtualQueueScheduler:
+    """The virtual hierarchical fair scheduler (redesign proposal §1).
+
+    Each flow-set owns a virtual queue Q_f (bits). Per period: this
+    period's arrival is enqueued, the policy tree hands out C'*T of
+    service to the queues that have something in them (weighted
+    max-min, caps respected, unused service passed to siblings - exactly
+    what an HTB-style scheduler would do), and every queue loses what it
+    was served. The demand fed to the water-filling is therefore the
+    BACKLOG, Q_f/T + r_f, not an estimate of appetite: a flow-set with a
+    backlog is contending, one without is served what it sends. There is
+    no delta ratchet, no saturation test, no hysteresis.
+
+    Outputs per flow-set: e_f (service rate this period), g_f (the
+    scheduler's share hint - what f would be served if its queue were
+    unbounded, siblings as they are; it never depends on f's own rate)
+    and d_f = Q_f / g_f, the virtual queueing delay in seconds - the
+    unfairness signal, scale-free by construction. Q_f is clipped at
+    d_clip * g_f: the queue is a bounded memory of recent excess, not a
+    debt.
+    """
+
+    def __init__(self, sched, d_clip_s):
+        self.sched = sched
+        self.q = {}                 # fsid -> bits
+        self.d_clip = d_clip_s
+
+    def step(self, active, rates, dt):
+        demand = {f: self.q.get(f, 0.0) / dt + rates.get(f, 0.0)
+                  for f in active}
+        ents, ceils = self.sched.entitlements(active, demand)
+        delay = {}
+        for f in active:
+            r = rates.get(f, 0.0)
+            e = ents.get(f, 0.0)
+            g = ceils.get(f, e)
+            q = self.q.get(f, 0.0) + (r - e) * dt
+            if g > 0:
+                q = min(max(q, 0.0), self.d_clip * g)
+            else:
+                q = 0.0
+            if q <= 0:
+                self.q.pop(f, None)
+                delay[f] = 0.0
+            else:
+                self.q[f] = q
+                delay[f] = q / g
+        for f in [f for f in self.q if f not in active]:
+            del self.q[f]
+        return ents, ceils, delay
+
+
 # receiver-host rate exporter wire format (hpft_rate_exporter.py):
 #   header '<HH' = (seq_lo16, n_records)
 #   record '<16sQQ' = (vnic_id[16], rx_bytes, t_host_monotonic_ns)
@@ -1079,7 +1131,10 @@ class Telemetry:
     from the registry, so the shim leg is currently inert."""
 
     HDR = struct.Struct("<HH")
-    REC = struct.Struct("<64sQQ")
+    # (fsid, g_bps, r_bps, d_us): g is the share hint / target, r the
+    # measured arrival, d the virtual queueing delay in microseconds
+    # (0 under the tracking law, where the audit is folded into g=u).
+    REC = struct.Struct("<64sQQQ")
 
     def __init__(self, vnic_host, telemetry_ip, port, shim_ip=None,
                  shim_port=None):
@@ -1099,21 +1154,22 @@ class Telemetry:
         out = [self.HDR.pack(self.seq & 0xffff, len(recs))]
         fsb = self._fsb
         pack = self.REC.pack
-        for fsid, u, r in recs:
+        for fsid, u, r, d_us in recs:
             b = fsb.get(fsid)
             if b is None:
                 b = fsb[fsid] = fsid.encode()[:64]
-            out.append(pack(b, int(u), int(r)))
+            out.append(pack(b, int(u), int(r), int(d_us)))
         return b"".join(out)
 
-    def send(self, targets, rates):
+    def send(self, targets, rates, delays=None):
         self.seq += 1
         per_dpu = {}     # dpu ip -> [records]
         per_shim = {}    # (shim ip, port) -> [tcp records]
+        delays = delays or {}
         for f, u in targets.items():
             src, cls = f.split(">")[0], f.rsplit("|", 1)[1]
             host = self.vnic_host.get(src)
-            rec = (f, u, rates.get(f, 0))
+            rec = (f, u, rates.get(f, 0), delays.get(f, 0.0) * 1e6)
             ip = self.telemetry_ip.get(host)
             if ip is not None:
                 per_dpu.setdefault(ip, []).append(rec)
@@ -1286,6 +1342,14 @@ def main():
     nticks_total = 0
     rootcong = RootCongestion()
     nodesat = NodeSaturation()
+    # LAW ARM. "track": design.md v2 (demand estimate + audit discount,
+    # target u = ceil*(1-gamma*s)). "vq": the redesign - backlog-fed
+    # virtual scheduler, wire carries {g, r, d}.
+    law = ep.get("law", "track")
+    vqs = VirtualQueueScheduler(sched, ep.get("d_clip_s", 0.2))
+    delays = {}
+    print("rx_agent: law=%s%s" % (law, "  d_clip=%.0fms" % (
+        ep.get("d_clip_s", 0.2) * 1e3) if law == "vq" else ""), flush=True)
     last_speed = c_link
     sched.set_downlink(c_link)
 
@@ -1405,8 +1469,14 @@ def main():
             # Hysteresis (enter 0.95, leave 0.85) keeps the two regimes
             # from chattering when a genuinely small flow leaves capacity
             # unused and utilisation drops back.
+            if law == "vq":
+                ents, ceils, delays = vqs.step(active, sched_rates, dt)
+                hybrid.prev_ents = ents
+                marks = {}
+                targets = {f: ceils.get(f, ents.get(f, 0.0)) for f in active}
+                telem.send(targets, sched_rates, delays)
             root_congested = rootcong.update(sum(active.values()),
-                                             sched.c_root)
+                                             sched.c_root) if law != "vq" else False
             # Every node of the policy tree that is at its capacity, not
             # just the root. A dst VM at its MaxRate saturates the node its
             # senders share, so all of them are contending - and this test
@@ -1414,17 +1484,19 @@ def main():
             # is, the SUM of the estimates is the exact vport total.
             sat = nodesat.update(active, {
                 v: p.get("max_rate_bps")
-                for v, p in sched.policy.get("vms", {}).items()})
+                for v, p in sched.policy.get("vms", {}).items()}) \
+                if law != "vq" else set()
             # a finite "big" (root capacity), NOT inf: it saturates the
             # class demand cap exactly like inf but survives int(ceil_f)
             # in the telemetry pack (inf overflows).
-            demand = demand_estimate(active, ep["delta_demand"],
-                                     sched.c_root, root_congested,
-                                     saturated_dsts=sat)
-            ents, ceils = sched.entitlements(active, demand)
-            # the split prior for the next tick (see HybridRates.rates)
-            hybrid.prev_ents = ents
-            marks = marker.step(sched_rates, ents, ceils, dt)
+            if law != "vq":
+                demand = demand_estimate(active, ep["delta_demand"],
+                                         sched.c_root, root_congested,
+                                         saturated_dsts=sat)
+                ents, ceils = sched.entitlements(active, demand)
+                # the split prior for the next tick (see HybridRates.rates)
+                hybrid.prev_ents = ents
+                marks = marker.step(sched_rates, ents, ceils, dt)
             # §3.4 target synthesis: the policy ceiling discounted by the
             # audited sustained excess. Bounded by construction - no
             # excess leaves the target AT the ceiling, saturated excess
@@ -1442,10 +1514,11 @@ def main():
             # dead control channel, which is a positive feedback into
             # fail-open. Iterate `active` (present in the flow table, plus
             # the membership grace) and default an absent mark to 0.
-            targets = {f: ceils.get(f, ents.get(f, 0.0))
-                          * (1.0 - gamma * marks.get(f, 0.0))
-                       for f in active}
-            telem.send(targets, sched_rates)
+            if law != "vq":
+                targets = {f: ceils.get(f, ents.get(f, 0.0))
+                              * (1.0 - gamma * marks.get(f, 0.0))
+                           for f in active}
+                telem.send(targets, sched_rates)
 
         # throttled logging (default ~50 Hz), never every 1ms tick
         if nticks_total % log_every == 0 and nticks_total:
@@ -1466,7 +1539,10 @@ def main():
                    "e": {f: int(v) for f, v in ents.items()},
                    "c": {f: int(v) for f, v in ceils.items()},
                    "s": {f: round(v, 4) for f, v in marks.items()},
-                   "vq": {f: int(v) for f, v in marker.vq.items()}}
+                   "vq": {f: int(v) for f, v in marker.vq.items()},
+                   # vq law: virtual queueing delay (ms) per flow-set
+                   "d": {f: round(v * 1e3, 3) for f, v in delays.items()
+                         if v > 0}}
             logf.write(json.dumps(rec) + "\n")
 
         _tick_us = (time.monotonic() - now) * 1e6
@@ -1494,10 +1570,11 @@ def main():
 
         nticks_total += 1
         if now - last_print >= 1.0:
-            act = " ".join("%s r=%.2fG u=%.2fG s=%.2f"
+            act = " ".join("%s r=%.2fG u=%.2fG s=%.2f d=%.1fms"
                            % (f, rates.get(f, 0) / 1e9,
-                              targets.get(f, 0) / 1e9, marks.get(f, 0))
-                           for f in sorted(marks) if rates.get(f, 0) > 0)
+                              targets.get(f, 0) / 1e9, marks.get(f, 0),
+                              delays.get(f, 0) * 1e3)
+                           for f in sorted(targets) if rates.get(f, 0) > 0)
             print("t=%.0fs ticks/s=%d dump_ms=%.1f | %s"
                   % (now - t_start, nticks_total // max(int(now - t_start), 1),
                      dump_ms, act or "idle"), flush=True)

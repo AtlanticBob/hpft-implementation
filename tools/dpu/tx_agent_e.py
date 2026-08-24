@@ -44,7 +44,7 @@ FIFO = "/tmp/rp_fifo"   # PCC RP mailbox (batched: 0xb47c000N ft bud rate ...)
 # agents are deployed and restarted together or the loop parses garbage.
 # header (seq16, n) then n x (fsid[64], u_bps u64, r_bps u64)
 _THDR = struct.Struct("<HH")
-_TREC = struct.Struct("<64sQQ")
+_TREC = struct.Struct("<64sQQQ")   # (fsid, u/g bps, r bps, d us)
 
 
 def parse_telemetry(data):
@@ -57,10 +57,33 @@ def parse_telemetry(data):
     for _ in range(n):
         if off + _TREC.size > len(data):
             break
-        fb, u, r = _TREC.unpack_from(data, off)
+        fb, u, r, d_us = _TREC.unpack_from(data, off)
         off += _TREC.size
-        recs[fb.rstrip(b"\x00").decode("ascii", "ignore")] = {"u": u, "r": r}
+        recs[fb.rstrip(b"\x00").decode("ascii", "ignore")] = {
+            "u": u, "r": r, "d": d_us / 1e6}
     return seq, recs
+
+
+def vq_step(R, g, d, dt, k, eps, d_repay, phi_min, floor):
+    """THE LAW of the redesign (proposal §2 + the two optimisations).
+
+    g: the receiver's share hint (what the virtual scheduler would serve
+       this flow-set if it were backlogged); d: its virtual queueing
+       delay in seconds.
+    Queue empty (d == 0): one first-order step in log space towards
+       (1+eps)*g - a fractional jump to a known destination, not a
+       search. The destination sits eps ABOVE the share on purpose: every
+       backlogged flow-set keeps nudging its queue, so the queue, not the
+       hint, is what fixes the equilibrium.
+    Queue non-empty: cut to the rate that drains the queue with time
+       constant d_repay - R = g*(1 - d/d_repay) - but never below
+       phi_min*g in one step (executor safety: it is the ratio of a fall
+       that kills an RDMA connection, not the destination).
+    Both factors come from the signal; nothing here is a fixed step."""
+    g = max(float(g), floor)
+    if d <= 0.0:
+        return track_step(R, (1.0 + eps) * g, dt, k, floor)
+    return max(g * (1.0 - d / d_repay), phi_min * g, floor)
 
 
 def track_step(R, target, dt, k, floor):
@@ -524,6 +547,22 @@ def main():
         dt = min(max(now - st.last_step, dt_min), dt_max)
         st.last_step = now
         st.R = track_step(st.R, target, dt, k, floor)
+
+    # LAW ARM: "track" (design.md v2) or "vq" (redesign: virtual-queue
+    # signal, share hint as the climb destination, delay-proportional cut).
+    law = ep.get("law", "track")
+    vq_eps = float(ep.get("eps", 0.05))
+    vq_repay = float(ep.get("d_repay_s", 0.06))
+    vq_phi = float(ep.get("phi_min", 0.5))
+
+    def step_law(st, rec, now):
+        if law == "vq":
+            dt = min(max(now - st.last_step, dt_min), dt_max)
+            st.last_step = now
+            st.R = vq_step(st.R, rec.get("u", 0.0), rec.get("d", 0.0), dt,
+                           k, vq_eps, vq_repay, vq_phi, floor)
+        else:
+            track(st, rec.get("u", 0.0), now)
     shim = PaceShim(ctl["pace_shim"][local_host])
     # sender-liveness feed (advisory, see SenderLiveness): tells the receiver
     # which senders are actually sending, at vport freshness (~1 ms), so its
@@ -634,10 +673,10 @@ def main():
     flows = {}   # fsid -> FlowState
     last_any_rx = time.monotonic()   # last telemetry from ANY flow-set
     logf = open(args.log, "a", buffering=1)
-    print("tx_agent_e: local=%s T=%.0fms law=track k=%.1f/s (tau=%.0fms, "
+    print("tx_agent_e: local=%s T=%.0fms law=%s k=%.1f/s (tau=%.0fms, "
           "alpha@T=%.4f) failopen=%.2f/%.1fs evict=%.0fs tree=%s shim=%s "
           "log=%s"
-          % (local_host, period * 1e3, k, 1e3 / k,
+          % (local_host, period * 1e3, law, k, 1e3 / k,
              1.0 - math.exp(-k * period), n1_s, n2_s, evict_s,
              "C" if fastfill.USING_C else "python",
              ctl["pace_shim"][local_host], args.log), flush=True)
@@ -800,7 +839,7 @@ def main():
                 # Nothing guards this line: the target is not a guess, it
                 # is bounded at the receiver, so there is nothing for an
                 # increase cap or a decrease floor to protect against.
-                track(st, u, now)
+                step_law(st, rec, now)
                 st.mode = "track"
                 actuate(fsid, st, r, rdma_batch)
                 # throttled logging: on change (>1% R move or mode flip)
@@ -816,6 +855,7 @@ def main():
                     logf.write(json.dumps(
                         {"ts": round(time.time(), 4), "fs": fsid,
                          "seq": st.last_seq, "u": int(u), "r": r,
+                         "d": round(rec.get("d", 0.0) * 1e3, 3),
                          "R": int(st.R), "pace": int(st.pace),
                          "tree": int(tree_of(fsid)), "tus": tree_us,
                          "mode": st.mode}) + "\n")

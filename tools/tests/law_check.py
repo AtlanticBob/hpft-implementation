@@ -62,15 +62,16 @@ def check(name, ok, detail):
 
 # ---------------------------------------------------------------- A. wire
 tel = rx_agent.Telemetry({}, {}, 9710)
-cases = [("sgpu01/vf0>sgpu02/vf0|rdma", 6_000_000_000, 5_900_000_000),
-         ("sgpu01/vf3>sgpu02/vf1|tcp", 0, 0),
-         ("a" * 64, 199_000_000_000, 198_000_000_000)]
-blob = tel._pack([(f, u, r) for f, u, r in cases])
+cases = [("sgpu01/vf0>sgpu02/vf0|rdma", 6_000_000_000, 5_900_000_000, 12500),
+         ("sgpu01/vf3>sgpu02/vf1|tcp", 0, 0, 0),
+         ("a" * 64, 199_000_000_000, 198_000_000_000, 200000)]
+blob = tel._pack([(f, u, r, d) for f, u, r, d in cases])
 seq, recs = tx_agent_e.parse_telemetry(blob)
 ok = len(recs) == len(cases)
-for f, u, r in cases:
+for f, u, r, d in cases:
     got = recs.get(f)
-    ok = ok and got is not None and got["u"] == u and got["r"] == r
+    ok = ok and got is not None and got["u"] == u and got["r"] == r \
+        and abs(got["d"] - d / 1e6) < 1e-9
 check("A1 pack/parse round-trip", ok,
       "%d records, %d B/record, seq=%s" % (len(recs), tel.REC.size, seq))
 

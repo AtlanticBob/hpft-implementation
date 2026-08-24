@@ -64,6 +64,9 @@ reg["e_params"]["telemetry_port"] = PORT
 # than waiting, which is the only way the POSITIVE half is reachable in a
 # run this short
 reg["e_params"]["n3_evict_s"] = 0.5
+# this dry run exercises the v2 tracking arm; the vq arm has its own
+# closed-loop check (vq_check.py)
+reg["e_params"]["law"] = "track"
 reg["control"]["pace_shim"] = {"sgpu01": "127.0.0.1:%d" % SHIM_PORT}
 regpath = os.path.join(tmp, "registry.json")
 json.dump(reg, open(regpath, "w"))
@@ -109,7 +112,7 @@ t0 = time.monotonic()
 
 def feed(u, r, until):
     while time.monotonic() - t0 < until:
-        sender.sendto(tel._pack([(FS, u, r)]), ("127.0.0.1", PORT))
+        sender.sendto(tel._pack([(FS, u, r, 0)]), ("127.0.0.1", PORT))
         time.sleep(EP["period_ms"] / 1e3)
 
 
@@ -120,7 +123,7 @@ FS2 = "sgpu01/vf1>sgpu02/vf1|rdma"
 
 def feed2(u, r, until, both=True):
     while time.monotonic() - t0 < until:
-        recs = [(FS, u, r)] + ([(FS2, u, r)] if both else [])
+        recs = [(FS, u, r, 0)] + ([(FS2, u, r, 0)] if both else [])
         sender.sendto(tel._pack(recs), ("127.0.0.1", PORT))
         time.sleep(EP["period_ms"] / 1e3)
 
