@@ -1073,14 +1073,39 @@ class VirtualQueueScheduler:
     debt.
     """
 
-    def __init__(self, sched, d_clip_s):
+    def __init__(self, sched, d_clip_s, hold_s=0.0):
         self.sched = sched
         self.q = {}                 # fsid -> bits
         self.d_clip = d_clip_s
+        # Backlog hold (lab finding, vq_i8 2026-08-24): a queue that has
+        # JUST emptied belongs to a flow-set that was cut below its share
+        # a moment ago, not to one whose appetite shrank. Reading it as
+        # demand-limited for the ticks its queue is empty hands its unused
+        # share into every sibling's hint (g ran ~30% above the true share
+        # with 24 flow-sets), the siblings overshoot by that much, their
+        # queues fill fast, the cuts get violent (phi_min was hit) and
+        # the whole population limit-cycles. So a flow-set stays
+        # "backlogged" (demand = root capacity, the same finite stand-in
+        # for infinity the v2 code used) for hold_s after its queue was
+        # last non-empty, provided it is still sending. Idle (r = 0) is
+        # released at once.
+        self.hold = hold_s
+        self.last_bl = {}           # fsid -> t (monotonic) queue last > 0
+        self.held = 0
 
-    def step(self, active, rates, dt):
-        demand = {f: self.q.get(f, 0.0) / dt + rates.get(f, 0.0)
-                  for f in active}
+    def step(self, active, rates, dt, now=None):
+        big = self.sched.c_root
+        demand = {}
+        self.held = 0
+        for f in active:
+            r = rates.get(f, 0.0)
+            d = self.q.get(f, 0.0) / dt + r
+            if (self.hold > 0 and r > 0 and now is not None
+                    and now - self.last_bl.get(f, -1e9) <= self.hold
+                    and d < big):
+                d = big
+                self.held += 1
+            demand[f] = d
         ents, ceils = self.sched.entitlements(active, demand)
         delay = {}
         for f in active:
@@ -1098,8 +1123,12 @@ class VirtualQueueScheduler:
             else:
                 self.q[f] = q
                 delay[f] = q / g
+                if now is not None:
+                    self.last_bl[f] = now
         for f in [f for f in self.q if f not in active]:
             del self.q[f]
+        for f in [f for f in self.last_bl if f not in active]:
+            del self.last_bl[f]
         return ents, ceils, delay
 
 
@@ -1346,10 +1375,12 @@ def main():
     # target u = ceil*(1-gamma*s)). "vq": the redesign - backlog-fed
     # virtual scheduler, wire carries {g, r, d}.
     law = ep.get("law", "track")
-    vqs = VirtualQueueScheduler(sched, ep.get("d_clip_s", 0.2))
+    vqs = VirtualQueueScheduler(sched, ep.get("d_clip_s", 0.2),
+                                hold_s=ep.get("backlog_hold_s", 0.0))
     delays = {}
-    print("rx_agent: law=%s%s" % (law, "  d_clip=%.0fms" % (
-        ep.get("d_clip_s", 0.2) * 1e3) if law == "vq" else ""), flush=True)
+    print("rx_agent: law=%s%s" % (law, "  d_clip=%.0fms hold=%.0fms" % (
+        ep.get("d_clip_s", 0.2) * 1e3, ep.get("backlog_hold_s", 0.0) * 1e3)
+        if law == "vq" else ""), flush=True)
     last_speed = c_link
     sched.set_downlink(c_link)
 
@@ -1470,7 +1501,7 @@ def main():
             # from chattering when a genuinely small flow leaves capacity
             # unused and utilisation drops back.
             if law == "vq":
-                ents, ceils, delays = vqs.step(active, sched_rates, dt)
+                ents, ceils, delays = vqs.step(active, sched_rates, dt, now)
                 hybrid.prev_ents = ents
                 marks = {}
                 targets = {f: ceils.get(f, ents.get(f, 0.0)) for f in active}
@@ -1542,7 +1573,8 @@ def main():
                    "vq": {f: int(v) for f, v in marker.vq.items()},
                    # vq law: virtual queueing delay (ms) per flow-set
                    "d": {f: round(v * 1e3, 3) for f, v in delays.items()
-                         if v > 0}}
+                         if v > 0},
+                   "held": vqs.held}
             logf.write(json.dumps(rec) + "\n")
 
         _tick_us = (time.monotonic() - now) * 1e6
