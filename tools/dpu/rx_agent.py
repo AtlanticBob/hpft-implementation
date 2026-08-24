@@ -997,8 +997,19 @@ class VQMarker:
     makes the mark ring on for extra ticks after the excess has stopped,
     deepening the undershoot."""
 
-    def __init__(self, v_full):
+    def __init__(self, v_full, v_mode="global", v_seconds_per_share=None,
+                 v_floor=None):
         self.vq = {}            # fsid -> bits
+        # ARM SWITCH (experiment, 2026-08-24). "global": V is one constant
+        # for every flow-set, as in design.md today. "per_fs": V_f = c*ehat_f,
+        # which makes the mark scale-invariant - s is then "how many seconds
+        # of full-share excess", identical in meaning for a 1G share and a
+        # 100G one, and both zeta and omega_n stop depending on ehat. The
+        # arms exist to be measured against each other, not to be chosen from
+        # in production.
+        self.v_mode = v_mode
+        self.v_c = v_seconds_per_share      # seconds, used when per_fs
+        self.v_floor = v_floor              # bits, guards ehat -> 0
         self.set_v(v_full)
 
     def set_v(self, v_full):
@@ -1009,26 +1020,34 @@ class VQMarker:
         self.v_full = v_full    # bits at which s saturates to 1
         self.v_max = v_full     # anti-windup clip = V (§3.3)
 
+    def _v_for(self, f, ceils, ents):
+        """The full-scale this flow-set's ledger is measured against."""
+        if self.v_mode != "per_fs":
+            return self.v_full
+        ehat = ceils.get(f) or ents.get(f) or 0.0
+        return max(self.v_c * ehat, self.v_floor)
+
     def step(self, rates, ents, ceils, dt_s):
         marks = {}
         for f in set(self.vq) | set(rates):
             r = rates.get(f, 0.0)
             e = ents.get(f, 0.0)
+            vf = self._v_for(f, ceils, ents)
             if r <= 0:
                 # idle flow-set: drain fast (see module docstring)
-                nv = self.vq.get(f, 0.0) - self.v_full
+                nv = self.vq.get(f, 0.0) - vf
             elif r > e:
                 nv = self.vq.get(f, 0.0) + (r - e) * dt_s   # real excess
             else:
                 # drain by unused fair-share ceiling, not by demand-capped
                 # e_f (see Scheduler.entitlements docstring)
                 nv = self.vq.get(f, 0.0) - max(ceils.get(f, e) - r, 0.0) * dt_s
-            nv = min(max(nv, 0.0), self.v_max)
+            nv = min(max(nv, 0.0), vf)
             if nv <= 0 and r <= 0:
                 self.vq.pop(f, None)   # fully drained and idle: forget
                 continue
             self.vq[f] = nv
-            marks[f] = min(nv / self.v_full, 1.0)
+            marks[f] = min(nv / vf, 1.0)
         return marks
 
 
@@ -1217,7 +1236,18 @@ def main():
     hybrid.liveness = liveness
     sched = Scheduler(reg["policy"], line, ep["headroom"], ep["delta_demand"])
     last_seen = {}
-    marker = VQMarker(v_full)
+    # V arm (experiment): "global" is the shipping behaviour. "per_fs" sets
+    # V_f = v_seconds_per_share * ehat_f; the default c = 4*zeta^2*gamma/k at
+    # zeta = 1/sqrt(2) is exactly the seconds the shipping V corresponds to at
+    # its own design point, so the two arms differ in how V VARIES, not in its
+    # value at that point.
+    v_mode = ep.get("v_mode", "global")
+    v_c = ep.get("v_seconds_per_share") or (4 * 0.5 * gamma / ep["k"])
+    marker = VQMarker(v_full, v_mode=v_mode, v_seconds_per_share=v_c,
+                      v_floor=ep.get("v_floor_bits", 1e6))
+    print("rx_agent: V arm=%s%s" % (
+        v_mode, ("  c=%.1f ms floor=%.0f Mbit" % (v_c * 1e3, ep.get("v_floor_bits", 1e6) / 1e6))
+        if v_mode == "per_fs" else "  V=%.0f Mbit" % (v_full / 1e6)), flush=True)
     ctl = reg["control"]
     telem = Telemetry(vnic_host, ctl["telemetry_ip"], ep["telemetry_port"],
                       shim_ip=ctl.get("shim_ip"),
