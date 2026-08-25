@@ -86,6 +86,27 @@ def vq_step(R, g, d, dt, k, eps, d_repay, phi_min, floor):
     return max(g * (1.0 - d / d_repay), phi_min * g, floor)
 
 
+def mimd_factor(R, g, d, eps, beta_max, d_repay, phi_min, floor):
+    """Pure multiplicative law: the FACTOR the flow-set multiplies its rate
+    by, computed from the receiver's signal and nothing else.
+
+    up   (d == 0): beta = min((1+eps)*g / R, beta_max) - one step to the
+                   destination, capped so a single step never more than
+                   beta_max-folds the rate (what the executor and the
+                   switch buffer can absorb in one loop delay).
+    down (d > 0):  beta = max((g/R)*(1 - d/d_repay), phi_min) - land at
+                   the rate that drains the queue in d_repay, never
+                   deeper than phi_min in one step.
+    The factor is meant to be applied ONCE PER LOOP DELAY (see the
+    gating in main): applied every period it would compound 24 times on
+    the same stale signal, which is the overreaction MIMD is known for."""
+    g = max(float(g), floor)
+    R = max(R, floor)
+    if d <= 0.0:
+        return min((1.0 + eps) * g / R, beta_max)
+    return max((g / R) * (1.0 - d / d_repay), phi_min)
+
+
 def track_step(R, target, dt, k, floor):
     """THE LAW (design.md §4.2): one first-order step of R towards `target`
     in log space, over a wall-clock interval dt.
@@ -115,7 +136,7 @@ def track_step(R, target, dt, k, floor):
 class FlowState:
     __slots__ = ("R", "last_rx", "last_step", "last_seq", "mode", "pace", "r",
                  "log_R", "log_age", "log_mode", "esc_since", "esc_log",
-                 "shim_last")
+                 "shim_last", "epoch", "phase", "acts")
 
     def __init__(self, tree, now):
         self.R = tree          # optimistic start at the tree share (§4.2)
@@ -131,6 +152,9 @@ class FlowState:
         self.esc_since = 0.0   # executor-escape tripwire: since when r >> pace
         self.esc_log = 0.0     # last escape alarm emitted
         self.shim_last = 0.0   # last TCP rate push to the host shim
+        self.epoch = -1        # mimd gating: last epoch index acted in
+        self.phase = 0.0       # mimd gating: per-flow-set phase offset (s)
+        self.acts = 0          # mimd: multiplicative steps taken
 
 
 def waterfill(capacity, items):
@@ -555,8 +579,42 @@ def main():
     vq_repay = float(ep.get("d_repay_s", 0.06))
     vq_phi = float(ep.get("phi_min", 0.5))
 
-    def step_law(st, rec, now):
-        if law == "vq":
+    # Pure-factor MIMD arm. gate_s is the loop delay: one multiplicative
+    # step per gate per flow-set. mi_gate selects HOW the once-per-delay
+    # rule is enforced:
+    #   phase  - deterministic: epochs of gate_s, each flow-set offset by a
+    #            hash of its id, so the population's steps are spread over
+    #            the delay instead of landing in the same millisecond
+    #   random - sparse MI: every record acts with probability T/gate_s
+    #            (one step per delay on average, desynchronised by chance)
+    #   none   - act on every record (the overreaction control arm)
+    mimd_gate = float(ep.get("gate_s", 0.024))
+    mimd_mode = ep.get("mi_gate", "phase")
+    mimd_bmax = float(ep.get("beta_max", 2.0))
+    _rng = __import__("random").Random(0x4851)
+
+    def mimd_due(st, fsid, now):
+        if mimd_mode == "none":
+            return True
+        if mimd_mode == "random":
+            return _rng.random() < period / mimd_gate
+        if st.epoch < 0:
+            st.phase = (hash(fsid) & 0xffff) / 65536.0 * mimd_gate
+        idx = int((now + st.phase) / mimd_gate)
+        if idx == st.epoch:
+            return False
+        st.epoch = idx
+        return True
+
+    def step_law(st, rec, now, fsid=""):
+        if law == "mimd":
+            if mimd_due(st, fsid, now):
+                beta = mimd_factor(st.R, rec.get("u", 0.0), rec.get("d", 0.0),
+                                   vq_eps, mimd_bmax, vq_repay, vq_phi, floor)
+                st.R = max(st.R * beta, floor)
+                st.acts += 1
+            st.last_step = now
+        elif law == "vq":
             dt = min(max(now - st.last_step, dt_min), dt_max)
             st.last_step = now
             st.R = vq_step(st.R, rec.get("u", 0.0), rec.get("d", 0.0), dt,
@@ -673,6 +731,10 @@ def main():
     flows = {}   # fsid -> FlowState
     last_any_rx = time.monotonic()   # last telemetry from ANY flow-set
     logf = open(args.log, "a", buffering=1)
+    if law == "mimd":
+        print("tx_agent_e: mimd gate=%.0fms mode=%s beta_max=%.1f eps=%.2f "
+              "d_repay=%.0fms phi_min=%.2f" % (mimd_gate * 1e3, mimd_mode,
+              mimd_bmax, vq_eps, vq_repay * 1e3, vq_phi), flush=True)
     print("tx_agent_e: local=%s T=%.0fms law=%s k=%.1f/s (tau=%.0fms, "
           "alpha@T=%.4f) failopen=%.2f/%.1fs evict=%.0fs tree=%s shim=%s "
           "log=%s"
@@ -839,7 +901,7 @@ def main():
                 # Nothing guards this line: the target is not a guess, it
                 # is bounded at the receiver, so there is nothing for an
                 # increase cap or a decrease floor to protect against.
-                step_law(st, rec, now)
+                step_law(st, rec, now, fsid)
                 st.mode = "track"
                 actuate(fsid, st, r, rdma_batch)
                 # throttled logging: on change (>1% R move or mode flip)
@@ -856,6 +918,7 @@ def main():
                         {"ts": round(time.time(), 4), "fs": fsid,
                          "seq": st.last_seq, "u": int(u), "r": r,
                          "d": round(rec.get("d", 0.0) * 1e3, 3),
+                         "acts": st.acts,
                          "R": int(st.R), "pace": int(st.pace),
                          "tree": int(tree_of(fsid)), "tus": tree_us,
                          "mode": st.mode}) + "\n")
