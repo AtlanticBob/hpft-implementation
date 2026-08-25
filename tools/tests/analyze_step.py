@@ -67,7 +67,11 @@ def main(tag):
     if not inc or not joiner:
         print("groups: incumbents=%d joiner=%d - nothing to measure" % (len(inc), len(joiner)))
         return
-    t_join = min(first[f] for f in joiner)
+    # the joiner's two classes do not start together either (perftest's
+    # connection setup is ~1 s slower than iperf's), so "join" is per class
+    t_join_c = {c: min(first[f] for f in joiner if f.endswith(c)) for c in ("rdma", "tcp")
+                if any(f.endswith(c) for f in joiner)}
+    t_join = min(t_join_c.values())
     # the joiner's classes end at different times (iperf runs dur-2 s from
     # connect, perftest -D from its own later connect), so "leave" is per
     # class and the shared plateau ends at the EARLIER of the two
@@ -81,13 +85,14 @@ def main(tag):
 
     def cls(f):
         return f.rsplit("|", 1)[1]
-    for name, grp, share, a, b in [
-            ("incumbents down-step (join)", inc, s2, t_join, t_leave),
-            ("joiner cold start", joiner, s2, t_join, t_leave)]:
+    for name, grp, share in [
+            ("incumbents down-step (join)", inc, s2),
+            ("joiner cold start", joiner, s2)]:
         for c in ("rdma", "tcp"):
             g = [f for f in grp if cls(f) == c]
-            st = settle(rows, g, share, a, b)
-            print("  %-30s %-5s settle %s" % (name, c, "%.0f ms" % (st * 1e3) if st is not None else "never"))
+            a = t_join_c.get(c, t_join)
+            st = settle(rows, g, share, a, t_leave)
+            print("  %-30s %-5s settle %s (join at %.1fs)" % (name, c, "%.0f ms" % (st * 1e3) if st is not None else "never", a))
     # up-step: when the joiner's class c leaves, the incumbents of class c
     # go back to C'/n1 within that class (the other class is unaffected
     # until its own joiners leave)

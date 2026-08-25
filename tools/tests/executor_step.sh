@@ -30,19 +30,23 @@ print(next(v['rdma_dev'] for v in r['vnics'] if v['vnic_id']=='sgpu02/vf0'))")
 ssh -o BatchMode=yes $SDPU 'sudo systemctl stop hpft-txagent-e 2>/dev/null; true'
 ssh -o BatchMode=yes $SDPU 'bash /opt/hpft/rp_service.sh start' >/dev/null 2>&1
 sleep 2
-# the unknown-flow cap the agent would have set (20G)
-ssh -o BatchMode=yes $SDPU "echo '0xccf $(units 20e9)' > /tmp/rp_fifo"
+# the unknown-flow cap the agent would have set (per QP; 4 QPs here)
+ssh -o BatchMode=yes $SDPU "echo '0xccf $(units 5e9)' > /tmp/rp_fifo"
+# receiver-DPU clock vs this host: the rx log is stamped there
+OFF=$(for i in 1 2 3; do a=$(date +%s.%N); b=$(ssh -o BatchMode=yes $RDPU date +%s.%N); c=$(date +%s.%N); python3 -c "print($b-($a+$c)/2)"; done | sort -n | sed -n 2p)
+echo "clock offset receiver-dpu minus local: $OFF s"
 ssh -o BatchMode=yes $RCV 'pkill -f "ib_write_[b]"; true'; sleep 1
 ssh -o BatchMode=yes $RCV "setsid nohup $PT -d $DEV_R -p 27000 -q 4 --report_gbits -D 60 >/tmp/exs_srv 2>&1 </dev/null &"
 sleep 2
-t0=$(date +%s.%N); echo "$t0" > "$OUT/${TAG}_t0.txt"
-ssh -o BatchMode=yes $SND "setsid nohup $PT -d $DEV_S -p 27000 -q 4 --report_gbits -D 60 $RIP >/tmp/exs_cli 2>&1 </dev/null &"
+t0=$(python3 -c "import time;print(time.time()+$OFF)"); echo "$t0" > "$OUT/${TAG}_t0.txt"
+run_snd() { if [ "$SND" = "$(hostname)" ]; then bash -c "$1"; else ssh -o BatchMode=yes $SND "$1"; fi; }
+run_snd "setsid nohup $PT -d $DEV_S -p 27000 -q 4 --report_gbits -D 60 $RIP >/tmp/exs_cli 2>&1 </dev/null &"
 : > "$OUT/${TAG}_events.txt"
 step() { # step <at s> <bps>
-  local now; now=$(python3 -c "import time;print(time.time()-$t0)")
+  local now; now=$(python3 -c "import time;print(time.time()+$OFF-$t0)")
   local wait; wait=$(python3 -c "print(max(0,$1-$now))"); sleep "$wait"
   ssh -o BatchMode=yes $SDPU "echo '0xb47c0001 $FT $(units $2) 0' > /tmp/rp_fifo"
-  echo "$(date +%s.%N) $2" >> "$OUT/${TAG}_events.txt"
+  echo "$(python3 -c "import time;print(time.time()+$OFF)") $2" >> "$OUT/${TAG}_events.txt"
 }
 step 8 40e9; step 18 10e9; step 28 40e9; step 38 5e9; step 48 40e9
 sleep 14

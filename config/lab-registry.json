@@ -426,7 +426,8 @@
     "gate_s": 0.016,
     "beta_max": 2.0,
     "split_by_sender": true,
-    "rdma_unknown_rate_bps": 20000000000.0
+    "rdma_unknown_rate_bps": 5000000000.0,
+    "rdma_unknown_comment": "per-QP cap for RDMA flows the executor has no budget for yet (mailbox 0xccf); the DPA applies rate per QP, so a 4-QP flow-set gets 4x this"
   },
   "nodes": [
     {
