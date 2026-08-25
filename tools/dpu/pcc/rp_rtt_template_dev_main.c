@@ -179,6 +179,9 @@ static volatile uint32_t g_dq_alpha_us = 55u;               /* alpha timer, us *
 #define ZTR_CNP_DEC_FACTOR  ((1u << 16) - 2u * ZTR_UPDATE_FACTOR)
 #define ZTR_NACK_DEC_FACTOR ((1u << 16) - 5u * ZTR_UPDATE_FACTOR)
 #define HPFT_MAX_THREADS (256)
+#define HPFT_PAIR_QPS (64)          /* QPs tracked per pair for N */
+#define HPFT_QP_ACTIVE_EPOCHS (8u)  /* seen within this many epochs = active */
+#define HPFT_QP_FORGET_EPOCHS (2000u)
 
 /* byte accumulation is sharded per DPA thread (each thread owns its slot),
  * so no atomics are needed on the hot path; the epoch winner sums the shards */
@@ -218,6 +221,11 @@ typedef struct {
 					 * alone cannot show the branch working */
 	volatile uint32_t qp_count;	/* QPs sending in the last epoch */
 	volatile uint32_t qp_seen;	/* QPs counted so far in THIS epoch */
+	/* map slots of the QPs this pair has seen; N = how many of them were
+	 * seen within the last HPFT_QP_ACTIVE_EPOCHS epochs (see the epoch
+	 * block) */
+	volatile uint32_t qp_slot[HPFT_PAIR_QPS];
+	volatile uint32_t qp_nslot;
 	volatile uint32_t epoch_id;	/* bumped once per epoch, ages the map */
 	volatile uint32_t cnp_hits;	/* DIAG 2026-07-22: CNP events matched to THIS pair
 					 * (target>=0 && ev_type==ROCE_CNP), vs g_hpft_cnp_any
@@ -291,6 +299,11 @@ static volatile uint32_t g_qpn_pair[HPFT_QPMAP_SIZE]; /* pair index */
  * pair by the same ratio. Counting per epoch ages entries out for free -
  * a QP that stops sending simply stops being counted. */
 static volatile uint32_t g_qpn_epoch[HPFT_QPMAP_SIZE];
+/* the sighting before the last one: a QP counts as active only if it was
+ * seen in two different epochs within the window, which keeps a QP that
+ * raises one event every few hundred milliseconds (perftest's control QP
+ * does) from taking a full 1/N of the pair's budget for 8 ms each time */
+static volatile uint32_t g_qpn_epoch_prev[HPFT_QPMAP_SIZE];
 static volatile uint32_t g_qpn_map_active;
 static volatile uint32_t g_hpft_rtt_traces;
 static volatile uint32_t g_hpft_unknown_ft;
@@ -404,6 +417,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					c->cc_prev = DOCA_PCC_DEV_MAX_RATE;
 					c->paced = 0;
 					c->qp_count = 0;	/* relearned from events */
+					c->qp_nslot = 0;
 					c->remote_rx_rate = erx;
 					for (int s = 0; s < HPFT_MAX_THREADS; s++)
 						c->b32_shard[s] = 0;
@@ -660,7 +674,15 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	 * deployment, so the exclusion belongs in the device code.
 	 */
 	if (target >= 0 && qpn > 1) {
-		/* count this QP once per epoch */
+		/* Stamp the QP's map slot with this epoch and make sure the
+		 * pair knows the slot. N is computed at the epoch boundary as
+		 * the number of slots stamped within the last
+		 * HPFT_QP_ACTIVE_EPOCHS epochs. The earlier rule - count a QP
+		 * only if it raised an event in this epoch AND the previous
+		 * one - undercounted whenever TX events for a QP arrived less
+		 * than once per millisecond: N read 3 for a 4-QP pair about
+		 * half the time, and level = budget/3 put the pair 33% over
+		 * its budget (measured 2026-08-25, executor_step). */
 		uint32_t eid = g_hpft_pairs[target].epoch_id;
 
 		for (uint32_t pr = 0; pr < HPFT_QPMAP_PROBE; pr++) {
@@ -668,28 +690,22 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 
 			if (g_qpn_key[idx] == qpn + 1) {
 				if (g_qpn_epoch[idx] != eid) {
-					/* Count only QPs that are CONTINUOUSLY
-					 * sending: this one must also have been
-					 * seen in the immediately preceding
-					 * epoch. The level is budget/N, so a QP
-					 * that emits a handful of events per
-					 * second - a connection-management QP
-					 * alongside the data QPs - would
-					 * otherwise take a full 1/N of the
-					 * pair's allowance and never use it.
-					 * Measured 2026-07-28: one incast pair
-					 * read N=5 against four data QPs,
-					 * stably, and delivered 4/5 of its
-					 * budget - the 17% deficit that showed
-					 * up as Jain 0.996.
-					 *
-					 * A genuinely new data QP is counted
-					 * from its second epoch, i.e. 1 ms
-					 * late, which is below anything the
-					 * loop upstream can resolve.
-					 */
-					if (g_qpn_epoch[idx] + 1 == eid)
-						g_hpft_pairs[target].qp_seen++;
+					hpft_pair_t *c = &g_hpft_pairs[target];
+					uint32_t k, n = c->qp_nslot;
+					int known = 0;
+
+					if (n > HPFT_PAIR_QPS)
+						n = HPFT_PAIR_QPS;
+					for (k = 0; k < n; k++)
+						if (c->qp_slot[k] == idx) {
+							known = 1;
+							break;
+						}
+					if (!known && n < HPFT_PAIR_QPS) {
+						c->qp_slot[n] = idx;
+						c->qp_nslot = n + 1;
+					}
+					g_qpn_epoch_prev[idx] = g_qpn_epoch[idx];
 					g_qpn_epoch[idx] = eid;
 				}
 				break;
@@ -817,9 +833,27 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			/* racy claim: concurrent winners are rare and the EWMA absorbs
 			 * the occasional double-computed epoch */
 			c->epoch_ts = now;
-			if (c->qp_seen)
-				c->qp_count = c->qp_seen;
-			c->qp_seen = 0;
+			{
+				uint32_t n = c->qp_nslot, k, w = 0, act = 0;
+				uint32_t eid = c->epoch_id;
+
+				if (n > HPFT_PAIR_QPS)
+					n = HPFT_PAIR_QPS;
+				for (k = 0; k < n; k++) {
+					uint32_t idx = c->qp_slot[k];
+					uint32_t age = eid - g_qpn_epoch[idx];
+
+					if (g_qpn_key[idx] == 0 || age > HPFT_QP_FORGET_EPOCHS)
+						continue;      /* gone: drop the slot */
+					c->qp_slot[w++] = idx;
+					if (age <= HPFT_QP_ACTIVE_EPOCHS &&
+					    eid - g_qpn_epoch_prev[idx] <= HPFT_QP_ACTIVE_EPOCHS)
+						act++;
+				}
+				c->qp_nslot = w;
+				if (act)
+					c->qp_count = act;
+			}
 			c->epoch_id++;
 			{
 				uint32_t b32 = 0;
