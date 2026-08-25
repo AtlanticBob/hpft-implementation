@@ -415,7 +415,7 @@
     "mix_window_s": 2.0,
     "slow_loop_ms": 200,
     "log_every_ms": 20,
-    "rdma_push_ms": 13,
+    "rdma_push_ms": 5,
     "tcp_refresh_ms": 100,
     "rate_window_s": 0.02,
     "fs_grace_s": 0.5,
@@ -425,7 +425,8 @@
     "mi_gate": "phase",
     "gate_s": 0.016,
     "beta_max": 2.0,
-    "split_by_sender": true
+    "split_by_sender": true,
+    "rdma_unknown_rate_bps": 20000000000.0
   },
   "nodes": [
     {

@@ -43,6 +43,8 @@ CFG_FILE=config/lab-registry.json
 # stale source fails silently at full plausibility.
 PCC_SRC=tools/dpu/pcc/rp_rtt_template_dev_main.c
 PCC_DEV=/home/ubuntu/bzx/doca34-apps/pcc/device/rp/rtt_template/rp_rtt_template_dev_main.c
+PCC_HSRC=tools/dpu/pcc/pcc_host.c
+PCC_HOST=/home/ubuntu/bzx/doca34-apps/pcc/host/pcc.c
 PCC_BUILD=/home/ubuntu/bzx/doca34-apps
 
 NODES=$(python3 -c "
@@ -54,7 +56,7 @@ import json;print(' '.join(n['host'] for n in json.load(open('$CFG_FILE'))['node
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 bad=0; warn=0
 
-remote_paths() { for f in $DPU_FILES $CFG_FILE; do echo -n "/opt/hpft/$(basename "$f") "; done; echo -n "$PCC_DEV"; }
+remote_paths() { for f in $DPU_FILES $CFG_FILE; do echo -n "/opt/hpft/$(basename "$f") "; done; echo -n "$PCC_DEV $PCC_HOST"; }
 
 # ---- one round trip per node, all nodes at once -------------------------
 for n in $NODES; do
@@ -85,6 +87,10 @@ for n in $NODES; do
     echo "  DIFFERS  $n:$PCC_DEV  (rebuild: meson setup --reconfigure build && ninja -C build pcc/doca_pcc)"
     bad=1; push="$push $PCC_SRC"
   fi
+  if [ "$(want_of $PCC_HSRC)" != "$(have_of "$n" "$PCC_HOST")" ]; then
+    echo "  DIFFERS  $n:$PCC_HOST  (rebuild: ninja -C build pcc/doca_pcc)"
+    bad=1; push="$push $PCC_HSRC"
+  fi
   echo "$push" > "$TMP/$n.push"
 done
 
@@ -98,6 +104,7 @@ if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
       for f in $push; do
         case "$f" in
           "$PCC_SRC") scp -q "$f" "$n:$PCC_DEV" ;;
+          "$PCC_HSRC") scp -q "$f" "$n:$PCC_HOST" ;;
           *)          scp -q "$f" "$n:/opt/hpft/" ;;
         esac
       done
@@ -115,6 +122,12 @@ if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
         ssh -o BatchMode=yes "$n" "cd $PCC_BUILD && meson setup --reconfigure build >/dev/null 2>&1 && ninja -C build pcc/doca_pcc >/dev/null 2>&1" \
           || echo "  WARN $n: doca_pcc rebuild failed - the RUNNING executor is still the old device code" ;;
       esac
+      case " $push " in *" $PCC_HSRC "*)
+        case " $push " in *" $PCC_SRC "*) ;; *)
+          ssh -o BatchMode=yes "$n" "cd $PCC_BUILD && ninja -C build pcc/doca_pcc >/dev/null 2>&1" \
+            || echo "  WARN $n: doca_pcc host rebuild failed" ;;
+        esac ;;
+      esac
     ) &
   done
   wait
@@ -130,6 +143,7 @@ if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
       [ "$(want_of "$f")" = "$(have_of "$n" "/opt/hpft/$(basename "$f")")" ] || { echo "  STILL DIFFERS  $n:$(basename "$f")"; bad=1; }
     done
     [ "$(want_of $PCC_SRC)" = "$(have_of "$n" "$PCC_DEV")" ] || { echo "  STILL DIFFERS  $n:$PCC_DEV"; bad=1; }
+    [ "$(want_of $PCC_HSRC)" = "$(have_of "$n" "$PCC_HOST")" ] || { echo "  STILL DIFFERS  $n:$PCC_HOST"; bad=1; }
   done
 fi
 

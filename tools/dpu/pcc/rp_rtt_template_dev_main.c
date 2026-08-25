@@ -295,6 +295,14 @@ static volatile uint32_t g_qpn_map_active;
 static volatile uint32_t g_hpft_rtt_traces;
 static volatile uint32_t g_hpft_unknown_ft;
 static volatile uint32_t g_hpft_cc_algo = HPFT_CC_DCQCN;
+/* Rate for a flow whose flowtag has no pair entry yet. Was MAX_RATE (fail
+ * open): a joining RDMA flow-set ran at line rate for the ~100 ms until
+ * its first budget landed, which on a saturated receiver charged every
+ * incumbent's virtual queue with a burst it did not cause (st_vq_split,
+ * 2026-08-25). The sender agent sets this at startup (mailbox 0xccf) to a
+ * conservative allowance; without an agent it stays MAX, i.e. the old
+ * behaviour. */
+static volatile uint32_t g_hpft_unknown_rate = DOCA_PCC_DEV_MAX_RATE;
 static volatile uint32_t g_hpft_rtt_events;   /* RTT events seen, any flowtag */
 static volatile uint32_t g_hpft_rtt_unmatched; /* ... with no pair match */
 
@@ -470,6 +478,11 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 4) g_d_floor = budget;
 			else if (which == 5) g_d_recover_us = budget ? budget : 1u;
 			else if (which == 6) g_pace_pct = budget;
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		if (ft == 0xccfu) {
+			/* 0xccf <rate units>: cap for flows with no pair entry */
+			g_hpft_unknown_rate = budget ? budget : DOCA_PCC_DEV_MAX_RATE;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		if (ft == 0xdeau) {
@@ -983,7 +996,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		if ((g_hpft_fo_cnt & 1023u) == 0)
 			results->rtt_req = 1;
 	}
-	results->rate = DOCA_PCC_DEV_MAX_RATE;
+	results->rate = g_hpft_unknown_rate;
 }
 
 /*

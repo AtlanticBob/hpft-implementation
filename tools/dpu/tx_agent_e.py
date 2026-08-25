@@ -641,6 +641,11 @@ def main():
                                   _live_ip, int(ep.get("liveness_port", 9713)),
                                   local_host)
     mailbox = RpMailbox(line)
+    # Cap for RDMA flows the executor has no budget for yet (mailbox 0xccf):
+    # a joiner otherwise runs at line rate until its first budget lands.
+    unknown_bps = float(ep.get("rdma_unknown_rate_bps", 20e9))
+    _unk_units = mailbox._units(unknown_bps)
+    _unk_sent = 0.0
     flowtags = {v["vnic_id"]: int(v["flowtag"], 16)
                 for v in reg["vnics"] if "flowtag" in v}
     # per-(src,dst) flowtags for cross-pair RDMA: the tag is a stable hash of
@@ -936,6 +941,11 @@ def main():
             last_ticker = now
             maybe_reload(now)
             mailbox.ensure_open()
+            # re-assert the unknown-flow cap every 5 s (an RP restart
+            # clears it; the write is one short line)
+            if now - _unk_sent >= 5.0:
+                _unk_sent = now
+                mailbox._fifo_write("0xccf %d\n" % _unk_units)
             # Eviction, and why it is gated on telemetry being alive: a
             # flow-set going quiet and the telemetry channel dying look
             # identical from one flow-set's record stream. They are told

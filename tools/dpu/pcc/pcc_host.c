@@ -24,6 +24,9 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <time.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -187,48 +190,90 @@ int main(int argc, char **argv)
 			goto destroy_pcc;
 		}
 		PRINT_INFO("Info: HPFT rate-stdin mode ready\n");
-		while (!host_stop && fgets(line, sizeof(line), stdin) != NULL) {
-			char *cur = line, *tok_end = NULL;
-			uint32_t words[128];
-			uint32_t nw = 0;
+		/* LATEST WINS (2026-08-25). One mailbox send costs 13 ms of wall
+		 * clock idle and ~22 ms under event load (measured), while the
+		 * sender agent pushes a fresh budget snapshot every few ms.
+		 * Reading the FIFO one line per send let the pipe fill with
+		 * stale snapshots, so every budget the device saw was up to
+		 * the pipe's depth (seconds) old - the "device applies a new
+		 * budget ~12 s late" pathology in ops_notes. Each budget batch
+		 * is a complete snapshot, so only the newest one is worth
+		 * sending: block for one line, then drain everything else that
+		 * is already in the pipe; send every control line (queries,
+		 * knobs) and only the LAST budget batch. */
+		unsigned long dropped = 0;
+		int fl = fcntl(STDIN_FILENO, F_GETFL);
+		while (!host_stop) {
+			char batch[1400], ctl[16][1400];
+			int have_batch = 0, nctl = 0;
+			char more[1400];
 
-			while (nw < 128) {
-				uint32_t v = (uint32_t)strtoul(cur, &tok_end, 0);
+			fcntl(STDIN_FILENO, F_SETFL, fl & ~O_NONBLOCK);
+			if (fgets(line, sizeof(line), stdin) == NULL)
+				break;
+			fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK);
+			for (;;) {
+				unsigned long w0 = strtoul(line, NULL, 0);
 
-				if (tok_end == cur)
+				if ((w0 & 0xffff0000ul) == 0xb47c0000ul) {
+					if (have_batch)
+						dropped++;
+					memcpy(batch, line, sizeof(batch));
+					have_batch = 1;
+				} else if (w0 != 0 && nctl < 16) {
+					memcpy(ctl[nctl++], line, sizeof(line));
+				}
+				if (fgets(more, sizeof(more), stdin) == NULL)
 					break;
-				words[nw++] = v;
-				cur = tok_end;
+				memcpy(line, more, sizeof(line));
 			}
-			if (nw < 2)
-				continue;
-			uint32_t ft = words[0];
-			uint32_t rate = words[1];
-			if (ft == 0)
-				continue;
-			clock_gettime(CLOCK_REALTIME, &t0);
-			for (uint32_t wi = 0; wi < nw; wi++)
-				req_buf[wi] = words[wi];
-			result = doca_pcc_mailbox_send(resources.doca_pcc,
-						       PCC_MAILBOX_REQUEST_SIZE,
-						       &mb_response_size,
-						       &mb_cb_ret_val);
-			clock_gettime(CLOCK_REALTIME, &t1);
-			if (mb_response_size >= 8 * sizeof(uint32_t)) {
-				uint32_t *rsp = NULL;
+			clearerr(stdin);
+			for (int li = 0; li < nctl + have_batch; li++) {
+				char *src = (li < nctl) ? ctl[li] : batch;
+				char *cur = src, *tok_end = NULL;
+				uint32_t words[128];
+				uint32_t nw = 0;
 
-				if (doca_pcc_mailbox_get_response_buffer(resources.doca_pcc, (void **)&rsp) == DOCA_SUCCESS && rsp != NULL)
-					printf("HPFT_RSP ft=0x%x bud=%u lvl=%u avg16=%u r=%u s16=%u ep=%u evb32=%u"
-					       " w8=%u w9=%u w10=%u\n",
-					       rsp[0], rsp[1], rsp[2], rsp[3], rsp[4], rsp[5], rsp[6], rsp[7],
-					       rsp[8], rsp[9], rsp[10]);
+				while (nw < 128) {
+					uint32_t v = (uint32_t)strtoul(cur, &tok_end, 0);
+
+					if (tok_end == cur)
+						break;
+					words[nw++] = v;
+					cur = tok_end;
+				}
+				if (nw < 2)
+					continue;
+				uint32_t ft = words[0];
+				uint32_t rate = words[1];
+				if (ft == 0)
+					continue;
+				clock_gettime(CLOCK_REALTIME, &t0);
+				for (uint32_t wi = 0; wi < nw; wi++)
+					req_buf[wi] = words[wi];
+				result = doca_pcc_mailbox_send(resources.doca_pcc,
+							       PCC_MAILBOX_REQUEST_SIZE,
+							       &mb_response_size,
+							       &mb_cb_ret_val);
+				clock_gettime(CLOCK_REALTIME, &t1);
+				if (mb_response_size >= 8 * sizeof(uint32_t)) {
+					uint32_t *rsp = NULL;
+
+					if (doca_pcc_mailbox_get_response_buffer(resources.doca_pcc, (void **)&rsp) == DOCA_SUCCESS && rsp != NULL)
+						printf("HPFT_RSP ft=0x%x bud=%u lvl=%u avg16=%u r=%u s16=%u ep=%u evb32=%u"
+						       " w8=%u w9=%u w10=%u\n",
+						       rsp[0], rsp[1], rsp[2], rsp[3], rsp[4], rsp[5], rsp[6], rsp[7],
+						       rsp[8], rsp[9], rsp[10]);
+				}
+				printf("HPFT_SET ft=0x%x rate=%u rc=%d cb=%u t0=%lld.%09ld send_ns=%lld stale_dropped=%lu\n",
+				       ft, rate, (int)result, mb_cb_ret_val,
+				       (long long)t0.tv_sec, t0.tv_nsec,
+				       (long long)((t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec)),
+				       dropped);
+				fflush(stdout);
 			}
-			printf("HPFT_SET ft=0x%x rate=%u rc=%d cb=%u t0=%lld.%09ld send_ns=%lld\n",
-			       ft, rate, (int)result, mb_cb_ret_val,
-			       (long long)t0.tv_sec, t0.tv_nsec,
-			       (long long)((t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec)));
-			fflush(stdout);
 		}
+		fcntl(STDIN_FILENO, F_SETFL, fl);
 		PRINT_INFO("Info: HPFT rate-stdin done\n");
 	}
 
