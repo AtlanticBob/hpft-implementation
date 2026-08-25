@@ -1414,7 +1414,7 @@ def main():
     delays = {}
     print("rx_agent: law=%s%s" % (law, "  d_clip=%.0fms hold=%.0fms" % (
         ep.get("d_clip_s", 0.2) * 1e3, ep.get("backlog_hold_s", 0.0) * 1e3)
-        if law == "vq" else ""), flush=True)
+        if law in ("vq", "vq2") else ""), flush=True)
     last_speed = c_link
     sched.set_downlink(c_link)
 
@@ -1534,7 +1534,7 @@ def main():
             # Hysteresis (enter 0.95, leave 0.85) keeps the two regimes
             # from chattering when a genuinely small flow leaves capacity
             # unused and utilisation drops back.
-            if law == "vq":
+            if law in ("vq", "vq2"):
                 ents, ceils, delays = vqs.step(active, sched_rates, dt, now)
                 # Split prior = the share HINT, never the service rate: a
                 # newcomer's service equals whatever arrival the split
@@ -1548,7 +1548,7 @@ def main():
                 targets = {f: ceils.get(f, ents.get(f, 0.0)) for f in active}
                 telem.send(targets, sched_rates, delays)
             root_congested = rootcong.update(sum(active.values()),
-                                             sched.c_root) if law != "vq" else False
+                                             sched.c_root) if law not in ("vq", "vq2") else False
             # Every node of the policy tree that is at its capacity, not
             # just the root. A dst VM at its MaxRate saturates the node its
             # senders share, so all of them are contending - and this test
@@ -1557,11 +1557,11 @@ def main():
             sat = nodesat.update(active, {
                 v: p.get("max_rate_bps")
                 for v, p in sched.policy.get("vms", {}).items()}) \
-                if law != "vq" else set()
+                if law not in ("vq", "vq2") else set()
             # a finite "big" (root capacity), NOT inf: it saturates the
             # class demand cap exactly like inf but survives int(ceil_f)
             # in the telemetry pack (inf overflows).
-            if law != "vq":
+            if law not in ("vq", "vq2"):
                 demand = demand_estimate(active, ep["delta_demand"],
                                          sched.c_root, root_congested,
                                          saturated_dsts=sat)
@@ -1586,7 +1586,7 @@ def main():
             # dead control channel, which is a positive feedback into
             # fail-open. Iterate `active` (present in the flow table, plus
             # the membership grace) and default an absent mark to 0.
-            if law != "vq":
+            if law not in ("vq", "vq2"):
                 targets = {f: ceils.get(f, ents.get(f, 0.0))
                               * (1.0 - gamma * marks.get(f, 0.0))
                            for f in active}
