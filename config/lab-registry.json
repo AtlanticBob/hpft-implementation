@@ -399,7 +399,7 @@
     "eps": 0.02,
     "d_repay_s": 0.15,
     "phi_min": 0.5,
-    "d_clip_s": 0.2,
+    "d_clip_s": 0.05,
     "backlog_hold_s": 0.05,
     "law_comment": "LAW ARM (branch vq-sched, 2026-08-24). law=vq: the receiver runs the virtual hierarchical fair scheduler (demand = backlog Q_f/T + r_f, no delta ratchet / saturation test) and sends {g = share hint, r, d = Q_f/g in us}; the sender climbs towards (1+eps)*g with the log first-order step (k) and, when d>0, cuts to g*(1-d/d_repay_s) floored at phi_min*g. d_clip_s bounds the queue (memory, not debt). law=track: design.md v2 (u = ceil*(1-gamma*s), k, gamma, v_seconds, delta_demand apply). Stability of the drain: d_repay_s > 0.64*tau_eff (no oscillation above 2.7*tau_eff); tau_eff ~24 ms here.",
     "k": 20.0,
@@ -421,7 +421,11 @@
     "fs_grace_s": 0.5,
     "backlog_congestion_aware": true,
     "policy": null,
-    "liveness_port": 9713
+    "liveness_port": 9713,
+    "mi_gate": "phase",
+    "gate_s": 0.016,
+    "beta_max": 2.0,
+    "split_by_sender": true
   },
   "nodes": [
     {

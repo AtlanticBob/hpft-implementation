@@ -68,7 +68,12 @@ def main(tag):
         print("groups: incumbents=%d joiner=%d - nothing to measure" % (len(inc), len(joiner)))
         return
     t_join = min(first[f] for f in joiner)
-    t_leave = max(last[f] for f in joiner)
+    # the joiner's classes end at different times (iperf runs dur-2 s from
+    # connect, perftest -D from its own later connect), so "leave" is per
+    # class and the shared plateau ends at the EARLIER of the two
+    t_leave_c = {c: max(last[f] for f in joiner if f.endswith(c)) for c in ("rdma", "tcp")
+                 if any(f.endswith(c) for f in joiner)}
+    t_leave = min(t_leave_c.values())
     n1, n2 = len(inc), len(inc) + len(joiner)
     s1, s2 = C / n1, C / n2
     print("=== %s : %d incumbents, %d joiners; join %.1fs leave %.1fs; shares %.1fG -> %.1fG -> %.1fG"
@@ -78,14 +83,23 @@ def main(tag):
         return f.rsplit("|", 1)[1]
     for name, grp, share, a, b in [
             ("incumbents down-step (join)", inc, s2, t_join, t_leave),
-            ("joiner cold start", joiner, s2, t_join, t_leave),
-            ("incumbents up-step (leave)", inc, s1, t_leave, rows[-1][0])]:
+            ("joiner cold start", joiner, s2, t_join, t_leave)]:
         for c in ("rdma", "tcp"):
             g = [f for f in grp if cls(f) == c]
             st = settle(rows, g, share, a, b)
             print("  %-30s %-5s settle %s" % (name, c, "%.0f ms" % (st * 1e3) if st is not None else "never"))
-    # aggregate overshoot after the leave
-    agg = [(t, sum(v for f, v in r.items() if f in keys)) for t, r, _ in rows if t_leave <= t <= t_leave + 1.5]
+    # up-step: when the joiner's class c leaves, the incumbents of class c
+    # go back to C'/n1 within that class (the other class is unaffected
+    # until its own joiners leave)
+    for c in ("rdma", "tcp"):
+        g = [f for f in inc if cls(f) == c]
+        tl = t_leave_c.get(c)
+        st = settle(rows, g, s1, tl, tl + 5) if tl else None
+        print("  %-30s %-5s settle %s (leave at %.1fs)" % ("incumbents up-step (leave)", c,
+              "%.0f ms" % (st * 1e3) if st is not None else "never", tl or 0))
+    # aggregate overshoot after the last leave
+    t_last = max(t_leave_c.values())
+    agg = [(t, sum(v for f, v in r.items() if f in keys)) for t, r, _ in rows if t_last <= t <= t_last + 1.5]
     peak = max(v for _, v in agg) if agg else 0
     print("  aggregate after leave: peak %.1fG = %.0f%% of C' (%.0fG)" % (peak / 1e9, 100 * peak / C, C / 1e9))
     agg_j = [(t, sum(v for f, v in r.items() if f in keys)) for t, r, _ in rows if t_join <= t <= t_join + 1.5]
@@ -93,8 +107,8 @@ def main(tag):
     print("  aggregate after join:  peak %.1fG = %.0f%% of C'" % (peak_j / 1e9, 100 * peak_j / C))
     # steady jitter per class in the three plateaus
     for name, a, b, grp in [("alone 10-28s", 10, t_join - 2, inc),
-                            ("shared +8..-3s", t_join + 8, t_leave - 3, inc + joiner),
-                            ("alone again +5s..85", t_leave + 5, 85, inc)]:
+                            ("shared +8..-4s", t_join + 8, t_leave - 4, inc + joiner),
+                            ("alone again +5s..85", t_last + 5, 85, inc)]:
         out = []
         for c in ("rdma", "tcp"):
             sds, means = [], []

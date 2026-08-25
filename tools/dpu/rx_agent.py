@@ -382,6 +382,23 @@ class SenderLiveness:
             except (ValueError, KeyError):
                 continue
 
+    def rates_for(self, fsids, now):
+        """{fsid: sender-reported bps} when EVERY fsid has a fresh report
+        (a sender's report covers all of that (src, class)'s flow-sets, so
+        two flow-sets from one src VF to different dsts share one number;
+        in the star lab each src VF talks to one dst so this is exact).
+        None if any member is unknown or the feed is stale."""
+        if self.sock is None or now - self.t > self.STALE_S:
+            return None
+        out = {}
+        for f in fsids:
+            src, cls = f.split(">")[0], f.rsplit("|", 1)[1]
+            v = self.rate.get("%s|%s" % (src, cls))
+            if v is None:
+                return None
+            out[f] = float(v)
+        return out
+
     def idle(self, fsid, now):
         """True only when the sender positively reports ~zero for this
         (src, class). Unknown or stale => False (never gate on silence)."""
@@ -433,6 +450,7 @@ class HybridRates:
         self.attr_host = set()            # dsts host-attributed this tick
         self.young_active = set()         # partially-visible newcomers
         self.liveness = None              # SenderLiveness (advisory)
+        self.sender_ratio = False         # split pools by sender reports
 
     def _rep_tx_bytes(self, dev):
         fd = self._fd.get(dev)
@@ -689,6 +707,21 @@ class HybridRates:
             act = [f for f in fs if not live.idle(f, now)]
             if act and len(act) < len(fs):
                 fs = act
+            # Sender-reported ratio (redesign proposal S1.5): the sender's
+            # own vport TX counters are exact and ~1 ms fresh, so when
+            # every member of this pool has a fresh report, divide the
+            # receiver's exact total in THAT ratio and skip the ~1 s
+            # megaflow cache and its priors altogether. The total stays
+            # the receiver's; only the division moves to the sender.
+            if self.sender_ratio:
+                w_s = live.rates_for(fs, now)
+                if w_s is not None and sum(w_s.values()) > 0:
+                    wsum = sum(w_s.values())
+                    for f in fs:
+                        share = w_s[f] / wsum
+                        if share > 0:
+                            out[f] = pool * share
+                    return
         young = bool(self.young_active & set(fs))
         if young or any(f in self.unmeasured for f in fs):
             # ABSENT from the prior and PRESENT-BUT-NEAR-ZERO are different
@@ -1319,6 +1352,7 @@ def main():
         rate_window_s=ep.get("rate_window_s", 0.006),
         meter=vpm)
     hybrid.liveness = liveness
+    hybrid.sender_ratio = bool(ep.get("split_by_sender", False))
     sched = Scheduler(reg["policy"], line, ep["headroom"], ep["delta_demand"])
     last_seen = {}
     # V arm (experiment): "global" is the shipping behaviour. "per_fs" sets
@@ -1502,7 +1536,14 @@ def main():
             # unused and utilisation drops back.
             if law == "vq":
                 ents, ceils, delays = vqs.step(active, sched_rates, dt, now)
-                hybrid.prev_ents = ents
+                # Split prior = the share HINT, never the service rate: a
+                # newcomer's service equals whatever arrival the split
+                # credited it with, so using it as next tick's prior locks
+                # a wrong split in (st_vq join, 2026-08-25: the incumbent
+                # read 33G against a 23G pace for 2 s while the joiner read
+                # 3-12G). The hint does not depend on the flow-set's own
+                # rate, so it cannot feed the error back.
+                hybrid.prev_ents = ceils
                 marks = {}
                 targets = {f: ceils.get(f, ents.get(f, 0.0)) for f in active}
                 telem.send(targets, sched_rates, delays)
