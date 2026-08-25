@@ -606,8 +606,20 @@ def main():
         st.epoch = idx
         return True
 
+    # vq2: ONE target, tracked with the v2 first-order step.
+    #   u = g * (1 + (d_star - d)/d_repay), floored at phi_min*g
+    # "your share, corrected by how far your queue is from the standing
+    # delay d_star". Linearised: x'' + k x' + (k/d_repay) x = 0, so
+    # zeta = 0.5*sqrt(k*d_repay) for every flow-set regardless of share.
+    vq_dstar = float(ep.get("d_star_s", 0.003))
+
     def step_law(st, rec, now, fsid=""):
-        if law == "mimd":
+        if law == "vq2":
+            g = max(float(rec.get("u", 0.0)), floor)
+            d = rec.get("d", 0.0)
+            u = g * (1.0 + (vq_dstar - d) / vq_repay)
+            track(st, max(u, vq_phi * g), now)
+        elif law == "mimd":
             if mimd_due(st, fsid, now):
                 beta = mimd_factor(st.R, rec.get("u", 0.0), rec.get("d", 0.0),
                                    vq_eps, mimd_bmax, vq_repay, vq_phi, floor)
