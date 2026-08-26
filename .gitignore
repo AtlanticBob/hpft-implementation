@@ -50,3 +50,6 @@ results/regression/
 # bulky one-off captures (overlay bring-up pcaps, vtune traces)
 results/p0_overlay_20260729/
 results/vtune_20260729/
+
+# raw run data of the VF-cap verification (distilled summary + runner stay)
+results/vf_caps_20260826/results/
