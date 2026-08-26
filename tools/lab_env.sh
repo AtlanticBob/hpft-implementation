@@ -195,8 +195,13 @@ ztr)
     ensure_overlay
   fi
   bash "$REPO/tools/lab-infra/roles.sh" stop >/dev/null 2>&1
-  # ZTR runs on the sender DPUs only (the receiver just answers RTT probes);
-  # every node except the receiver is a potential sender in the four-node lab.
+  # ZTR runs on the sender DPUs. The RECEIVER needs a PCC application too:
+  # with UPCC=1 and no app the NIC answers nothing and every RDMA flow into
+  # it dies with "retry counter exceeded" (probed 2026-08-26). The stock
+  # RTT-template binary as the responder ALSO kills the flows (0 iterations);
+  # the HPFT executor (rp_service.sh, same PCC framework) as the responder
+  # works, and with no sender agent it shapes nothing on the receive side.
+  ssh -n "$(dpu_of "$RECEIVER")" 'bash /opt/hpft/rp_service.sh start >/dev/null 2>&1; echo -n "  receiver responder: "; pgrep -ax doca_pcc | head -1' </dev/null
   for d in $(all_dpus); do
     [ "$d" = "$(dpu_of "$RECEIVER")" ] && continue
     ssh -n "$d" "sudo pkill -x doca_pcc 2>/dev/null; sleep 1
