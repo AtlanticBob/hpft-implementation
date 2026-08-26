@@ -39,8 +39,8 @@ HPFT 在 BlueField-3 DPU 的边缘上用虚拟队列的差分标记，实现云�
 四台机器 `sgpu01`–`sgpu04`，每台一块 BlueField-3 挂在同一台 SN5600 上，
 四个 p1 口统一 **200G**（交换机侧 swp37s1 / swp37s0 / swp3s1 / swp4s1）。
 sgpu01/sgpu02 用 PCI `38:00` 那块卡，sgpu03/sgpu04 用 `b8:00`（host netdev
-`bf1_1`）。每台 4 个 VF：host 侧 `dpu1vf0-3` = `10.1.i.<机器号>`，DPU 侧
-representor `pf1vf0-3`。
+`bf1_1`）。每台 **8 个 VF**（2026-08-26 起）：host 侧 `dpu1vf0-7` = `10.1.i.<机器号>`，DPU 侧
+representor `pf1vf0-7`。每个 VF 卖 50G，两层限速都在 VF 自己的 DPU 上：上行 devlink `tx_max`、下行 OVS drop-band meter（`tools/lab-infra/vf_caps.sh sync`；fw reset 后必须重做；验证见 `results/vf_caps_20260826/`）。
 
 数据面是常驻 VxLAN overlay，**星型，中心是接收端**：`ovsbr-p1` 挂 4 个
 representor 加若干 vxlan 隧道（`tos=inherit` 是硬性要求，否则 ECN 位过不了
