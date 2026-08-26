@@ -175,7 +175,13 @@ pcc)
   WANT_SR=$(on_host "$1" "sudo mlxreg -y -d $(pf_short $3) --reg_name ROCE_ACCL --get 2>/dev/null" \
             | awk '/^selective_repeat_forced_en  /{print $NF+0}')
   if set_flags 1 -; then fw_reset_all; restore_sr "${WANT_SR:-0}"; fi
-  bash "$REPO/tools/reboot_recover.sh" | sed 's/^/  /'
+  # post_recover, not bare reboot_recover: vf_setup leaves the VFs at MTU
+  # 8192 while the DPU representors/bridge are 1500. Any TCP connection that
+  # idles past the OVS flow max-idle (10 s) then loses every full-size
+  # segment - the first packet after aging must take the slow path through
+  # a 1500-byte representor and is dropped as oversized, so the HW flow is
+  # never reinstalled (2026-08-26, cost a whole 1-2 ZTR row).
+  post_recover
   # roles.sh owns which node runs which plane, and starts the RP before the
   # sender agent -- an executor left over from the previous role assignment
   # takes budgets and stops pacing.

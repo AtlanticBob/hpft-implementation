@@ -73,7 +73,9 @@ PY
     fi
     sudo ip addr flush dev "$want" 2>/dev/null
     sudo ip addr add "$ip/24" dev "$want"
-    sudo ip link set "$want" mtu 8192 up
+    # 1500 = the lab baseline (and the DPU representor/bridge MTU; a bigger
+    # VF MTU silently breaks idle TCP connections, see cc_mode.sh post_recover)
+    sudo ip link set "$want" mtu 1500 up
     i=$((i+1))
 done
 
