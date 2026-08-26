@@ -15,10 +15,11 @@
 #   lab_env.sh plain       firmware DCQCN baseline: UPCC=0, no HPFT, no Jakiro
 #   lab_env.sh jakiro      firmware DCQCN + Jakiro DHTB at the receiver decap
 #                          point (multi-sender flows need cross_pair_net.sh)
-#   lab_env.sh ztr         UPCC=1 + STOCK DOCA PCC RTT template (ZTR-RTTCC),
-#                          no HPFT agents -- the native-ZTR arm of the eval
-#                          CC matrix (binary: ~/bzx/pcc_ztr_stock on the DPU,
-#                          built from the pristine SDK application source)
+#   lab_env.sh ztr         UPCC=1 + STOCK DOCA PCC RTT template (ZTR-RTTCC)
+#                          on every sender DPU, no HPFT agents -- the
+#                          native-ZTR arm of the CC matrix (binary:
+#                          ~/bzx/pcc_ztr_stock on each DPU, built from the
+#                          pristine SDK application source)
 #   lab_env.sh direct      LEGACY/debug: tear the overlay down to the old
 #                          direct topology (p1 + reps back on underlay-p1)
 #   lab_env.sh meter on [gbps] | off | status
@@ -184,20 +185,25 @@ direct)
   echo "== DIRECT ready (rx agent default bridge is ovsbr-p1: pass --bridge underlay-p1 by hand) ==" ;;
 
 ztr)
-  echo "== -> ZTR (stock RTT template, UPCC=1, no HPFT) =="
+  echo "== -> ZTR (stock RTT template, UPCC=1, no HPFT) on every SENDER DPU =="
   jakiro_stop
   ensure_overlay
-  if [ "$(upcc_of hpft-dpu)" != 1 ]; then
-    bash "$CC" pcc            # brings UPCC=1 (fw reset path); converted below
+  # UPCC=1 on all nodes (cc_mode pcc does the fw reset on every registry
+  # node); the HPFT stack it starts is torn down right after.
+  if [ "$(upcc_of "$(dpu_of "$SENDER")")" != 1 ]; then
+    bash "$CC" pcc
     ensure_overlay
   fi
-  ssh hpft-dpu2 'sudo systemctl stop hpft-rxagent-e 2>/dev/null; true'
-  ssh hpft-dpu  'sudo systemctl stop hpft-txagent-e 2>/dev/null; true'
-  sudo systemctl stop hpft-pace-shim 2>/dev/null || true
-  ssh -n hpft-dpu "sudo pkill -x doca_pcc 2>/dev/null; sleep 1
-    sudo setsid nohup $ZTR_BIN -d mlx5_0 -w -1 -l 40 >/tmp/ztr_pcc.log 2>&1 < /dev/null &
-    sleep 3; pgrep -ax doca_pcc | head -1" </dev/null
-  echo "== ZTR ready (back to hpft: lab_env.sh hpft restarts the HPFT RP+agents+shim) =="
+  bash "$REPO/tools/lab-infra/roles.sh" stop >/dev/null 2>&1
+  # ZTR runs on the sender DPUs only (the receiver just answers RTT probes);
+  # every node except the receiver is a potential sender in the four-node lab.
+  for d in $(all_dpus); do
+    [ "$d" = "$(dpu_of "$RECEIVER")" ] && continue
+    ssh -n "$d" "sudo pkill -x doca_pcc 2>/dev/null; sleep 1
+      sudo setsid nohup $ZTR_BIN -d mlx5_0 -w -1 -l 40 >/tmp/ztr_pcc.log 2>&1 < /dev/null &
+      sleep 3; echo -n '  $d: '; pgrep -ax doca_pcc | head -1" </dev/null
+  done
+  echo "== ZTR ready (back to plain/hpft: lab_env.sh plain|hpft; re-run vf_caps.sh sync + cc_mode.sh gbn|sr + cross_pair_net after the fw reset) =="
   status ;;
 
 meter)
