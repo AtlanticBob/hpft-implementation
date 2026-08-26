@@ -99,7 +99,7 @@ post_recover() {
   bash "$REPO/tools/reboot_recover.sh" | sed 's/^/  /'
   for n in "${NODES[@]}"; do
     set -- $n
-    on_host "$1" "for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do sudo ip link set \$d mtu $VF_MTU 2>/dev/null; done" &
+    on_host "$1" "for d in /sys/class/net/dpu1vf*; do sudo ip link set \$(basename \$d) mtu $VF_MTU 2>/dev/null; done" &
     ssh -o BatchMode=yes "$2" 'for p in p0 p1; do sudo ethtool -A $p rx off tx off 2>/dev/null; sudo mlnx_qos -i $p --pfc 0,0,0,0,0,0,0,0 >/dev/null 2>&1; done' &
   done
   wait

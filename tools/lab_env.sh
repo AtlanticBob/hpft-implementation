@@ -22,9 +22,9 @@
 #   lab_env.sh direct      LEGACY/debug: tear the overlay down to the old
 #                          direct topology (p1 + reps back on underlay-p1)
 #   lab_env.sh meter on [gbps] | off | status
-#                          per-dst-VF OVS meters on the receiver vswitch
-#                          (drop band, default 30G) -- the naive-policer
-#                          downlink cap of the native/with-TC arms
+#                          per-VF OVS drop-band meters on EVERY DPU (the
+#                          naive-policer downlink cap; rate = policy MaxRate,
+#                          50G since 2026-08-26; see lab-infra/vf_caps.sh)
 #
 #   axis            hpft              plain             jakiro
 #   UPCC / CC       1 / PCC device    0 / fw DCQCN      0 / fw DCQCN
@@ -87,7 +87,7 @@ status() {
   echo "doca_pcc bin:    $(ssh "$SDPU" 'pgrep -a -x doca_pcc | head -1 | sed "s/^[0-9]* //"' 2>/dev/null || echo none)"
   echo "rx meters:       $(ssh "$RDPU" 'sudo ovs-ofctl -O OpenFlow13 dump-meters ovsbr-p1 2>/dev/null | grep -c "meter=1[1-4]" || true' 2>/dev/null)"
   echo -n "receiver VF IPs: "
-  ssh "$RECEIVER" 'for i in 0 1 2 3; do printf "vf%s=%s " $i "$(ip -4 addr show dpu1vf$i 2>/dev/null | grep -oE "inet [0-9.]+" | awk "{print \$2}" | head -1)"; done; echo'
+  ssh "$RECEIVER" 'for i in $(seq 0 7); do printf "vf%s=%s " $i "$(ip -4 addr show dpu1vf$i 2>/dev/null | grep -oE "inet [0-9.]+" | awk "{print \$2}" | head -1)"; done; echo'
   # verdict
   if [ "$u1" = 1 ] && [ "$rx" = active ] && [ "$tx" = active ]; then
     echo "==> environment: HPFT"
@@ -141,7 +141,7 @@ teardown_overlay() {
   # restore direct VF IPs on every host
   for h in $(all_hosts); do
     if [ "$h" = "$(hostname)" ]; then
-      for i in 0 1 2 3; do sudo ip addr flush dev dpu1vf$i 2>/dev/null; done
+      for d in /sys/class/net/dpu1vf*; do sudo ip addr flush dev $(basename $d) 2>/dev/null; done
       bash "$REPO/tools/lab-infra/vf_setup.sh" >/dev/null 2>&1
     else
       ssh "$h" "bash $REPO/tools/lab-infra/vf_setup.sh >/dev/null 2>&1"
@@ -201,23 +201,16 @@ ztr)
   status ;;
 
 meter)
-  RATE_KBPS=$(( ${3:-30} * 1000000 ))
+  # Per-VF downlink policer on EVERY DPU is standing lab shape since
+  # 2026-08-26 (50G per VF, tools/lab-infra/vf_caps.sh). This target is kept
+  # as a thin alias so older runners keep working; "on [gbps]" re-installs
+  # the meters at the policy rate (the gbps argument is ignored with a note).
   case "${2:-status}" in
-    on)
-      ssh hpft-dpu2 "for i in 0 1 2 3; do
-        sudo ovs-ofctl -O OpenFlow13 add-meter ovsbr-p1 \"meter=\$((11+i)),kbps,band=type=drop,rate=$RATE_KBPS\" 2>/dev/null
-        sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 \"priority=120,ip,in_port=vxlan100,nw_dst=10.1.\$i.2,actions=meter:\$((11+i)),NORMAL\"
-      done
-      echo -n 'meters installed: '; sudo ovs-ofctl -O OpenFlow13 dump-meters ovsbr-p1 | grep -c 'meter=1[1-4]'" ;;
-    off)
-      ssh hpft-dpu2 'for i in 0 1 2 3; do
-        sudo ovs-ofctl -O OpenFlow13 del-flows ovsbr-p1 "ip,in_port=vxlan100,nw_dst=10.1.$i.2" 2>/dev/null
-        sudo ovs-ofctl -O OpenFlow13 del-meter ovsbr-p1 "meter=$((11+i))" 2>/dev/null
-      done; echo "meters removed"' ;;
-    status)
-      ssh hpft-dpu2 'sudo ovs-ofctl -O OpenFlow13 dump-meters ovsbr-p1 2>/dev/null | grep "meter=1[1-4]" || echo "no meters"
-        sudo ovs-ofctl -O OpenFlow13 dump-flows ovsbr-p1 2>/dev/null | grep -o "nw_dst=10.1.[0-3].2 actions=meter:[0-9]*" || true' ;;
-    *) echo "usage: lab_env.sh meter on [gbps] | off | status"; exit 2 ;;
+    on)  [ -n "${3:-}" ] && echo "  note: meter rate comes from the registry policy (max_rate_bps), argument $3 ignored"
+         bash "$REPO/tools/lab-infra/vf_caps.sh" meter-on ;;
+    off) bash "$REPO/tools/lab-infra/vf_caps.sh" meter-off ;;
+    status) bash "$REPO/tools/lab-infra/vf_caps.sh" status ;;
+    *) echo "usage: lab_env.sh meter on | off | status"; exit 2 ;;
   esac ;;
 
 *) grep '^#' "$0" | sed -n '2,26p' ;;

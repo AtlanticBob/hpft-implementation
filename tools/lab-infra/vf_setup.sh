@@ -15,10 +15,12 @@ read -r PF NVF <<<"$(python3 - "$REPO" "$ME" <<'PY'
 import json, sys
 repo, me = sys.argv[1], sys.argv[2]
 t = json.load(open(f"{repo}/config/lab-tcp-registry.json"))
+r = json.load(open(f"{repo}/config/lab-registry.json"))
 v = [x for x in t["vnics"] if x["host"] == me]
 if not v:
     sys.exit(f"vf_setup: {me} has no vnics in lab-tcp-registry.json")
-print(v[0]["pf_bdf"], len(v))
+# the VF count is the number of vnics lab-registry gives this host (8 since 2026-08-26)
+print(v[0]["pf_bdf"], len([x for x in r["vnics"] if x["host"] == me]))
 PY
 )" || exit 1
 
@@ -41,14 +43,10 @@ for i in $(seq 0 $((NVF-1))); do
       | sudo tee /sys/class/infiniband/$PFDEV/device/sriov/${i}/node >/dev/null
 done
 
-VFPCI=$(python3 - "$REPO" "$ME" <<'PY'
-import json, sys
-repo, me = sys.argv[1], sys.argv[2]
-t = json.load(open(f"{repo}/config/lab-tcp-registry.json"))
-print(" ".join(x["vf_pci_bdf"] for x in sorted(
-    (x for x in t["vnics"] if x["host"] == me), key=lambda x: x["vf_index"])))
-PY
-)
+# VF i's PCI address is the PF's virtfn<i> link: read it from sysfs rather
+# than from a table, so the table (lab-tcp-registry vf_pci_bdf) is checked
+# against the kernel by registry_refresh.py instead of trusted blindly.
+VFPCI=$(for i in $(seq 0 $((NVF-1))); do basename "$(readlink -f /sys/bus/pci/devices/$PF/virtfn$i)"; done)
 for p in $VFPCI; do echo $p | sudo tee /sys/bus/pci/drivers/mlx5_core/unbind >/dev/null 2>&1; done
 sleep 1
 for p in $VFPCI; do echo $p | sudo tee /sys/bus/pci/drivers/mlx5_core/bind >/dev/null 2>&1; done

@@ -20,7 +20,7 @@ if ! sudo test -e "$PIN/hpft_tcp_edt"; then
     exit 1
 fi
 
-for d in dpu1vf0 dpu1vf1 dpu1vf2 dpu1vf3; do
+for d in $(ls /sys/class/net | grep -E '^dpu1vf[0-9]+$'); do
     ip link show "$d" > /dev/null 2>&1 || { echo "$d: absent, skipped"; continue; }
     tc qdisc show dev "$d" | grep -q "^qdisc fq [0-9a-f]*: root" \
         || sudo tc qdisc replace dev "$d" root fq

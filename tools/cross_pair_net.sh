@@ -38,8 +38,12 @@ oct4 = {ip.split('.')[-1] for ip in ips}
 if len(oct4) != 1: sys.exit('cross_pair_net: %s vnics do not share a last octet' % me)
 print(oct4.pop())") || exit 1
 
+NVF=$(python3 -c "
+import json, socket
+r = json.load(open('$REPO/config/lab-registry.json'))
+print(len([v for v in r['vnics'] if v['host'] == socket.gethostname()]))")
 cmd=${1:-status}
-for i in 0 1 2 3; do
+for i in $(seq 0 $((NVF-1))); do
     dev="dpu1vf$i"
     src="10.1.$i.$OCT"
     tbl=$((100 + i))

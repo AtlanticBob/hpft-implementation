@@ -28,6 +28,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 HUB=${HUB:-$(python3 -c "import json;print(json.load(open('config/lab-registry.json'))['receiver_host'])")}
+# how many VFs a host carries is a registry fact (8 since 2026-08-26), not a loop bound
+NVF=$(python3 -c "import json;r=json.load(open('config/lab-registry.json'));print(max(len([v for v in r['vnics'] if v['host']==n['host']]) for n in r['nodes']))")
+VFIDX=$(seq -s ' ' 0 $((NVF-1)))
 
 mapfile -t NODES < <(python3 -c "
 import json
@@ -48,7 +51,7 @@ if [ "$MODE" = teardown ]; then
     ssh -o BatchMode=yes "$2" 'sudo ovs-vsctl --if-exists del-br ovsbr-p1
       sudo ip addr flush dev p1 2>/dev/null
       sudo ovs-vsctl --may-exist add-port underlay-p1 p1
-      for i in 0 1 2 3; do sudo ovs-vsctl --may-exist add-port underlay-p1 pf1vf$i; done
+      for i in $VFIDX; do sudo ovs-vsctl --may-exist add-port underlay-p1 pf1vf$i; done
       sudo ip link set p1 up' &
   done
   wait
@@ -73,7 +76,7 @@ for n in "${NODES[@]}"; do
       sudo ip addr add $tel/24 dev p1 2>/dev/null
       sudo ip link set p1 up mtu 9000
       sudo ovs-vsctl --may-exist add-br ovsbr-p1
-      for i in 0 1 2 3; do
+      for i in $VFIDX; do
         sudo ovs-vsctl --if-exists del-port underlay-p1 pf1vf\$i 2>/dev/null
         sudo ovs-vsctl --if-exists del-port ovsbr2 pf1vf\$i 2>/dev/null
         sudo ovs-vsctl --may-exist add-port ovsbr-p1 pf1vf\$i
