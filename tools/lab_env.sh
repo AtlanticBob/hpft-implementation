@@ -15,6 +15,8 @@
 #   lab_env.sh plain       firmware DCQCN baseline: UPCC=0, no HPFT, no Jakiro
 #   lab_env.sh jakiro      firmware DCQCN + Jakiro DHTB at the receiver decap
 #                          point (multi-sender flows need cross_pair_net.sh)
+#   lab_env.sh swift       like ztr, but the Swift port of the stock template
+#                          (~/bzx/pcc_swift_stock, results/swift_20260827)
 #   lab_env.sh ztr         UPCC=1 + STOCK DOCA PCC RTT template (ZTR-RTTCC)
 #                          on every sender DPU, no HPFT agents -- the
 #                          native-ZTR arm of the CC matrix (binary:
@@ -52,7 +54,8 @@ REPO=/home/zhaoxiang/hyperfront/hpft-implementation
 CC="$REPO/tools/cc_mode.sh"
 MST=/dev/mst/mt41692_pciconf0
 JAKIRO_DIR=/home/ubuntu/bzx/jakiro_dhtb          # on hpft-dpu2
-ZTR_BIN=/home/ubuntu/bzx/pcc_ztr_stock/build/pcc/doca_pcc   # on hpft-dpu
+ZTR_BIN=/home/ubuntu/bzx/pcc_ztr_stock/build/pcc/doca_pcc     # stock DOCA RTT template (ZTR-RTTCC), every sender DPU
+SWIFT_BIN=/home/ubuntu/bzx/pcc_swift_stock/build/pcc/doca_pcc # same tree with Swift in algorithm_core (results/swift_20260827), every sender DPU
 UL_SENDER=172.16.1.1; UL_RECV=172.16.1.2         # VxLAN underlay on p1
 
 # ---------------------------------------------------------------- status ----
@@ -184,8 +187,9 @@ direct)
   if overlay_present; then teardown_overlay; fi
   echo "== DIRECT ready (rx agent default bridge is ovsbr-p1: pass --bridge underlay-p1 by hand) ==" ;;
 
-ztr)
-  echo "== -> ZTR (stock RTT template, UPCC=1, no HPFT) on every SENDER DPU =="
+ztr|swift)
+  STOCK_BIN=$ZTR_BIN; [ "$1" = swift ] && STOCK_BIN=$SWIFT_BIN
+  echo "== -> ${1^^} (stock RTT-template binary $STOCK_BIN, UPCC=1, no HPFT) on every SENDER DPU =="
   jakiro_stop
   ensure_overlay
   # UPCC=1 on all nodes (cc_mode pcc does the fw reset on every registry
@@ -205,10 +209,10 @@ ztr)
   for d in $(all_dpus); do
     [ "$d" = "$(dpu_of "$RECEIVER")" ] && continue
     ssh -n "$d" "sudo pkill -x doca_pcc 2>/dev/null; sleep 1
-      sudo setsid nohup $ZTR_BIN -d mlx5_0 -w -1 -l 40 >/tmp/ztr_pcc.log 2>&1 < /dev/null &
+      sudo setsid nohup $STOCK_BIN -d mlx5_0 -w -1 -l 40 >/tmp/ztr_pcc.log 2>&1 < /dev/null &
       sleep 3; echo -n '  $d: '; pgrep -ax doca_pcc | head -1" </dev/null
   done
-  echo "== ZTR ready (back to plain/hpft: lab_env.sh plain|hpft; re-run vf_caps.sh sync + cc_mode.sh gbn|sr + cross_pair_net after the fw reset) =="
+  echo "== ${1^^} ready (back to plain/hpft: lab_env.sh plain|hpft; re-run vf_caps.sh sync + cc_mode.sh gbn|sr + cross_pair_net after the fw reset) =="
   status ;;
 
 meter)
