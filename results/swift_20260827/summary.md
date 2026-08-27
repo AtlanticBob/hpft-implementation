@@ -125,3 +125,17 @@ Swift 遥测（每对，5–30 s）：cwnd 27–30 KB（sd ~5），`rtt_s` 8.5�
 ## 七、lab 现状
 
 **停在 UPCC=1 + 三台发送端 HPFT 执行面（Swift）+ 接收端应答方**，agent 全停，GBN，8 VF/50 G，交叉对规则已 apply。回 plain 要 `lab_env.sh plain`（fw reset ~6 min）+ `vf_caps.sh sync` + `cc_mode.sh gbn|sr` + 四台 `cross_pair_net.sh apply` + MTU 核对。
+
+## 六、利用率 84–88% 的原因与最终形态（2026-08-27 验收后补）
+
+原因：执行面版把**一个流对（10 个 QP）当作一条 Swift 流**——cwnd 是流对级的，速率按 QP 数均摊，等于每个 QP 只拿到 1/10 的加性增；论文里每条连接就是一条流。在线调参证实了方向：加性增加大反而更差（4 包 143 G、10 包 128 G，上冲后砍得更深），把砍幅收小、目标抬高只能到 176 G（92%）：
+
+| 参数（执行面版，4 对 RDMA 打口，4–14 s 均值） | RDMA 合计 |
+|---|---|
+| base 6 µs, ai 1 包, b 0.8, mdf 0.5（原默认） | 167 G（88%） |
+| base 12 µs, ai 1 包, b 0.8, mdf 0.5 | 172.5 G（90%） |
+| base 12 µs, ai 1 包, b 0.4, mdf 0.25 | 174.4 G（91%） |
+| base 16 µs, ai 1 包, b 0.4, mdf 0.25 | 176.4 G（92%） |
+| base 6 µs, ai 4 / 10 包 | 143 / 128 G |
+
+最终形态：**独立的原厂模板二进制** `~/bzx/pcc_swift_stock`（`tools/dpu/pcc/swift_stock/`），Swift 写在 `algorithm_core` 位置，每个 PCC 流上下文（= 每个 QP）一条 Swift 流，参数 base 12 µs / fs_range 20 µs / ai 1 包 / b 0.4 / mdf 0.25。同一 4 对场景 **187.4 G（98%，两遍 187.4 / 187.4，sd 0.5）**，与 DCQCN 行持平。motivation 1-2 的 Swift 行用的就是这个二进制（`lab_env.sh swift`），不含任何 HyperFront 代码；执行面里的 `0xccd 3` 保留作 HPFT 内部对照。
