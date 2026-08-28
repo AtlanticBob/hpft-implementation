@@ -284,6 +284,8 @@ typedef struct {
 	 * block) */
 	volatile uint32_t qp_slot[HPFT_PAIR_QPS];
 	volatile uint32_t qp_nslot;
+	volatile uint32_t trust;	/* fxp16; valid when trust_mode */
+	volatile uint32_t trust_mode;	/* 1: rate = T*cc + (1-T)*level */
 	volatile uint32_t epoch_id;	/* bumped once per epoch, ages the map */
 	volatile uint32_t cnp_hits;	/* DIAG 2026-07-22: CNP events matched to THIS pair
 					 * (target>=0 && ev_type==ROCE_CNP), vs g_hpft_cnp_any
@@ -532,18 +534,23 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			g_qpn_map_active = 1;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
-		if ((ft & 0xffff0000u) == 0xb47c0000u) {
+		if ((ft & 0xfffe0000u) == 0xb47c0000u) {
 			/* batch update: word0 = 0xB47C0000|n, then n x
-			 * {flowtag, budget, rx_rate}. budget=0 deletes. */
+			 * {flowtag, budget, rx_rate}. budget=0 deletes.
+			 * 0xB47D0000|n: four words per entry, the fourth is the
+			 * trust T (fxp16) in the tenant CC; the pair is then shaped
+			 * to T*cc + (1-T)*level per QP (fence design, 2026-08-26). */
 			uint32_t n = ft & 0xffffu;
+			uint32_t w = ((ft & 0xffff0000u) == 0xb47d0000u) ? 4u : 3u;
 			volatile uint32_t *req = (volatile uint32_t *)request;
 
-			if (request_size < (1 + 3 * n) * sizeof(uint32_t))
+			if (request_size < (1 + w * n) * sizeof(uint32_t))
 				return DOCA_PCC_DEV_STATUS_OK;
 			for (uint32_t e = 0; e < n; e++) {
-				uint32_t eft = req[1 + 3 * e];
-				uint32_t ebud = req[2 + 3 * e];
-				uint32_t erx = req[3 + 3 * e];
+				uint32_t eft = req[1 + w * e];
+				uint32_t ebud = req[2 + w * e];
+				uint32_t erx = req[3 + w * e];
+				uint32_t etr = (w == 4u) ? req[4 + w * e] : 0u;
 				int fidx = -1;
 
 				for (int i = 0; i < HPFT_PAIRS; i++) {
@@ -572,6 +579,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 									c->last_rrx_used = erx; /* don't integrate on pre-change (stale) R */
 												}
 								c->remote_rx_rate = erx;
+								c->trust = etr;
+								c->trust_mode = (w == 4u);
 						}
 						fidx = -2;
 						break;
@@ -591,6 +600,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					c->qp_count = 0;	/* relearned from events */
 					c->qp_nslot = 0;
 					c->remote_rx_rate = erx;
+					c->trust = etr;
+					c->trust_mode = (w == 4u);
 					for (int s = 0; s < HPFT_MAX_THREADS; s++)
 						c->b32_shard[s] = 0;
 					c->epoch_ts = 0;
@@ -1258,7 +1269,17 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		uint32_t cc = c->cc_rate;
 		uint32_t lvl = c->level;
 
-		if (g_hpft_couple == HPFT_COUPLE_D) {
+		if (c->trust_mode) {
+			/* fence design: r = T*cc + (1-T)*level, T fxp16 */
+			uint64_t t = c->trust;
+			uint32_t r = (uint32_t)((((uint64_t)cc * t)
+					+ ((uint64_t)lvl * (65536u - t))) >> 16);
+
+			if (r < HPFT_MIN_LEVEL)
+				r = HPFT_MIN_LEVEL;
+			c->paced = r;
+			results->rate = r;
+		} else if (g_hpft_couple == HPFT_COUPLE_D) {
 			/* reading the CC is work only this arm needs; the min()
 			 * arm must not pay for it, or it stops being the
 			 * baseline its measurements are taken as */

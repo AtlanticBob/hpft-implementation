@@ -652,6 +652,7 @@ def build_pair_cfg_update(
     rate_bps: int,
     burst_bytes: int,
     generation: int,
+    flags: int = 0,
 ) -> MapUpdate:
     indices = vnic_index(registry)
     if src_vnic not in indices:
@@ -665,7 +666,7 @@ def build_pair_cfg_update(
     return MapUpdate(
         "hpft_pair_cfg",
         pack_u64(key_int),
-        pack_rate_cfg(rate_bps, generation, burst_bytes),
+        pack_rate_cfg(rate_bps, generation, burst_bytes, flags),
         {
             "src_vnic": src_vnic,
             "dst_vnic": dst_vnic,

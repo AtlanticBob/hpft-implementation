@@ -107,6 +107,29 @@ def mimd_factor(R, g, d, eps, beta_max, d_repay, phi_min, floor):
     return max((g / R) * (1.0 - d / d_repay), phi_min)
 
 
+def conf_step(R, T, Ehat, q, dt, k, d_r, tau_r, floor, gamma=0.0, delta=0.15):
+    """Fence design v4 (2026-08-26), one feedback step.
+    R tracks Ehat in log space with the repayment term exp(-(k dt/D_r) q);
+    when the queue is empty and Ehat is above R it jumps straight up.
+    Trust: recovers at 1/tau_r ONLY while the flow-set is clearly under
+    its share (gamma < -delta/2: its own CC is holding it back); decays by
+    the queue, a full queue clearing it within one period. Without the
+    gate an aggressive CC kept ~1% trust from the recovery term alone,
+    and 1% of line rate is 10% of a 20G share - a standing queue of 14 ms
+    in simulation. Returns (R, T)."""
+    Ehat = max(float(Ehat), floor)
+    R0 = max(R, floor)
+    if q <= 0.0 and Ehat > R0:
+        R1 = Ehat
+    else:
+        a = 1.0 - math.exp(-k * dt)
+        R1 = max(R0 * (Ehat / R0) ** a * math.exp(-(k * dt / d_r) * q), floor)
+    T1 = T - min(q / d_r, 1.0) * T
+    if gamma < -0.5 * delta:
+        T1 += dt * (1.0 - T) / tau_r
+    return R1, min(max(T1, 0.0), 1.0)
+
+
 def track_step(R, target, dt, k, floor):
     """THE LAW (design.md §4.2): one first-order step of R towards `target`
     in log space, over a wall-clock interval dt.
@@ -136,7 +159,7 @@ def track_step(R, target, dt, k, floor):
 class FlowState:
     __slots__ = ("R", "last_rx", "last_step", "last_seq", "mode", "pace", "r",
                  "log_R", "log_age", "log_mode", "esc_since", "esc_log",
-                 "shim_last", "epoch", "phase", "acts")
+                 "shim_last", "epoch", "phase", "acts", "T", "Ehat")
 
     def __init__(self, tree, now):
         self.R = tree          # optimistic start at the tree share (§4.2)
@@ -155,6 +178,8 @@ class FlowState:
         self.epoch = -1        # mimd gating: last epoch index acted in
         self.phase = 0.0       # mimd gating: per-flow-set phase offset (s)
         self.acts = 0          # mimd: multiplicative steps taken
+        self.T = 0.0           # conf: trust in the tenant CC (starts at 0)
+        self.Ehat = 0.0        # conf: expected rate reconstructed from gamma
 
 
 def waterfill(capacity, items):
@@ -333,14 +358,19 @@ class RpMailbox:
             except OSError:
                 pass
 
-    def write_batch(self, entries):
-        """entries: [(flowtag_int, budget_bps, rate_bps)]"""
+    def write_batch(self, entries, trust=False):
+        """entries: [(flowtag_int, budget_bps, rate_bps[, trust_fxp16])].
+        trust=True selects the 0xb47d format (four words per entry): the
+        device blends rate = T*cc + (1-T)*level per QP."""
         if not entries:
             return
-        parts = ["0x%x" % (0xb47c0000 | len(entries))]
-        for ft, bud, rate in entries:
+        parts = ["0x%x" % ((0xb47d0000 if trust else 0xb47c0000) | len(entries))]
+        for e in entries:
+            ft, bud, rate = e[0], e[1], e[2]
             parts.append("0x%x %d %d"
                          % (ft, self._units(bud), self._units(rate)))
+            if trust:
+                parts.append("%d" % (e[3] if len(e) > 3 else 0))
         if self._fifo_write(" ".join(parts) + "\n"):
             self.writes += 1
         else:
@@ -380,8 +410,10 @@ class PaceShim:
         self.sock.setblocking(False)
         self.sent = self.acked = self.errs = 0
 
-    def set_rate(self, src, dst, rate_bps):
+    def set_rate(self, src, dst, rate_bps, trust=None):
         msg = {"src_vnic": src, "dst_vnic": dst, "rate_bps": int(rate_bps)}
+        if trust is not None:
+            msg["trust"] = round(float(trust), 4)
         try:
             self.sock.sendto(json.dumps(msg).encode(), self.addr)
             self.sent += 1
@@ -613,8 +645,25 @@ def main():
     # zeta = 0.5*sqrt(k*d_repay) for every flow-set regardless of share.
     vq_dstar = float(ep.get("d_star_s", 0.003))
 
+    # conf (fence design v4): Ehat = A/(1+gamma); R tracks Ehat with the
+    # log first-order step plus the repayment term exp(-(k dt/D_r) q);
+    # exception: q == 0 and Ehat > R jumps straight up. Trust
+    # T' = (1-T)/tau_r - (q/D_r)(T/D_r). The executor blends r = T c + (1-T) R.
+    conf_tr = float(ep.get("trust_recover_s", 1.0))
+
     def step_law(st, rec, now, fsid=""):
-        if law == "vq2":
+        if law == "conf":
+            dt = min(max(now - st.last_step, dt_min), dt_max)
+            st.last_step = now
+            gam = rec.get("u", 1e6) / 1e6 - 1.0     # (1+gamma) scaled
+            q = rec.get("d", 0.0)                   # seconds
+            A = float(rec.get("r", 0))
+            if A > 0 and 1.0 + gam > 0:
+                st.Ehat = A / (1.0 + gam)
+            st.R, st.T = conf_step(st.R, st.T, st.Ehat, q, dt, k,
+                                   vq_repay, conf_tr, floor,
+                                   gamma=gam, delta=ep["delta_demand"])
+        elif law == "vq2":
             g = max(float(rec.get("u", 0.0)), floor)
             d = rec.get("d", 0.0)
             u = g * (1.0 + (vq_dstar - d) / vq_repay)
@@ -774,7 +823,8 @@ def main():
             # this property (it reflushes every rdma_push_ms even when the
             # budget has not changed); the TCP path did not.
             if pace != st.pace or tnow - st.shim_last >= tcp_refresh_s:
-                shim.set_rate(src, dst, pace)
+                shim.set_rate(src, dst, pace,
+                              st.T if law == "conf" else None)
                 st.shim_last = tnow
         elif cls == "rdma":
             ft = pair_ft.get(src_dst, flowtags.get(src))
@@ -787,7 +837,8 @@ def main():
                 # sender tree (measured 2.6x the granted pace). The fix
                 # belongs where the error was - in the receiver's split -
                 # not in refusing to use its output.
-                rdma_batch.append((ft, pace, r_bps))
+                rdma_batch.append((ft, pace, r_bps,
+                                   st.T if law == "conf" else None))
         st.pace = pace
         # executor-escape tripwire (log-only). Every stress-D1 failure class
         # was a silent one: an unpaced EDT pair, an unmatched flowtag and a
@@ -907,6 +958,10 @@ def main():
                 # reads a 2x over-budget condition as something to dig out
                 # of, hard, for both senders at once (2026-07-28).
                 u0 = recs[fsid].get("u", 0)
+                if law == "conf":
+                    rr = recs[fsid].get("r", 0)
+                    g1 = u0 / 1e6 if u0 > 0 else 1.0
+                    u0 = (rr / g1) if (rr > 0 and g1 > 0) else 0
                 flows[fsid].R = min(tree_of(fsid), u0) if u0 > 0 \
                     else tree_of(fsid)
             for fsid, rec in recs.items():
@@ -935,7 +990,8 @@ def main():
                         {"ts": round(time.time(), 4), "fs": fsid,
                          "seq": st.last_seq, "u": int(u), "r": r,
                          "d": round(rec.get("d", 0.0) * 1e3, 3),
-                         "acts": st.acts,
+                         "acts": st.acts, "T": round(st.T, 3),
+                         "Ehat": int(st.Ehat),
                          "R": int(st.R), "pace": int(st.pace),
                          "tree": int(tree_of(fsid)), "tus": tree_us,
                          "mode": st.mode}) + "\n")
@@ -1033,24 +1089,28 @@ def main():
         # (k*ln2 = 13.9 s^-1). Descent is one step, and the RP's
         # proportional feed-forward scales its level by the budget ratio
         # (design.md §5.2).
-        for ft, bud, rate in rdma_batch:
-            latest_rdma[ft] = (bud, rate)
+        for ft, bud, rate, tr in rdma_batch:
+            latest_rdma[ft] = (bud, rate, tr)
         if latest_rdma and now - last_rdma_push >= rdma_push_s:
             mailbox.ensure_open()
             rp_dither_flip = not rp_dither_flip
             entries = []
-            for ft, (bud, rate) in latest_rdma.items():
+            trust_mode = False
+            for ft, (bud, rate, tr) in latest_rdma.items():
                 sent = rdma_sent_budget.get(ft)
                 if sent is None or bud == 0:
                     sent = bud
                 elif abs(bud - sent) > 0.03 * sent:
                     sent = bud     # 3% hysteresis, symmetric
                 rdma_sent_budget[ft] = sent
-                entries.append(
-                    (ft, sent,
-                     max(rate + (1 if rp_dither_flip else -1)
-                         * max(0.03 * rate, 2e5), 2e5)))
-            mailbox.write_batch(entries)
+                ent = [ft, sent,
+                       max(rate + (1 if rp_dither_flip else -1)
+                           * max(0.03 * rate, 2e5), 2e5)]
+                if tr is not None:
+                    trust_mode = True
+                    ent.append(int(round(min(max(tr, 0.0), 1.0) * 65535)))
+                entries.append(tuple(ent))
+            mailbox.write_batch(entries, trust=trust_mode)
             last_rdma_push = now
         shim.drain_acks()
         if recs_all:

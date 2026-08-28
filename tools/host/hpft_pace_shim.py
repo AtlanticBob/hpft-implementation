@@ -116,6 +116,10 @@ def main():
                 dst_vnic=emap[msg["dst_vnic"]],
                 rate_bps=int(msg["rate_bps"]),
                 burst_bytes=BURST_BYTES,
+                # trust in the tenant CC (fence design): flags bit31 set
+                # selects the blend r = T*cc + (1-T)*rate in the BPF program
+                flags=((0x80000000 | int(round(min(max(float(msg["trust"]), 0.0), 1.0) * 65535)))
+                       if "trust" in msg else 0),
                 generation=_gen_for((msg["src_vnic"], msg["dst_vnic"]),
                                     int(msg["rate_bps"])))
             writer.update(upd)

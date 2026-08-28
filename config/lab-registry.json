@@ -382,7 +382,7 @@
     }
   ],
   "policy": {
-    "comment": "design.md §3.2. VM == vnic in this lab. weight = W_i (inter-tenant); max_rate_bps = MaxRate_i (null = uncapped); class_weights = W_{i,TCP}/W_{i,RDMA}. per_sender_weights: 'dst_vnic|class|src_vnic' -> u (absent = 1). LAB SHAPE 2026-08-26: every host carries 8 VFs and every VF is sold at 50 Gb/s. The 50G is enforced by two class-blind hardware/vswitch layers that do not know about each other (tools/lab-infra/vf_caps.sh): devlink tx_max on the VF's representor at its own DPU (uplink), and an OVS drop-band meter on the traffic addressed to the VF at its own DPU (downlink, a naive cloud policer: drops excess, marks nothing). HPFT reads the same number as MaxRate. 8 VMs x 50G = 400G > C' so the ROOT layer binds under full load; one VM alone stays capped below the 200G link.",
+    "comment": "design.md \u00a73.2. VM == vnic in this lab. weight = W_i (inter-tenant); max_rate_bps = MaxRate_i (null = uncapped); class_weights = W_{i,TCP}/W_{i,RDMA}. per_sender_weights: 'dst_vnic|class|src_vnic' -> u (absent = 1). LAB SHAPE 2026-08-26: every host carries 8 VFs and every VF is sold at 50 Gb/s. The 50G is enforced by two class-blind hardware/vswitch layers that do not know about each other (tools/lab-infra/vf_caps.sh): devlink tx_max on the VF's representor at its own DPU (uplink), and an OVS drop-band meter on the traffic addressed to the VF at its own DPU (downlink, a naive cloud policer: drops excess, marks nothing). HPFT reads the same number as MaxRate. 8 VMs x 50G = 400G > C' so the ROOT layer binds under full load; one VM alone stays capped below the 200G link.",
     "vms": {
       "sgpu01/vf0": {
         "weight": 1,
@@ -644,7 +644,7 @@
     "per_sender_weights": {}
   },
   "control": {
-    "comment": "Scheme-E control plane addressing. telemetry: host -> its DPU's in-band ctl IP (PF1 SF on underlay-p1, rides the p1/switch data path per design_e §3.4 user note). pace_shim: sender host -> shim addr as reachable from that host's DPU (tmfifo). tree_stub_bps = static Tree_f until M5's sender tree. rate_export: receiver host -> its DPU rx_agent (tmfifo), fresh kernel-path byte counter for class attribution (2026-07-11).",
+    "comment": "Scheme-E control plane addressing. telemetry: host -> its DPU's in-band ctl IP (PF1 SF on underlay-p1, rides the p1/switch data path per design_e \u00a73.4 user note). pace_shim: sender host -> shim addr as reachable from that host's DPU (tmfifo). tree_stub_bps = static Tree_f until M5's sender tree. rate_export: receiver host -> its DPU rx_agent (tmfifo), fresh kernel-path byte counter for class attribution (2026-07-11).",
     "telemetry_ip": {
       "sgpu01": "10.1.9.1",
       "sgpu02": "10.1.9.2",
@@ -665,9 +665,9 @@
     "rate_export_ms": 5
   },
   "e_params": {
-    "comment": "design.md §6 (tracking-audit law). RESPONSE LAW: the receiver synthesises one target per flow-set, u_f = ceil_f*(1-gamma*s_f) (§3.4), and the sender does first-order tracking in log space, R <- R*(u/R)^(k*T) (§4.2). Fairness still lives entirely in the receiver's water-filling, not in the law. Params are wall-clock quantities (rate constants in s^-1, integrals in bits), so they do not need retuning when period_ms changes -- there is no ref_period_ms scaling any more. k=20 s^-1 is capped by target staleness (k*tau_eff <~ 0.4, tau_eff ~20ms); gamma=0.25 sets both the audit discount band (u >= 0.75*ceil) and the audit-loop damping (zeta = 0.5*sqrt(k*V/(gamma*ceil))); V = v_seconds*headroom*C = 1.6 Gbit is a wall-clock excess-integral: it must NOT scale with the control period, and it IS anchored on C, the downlink bottleneck capacity the receiver actually schedules against (100G here), not on the NIC port line rate -- ehat scales with C, so V must too or the audit loop's damping becomes link-rate dependent (design.md §3.3). rx_agent reads C from the uplink and recomputes V whenever the link speed changes. HEADROOM=0.08 (2026-07-29, overlay-resident): 3% queue-warning + ~5% VxLAN encap tax (inner-byte ledger vs outer-byte wire, measured 4.99% at 1500 MTU); covers inner packets >= ~625 B, smaller-packet overshoot falls back to tenant CC. V IS NOT DERIVED FROM HEADROOM: the real rule is V = 4*zeta^2*gamma*ehat*/k at the typical contention point (design_theory par.3; ehat*=23G, zeta=1/sqrt(2) => V=576 Mbit, revalidated by results/vtune_20260729). v_seconds=0.072 is only the dial that lands V there through the legacy v_sec*headroom*C packaging -- when headroom or C' changes, re-solve V from the zeta rule and re-set v_seconds, do NOT let V drift; design_theory §3 shows it lands 1% from the optimal-damping inverse V = 4*zeta^2*gamma*ehat_star/k at zeta=1/sqrt(2), which is post-hoc confirmation, not a derivation -- re-derive it if the tenant count, flow count, link rate or loop delay changes. Derivations and tuning rules: hpft-design/docs/design_theory.md.",
+    "comment": "design.md \u00a76 (tracking-audit law). RESPONSE LAW: the receiver synthesises one target per flow-set, u_f = ceil_f*(1-gamma*s_f) (\u00a73.4), and the sender does first-order tracking in log space, R <- R*(u/R)^(k*T) (\u00a74.2). Fairness still lives entirely in the receiver's water-filling, not in the law. Params are wall-clock quantities (rate constants in s^-1, integrals in bits), so they do not need retuning when period_ms changes -- there is no ref_period_ms scaling any more. k=20 s^-1 is capped by target staleness (k*tau_eff <~ 0.4, tau_eff ~20ms); gamma=0.25 sets both the audit discount band (u >= 0.75*ceil) and the audit-loop damping (zeta = 0.5*sqrt(k*V/(gamma*ceil))); V = v_seconds*headroom*C = 1.6 Gbit is a wall-clock excess-integral: it must NOT scale with the control period, and it IS anchored on C, the downlink bottleneck capacity the receiver actually schedules against (100G here), not on the NIC port line rate -- ehat scales with C, so V must too or the audit loop's damping becomes link-rate dependent (design.md \u00a73.3). rx_agent reads C from the uplink and recomputes V whenever the link speed changes. HEADROOM=0.08 (2026-07-29, overlay-resident): 3% queue-warning + ~5% VxLAN encap tax (inner-byte ledger vs outer-byte wire, measured 4.99% at 1500 MTU); covers inner packets >= ~625 B, smaller-packet overshoot falls back to tenant CC. V IS NOT DERIVED FROM HEADROOM: the real rule is V = 4*zeta^2*gamma*ehat*/k at the typical contention point (design_theory par.3; ehat*=23G, zeta=1/sqrt(2) => V=576 Mbit, revalidated by results/vtune_20260729). v_seconds=0.072 is only the dial that lands V there through the legacy v_sec*headroom*C packaging -- when headroom or C' changes, re-solve V from the zeta rule and re-set v_seconds, do NOT let V drift; design_theory \u00a73 shows it lands 1% from the optimal-damping inverse V = 4*zeta^2*gamma*ehat_star/k at zeta=1/sqrt(2), which is post-hoc confirmation, not a derivation -- re-derive it if the tenant count, flow count, link rate or loop delay changes. Derivations and tuning rules: hpft-design/docs/design_theory.md.",
     "period_ms": 1,
-    "law": "vq2",
+    "law": "conf",
     "eps": 0.02,
     "d_repay_s": 0.15,
     "phi_min": 0.5,
@@ -700,7 +700,9 @@
     "split_by_sender": true,
     "rdma_unknown_rate_bps": 5000000000.0,
     "rdma_unknown_comment": "per-QP cap for RDMA flows the executor has no budget for yet (mailbox 0xccf); the DPA applies rate per QP, so a 4-QP flow-set gets 4x this",
-    "d_star_s": 0.003
+    "d_star_s": 0.003,
+    "trust_recover_s": 1.0,
+    "conf_comment": "law=conf (fence design v4, 2026-08-26): rx demand=A(1+delta_demand), Q clipped to [0, d_repay_s*E], wire {(1+gamma)*1e6, r, q_us}; tx Ehat=A/(1+gamma), R tracks Ehat (k) with repayment exp(-(k dt/d_repay_s) q), jumps up when q=0; trust T'=(1-T)/trust_recover_s-(q/d_repay_s)(T/d_repay_s), T0=0; executors blend r=T*cc+(1-T)*R"
   },
   "nodes": [
     {

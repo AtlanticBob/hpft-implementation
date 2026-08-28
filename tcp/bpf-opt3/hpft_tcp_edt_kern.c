@@ -62,6 +62,11 @@
 #define HPFT_D_ONE 1048576ULL       /* 1.0, matching the RDMA executor's fxp20 */
 #define HPFT_D_FLOOR (HPFT_D_ONE >> 6)
 #define HPFT_D_RECOVER_NS 300000ULL /* one half-gap step, as on the DPA */
+/* fence design (2026-08-26): cfg->flags bit31 set => trust mode, low 16
+ * bits = trust T in fxp16. The pair is shaped to T*cc + (1-T)*rate where
+ * cc is the flow-set's aggregate cwnd*mss/srtt, capped at line rate. */
+#define HPFT_TRUST_FLAG 0x80000000U
+#define HPFT_LINE_BPS 200000000000ULL
 
 struct hpft_vlan_hdr {
     __u16 h_vlan_TCI;
@@ -283,6 +288,7 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         /* Step 1: read the CC. cwnd*mss is this connection's contribution to
          * the flow-set's aggregate window; cc_delta is what it changed by,
          * which is what the pair's running sum needs. */
+        __u64 srtt_us = 0;
         {
             struct bpf_sock *sk = skb->sk;
 
@@ -294,6 +300,8 @@ int hpft_tcp_edt(struct __sk_buff *skb)
 
                     if (tp) {
                         __u64 win = (__u64)tp->snd_cwnd * (__u64)tp->mss_cache;
+
+                        srtt_us = (__u64)tp->srtt_us >> 3;
 
                         if (fs) {
                             cc_delta = (__s64)win - (__s64)fs->cc_win;
@@ -361,7 +369,21 @@ int hpft_tcp_edt(struct __sk_buff *skb)
             d = state->d;
         }
         /* Step 3: shape to it. */
-        eff_rate = (cfg->rate_bps * (__u64)d) >> 20;
+        if (cfg->flags & HPFT_TRUST_FLAG) {
+            /* trust blend: r = T*cc + (1-T)*rate. cc = aggregate window
+             * over this connection's srtt, capped at line rate. */
+            __u64 t = cfg->flags & 0xffffULL;
+            __u64 cc_bps = 0;
+
+            if (srtt_us) {
+                cc_bps = (state->cc_sum * 8000000ULL) / srtt_us;
+                if (cc_bps > HPFT_LINE_BPS)
+                    cc_bps = HPFT_LINE_BPS;
+            }
+            eff_rate = (cc_bps * t + cfg->rate_bps * (65536ULL - t)) >> 16;
+        } else {
+            eff_rate = (cfg->rate_bps * (__u64)d) >> 20;
+        }
         if (!eff_rate)
             eff_rate = 1;
         packet_ns = hpft_bytes_to_ns(wire, eff_rate);

@@ -215,7 +215,7 @@ int main(int argc, char **argv)
 			for (;;) {
 				unsigned long w0 = strtoul(line, NULL, 0);
 
-				if ((w0 & 0xffff0000ul) == 0xb47c0000ul) {
+				if ((w0 & 0xfffe0000ul) == 0xb47c0000ul) {
 					if (have_batch)
 						dropped++;
 					memcpy(batch, line, sizeof(batch));
