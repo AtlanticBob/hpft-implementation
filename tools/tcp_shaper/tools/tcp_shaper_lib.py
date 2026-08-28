@@ -183,7 +183,7 @@ def pack_pair_state(next_ns: int = 0, generation: int = 0) -> bytes:
     """struct hpft_pair_state: lock, reserved0, next_ns, generation, then the
     observer's cc_sum, cc_prev, d_ts, d, reserved1. The datapath initialises
     d itself when it reads zero, so seeding zeros stays correct."""
-    return struct.pack("<IIQQQQQII", 0, 0, next_ns, generation, 0, 0, 0, 0, 0)
+    return struct.pack("<IIQQQQQIIIIQQ", 0, 0, next_ns, generation, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 
 def normalize_positive_int(value: Any, field: str) -> int:

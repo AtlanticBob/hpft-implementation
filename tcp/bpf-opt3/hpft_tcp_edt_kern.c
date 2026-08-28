@@ -67,6 +67,10 @@
  * cc is the flow-set's aggregate cwnd*mss/srtt, capped at line rate. */
 #define HPFT_TRUST_FLAG 0x80000000U
 #define HPFT_LINE_BPS 200000000000ULL
+#define HPFT_TRUST_EPOCH_NS 1000000ULL      /* trust updated once per ms */
+#define HPFT_TRUST_UNDER_NS 20000000ULL     /* 20 ms clearly under the fence */
+#define HPFT_TRUST_STEP 66ULL               /* fxp16 per ms = 1 ms / 1 s */
+#define HPFT_TRUST_MARGIN 60555ULL          /* fxp16: 1 - 0.075 */
 
 struct hpft_vlan_hdr {
     __u16 h_vlan_TCI;
@@ -97,6 +101,12 @@ struct hpft_pair_state {
      * the active branch is working; this counter is the evidence that it
      * is. */
     __u32 cuts;
+    /* fence design: executor-owned trust (fxp16), its last update time,
+     * and how long the CC has asked for less than the fence allows */
+    __u32 trust;
+    __u32 pad1;
+    __u64 trust_ns;
+    __u64 under_ns;
 };
 
 struct {
@@ -371,15 +381,36 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         /* Step 3: shape to it. */
         if (cfg->flags & HPFT_TRUST_FLAG) {
             /* trust blend: r = T*cc + (1-T)*rate. cc = aggregate window
-             * over this connection's srtt, capped at line rate. */
-            __u64 t = cfg->flags & 0xffffULL;
+             * over this connection's srtt, capped at line rate. The
+             * flags' low 16 bits carry the queue fraction q/D_r; the
+             * trust itself is kept here, once per ms: decayed by the
+             * queue fraction, recovered while the CC asks for less than
+             * the fence allows for 20 ms. */
+            __u64 qf = cfg->flags & 0xffffULL;
             __u64 cc_bps = 0;
+            __u64 t;
 
             if (srtt_us) {
                 cc_bps = (state->cc_sum * 8000000ULL) / srtt_us;
                 if (cc_bps > HPFT_LINE_BPS)
                     cc_bps = HPFT_LINE_BPS;
             }
+            if (now - state->trust_ns >= HPFT_TRUST_EPOCH_NS) {
+                __u64 el = now - state->trust_ns;
+
+                state->trust_ns = now;
+                t = state->trust;
+                t -= (t * qf) >> 16;
+                if (qf == 0 && cc_bps * 65536ULL < cfg->rate_bps * HPFT_TRUST_MARGIN) {
+                    state->under_ns += el;
+                    if (state->under_ns >= HPFT_TRUST_UNDER_NS)
+                        t += ((65536ULL - t) * HPFT_TRUST_STEP) >> 16;
+                } else {
+                    state->under_ns = 0;
+                }
+                state->trust = t > 65536ULL ? 65536U : (__u32)t;
+            }
+            t = state->trust;
             eff_rate = (cc_bps * t + cfg->rate_bps * (65536ULL - t)) >> 16;
         } else {
             eff_rate = (cfg->rate_bps * (__u64)d) >> 20;

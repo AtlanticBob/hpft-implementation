@@ -284,8 +284,10 @@ typedef struct {
 	 * block) */
 	volatile uint32_t qp_slot[HPFT_PAIR_QPS];
 	volatile uint32_t qp_nslot;
-	volatile uint32_t trust;	/* fxp16; valid when trust_mode */
+	volatile uint32_t trust;	/* fxp16, executor-owned (fence design) */
 	volatile uint32_t trust_mode;	/* 1: rate = T*cc + (1-T)*level */
+	volatile uint32_t qfrac;	/* fxp16: q/D_r from the sender agent */
+	volatile uint32_t under_ep;	/* epochs the CC asked for less than the fence */
 	volatile uint32_t epoch_id;	/* bumped once per epoch, ages the map */
 	volatile uint32_t cnp_hits;	/* DIAG 2026-07-22: CNP events matched to THIS pair
 					 * (target>=0 && ev_type==ROCE_CNP), vs g_hpft_cnp_any
@@ -484,6 +486,13 @@ static volatile uint32_t g_hpft_cc_algo = HPFT_CC_DCQCN;
  * conservative allowance; without an agent it stays MAX, i.e. the old
  * behaviour. */
 static volatile uint32_t g_hpft_unknown_rate = DOCA_PCC_DEV_MAX_RATE;
+/* fence design trust (executor-owned): per epoch T -= (q/D_r)*T; when the
+ * queue is empty and the CC asks for less than the fence allows (cc <
+ * level*(1-margin)) for HPFT_TRUST_UNDER_EP epochs, T += (1-T)/tau_r per
+ * epoch. Margin = half the receiver's demand margin (15%). */
+#define HPFT_TRUST_MARGIN_FXP16 (60555u)   /* 1 - 0.075 */
+#define HPFT_TRUST_UNDER_EP     (20u)
+static volatile uint32_t g_trust_step = 66u;   /* fxp16 per epoch = 1 ms / 1 s */
 static volatile uint32_t g_hpft_rtt_events;   /* RTT events seen, any flowtag */
 /* DIAG 2026-08-27: which event types carry a stable QPN? Per ev_type&7:
  * last qpn seen and how often it differed from the previous one. */
@@ -579,7 +588,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 									c->last_rrx_used = erx; /* don't integrate on pre-change (stale) R */
 												}
 								c->remote_rx_rate = erx;
-								c->trust = etr;
+								c->qfrac = etr;
 								c->trust_mode = (w == 4u);
 						}
 						fidx = -2;
@@ -600,7 +609,9 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					c->qp_count = 0;	/* relearned from events */
 					c->qp_nslot = 0;
 					c->remote_rx_rate = erx;
-					c->trust = etr;
+					c->qfrac = etr;
+					c->trust = 0;
+					c->under_ep = 0;
 					c->trust_mode = (w == 4u);
 					for (int s = 0; s < HPFT_MAX_THREADS; s++)
 						c->b32_shard[s] = 0;
@@ -642,7 +653,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[7] = (uint32_t)hpft_pace_limited(c);
 			rsp[8] = c->dbg_hits;   /* events the DPA processed for this pair */
 			rsp[9] = c->d_cuts;
-			rsp[10] = 0;
+			rsp[10] = c->trust;
 			*response_size = 11 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
@@ -723,6 +734,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 4) g_d_floor = budget;
 			else if (which == 5) g_d_recover_us = budget ? budget : 1u;
 			else if (which == 6) g_pace_pct = budget;
+			else if (which == 7) g_trust_step = budget;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		if (ft == 0xccfu) {
@@ -1218,6 +1230,23 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 					if (want < HPFT_MIN_LEVEL)
 						want = HPFT_MIN_LEVEL;
 					c->level = want;
+				}
+				if (c->trust_mode) {
+					/* executor-owned trust, once per epoch */
+					uint32_t t = c->trust;
+					uint32_t qf = c->qfrac > 65536u ? 65536u : c->qfrac;
+
+					t -= (uint32_t)(((uint64_t)t * qf) >> 16);
+					if (qf == 0 &&
+					    (uint64_t)c->cc_rate * 65536u <
+					    (uint64_t)c->level * HPFT_TRUST_MARGIN_FXP16) {
+						if (++c->under_ep >= HPFT_TRUST_UNDER_EP)
+							t += (uint32_t)(((uint64_t)(65536u - t)
+								* g_trust_step) >> 16);
+					} else {
+						c->under_ep = 0;
+					}
+					c->trust = t > 65536u ? 65536u : t;
 				}
 				if (g_hpft_cc_algo == HPFT_CC_AIMD) {
 					/* AIMD backstop: fixed additive step per epoch */

@@ -107,16 +107,30 @@ def mimd_factor(R, g, d, eps, beta_max, d_repay, phi_min, floor):
     return max((g / R) * (1.0 - d / d_repay), phi_min)
 
 
-def conf_step(R, T, Ehat, q, dt, k, d_r, tau_r, floor, gamma=0.0, delta=0.15):
+def conf_step(R, T, Ehat, q, dt, k, d_r, tau_r, floor, gamma=0.0, delta=0.15,
+              under=0, under_n=20, A=0.0, a_ref=0.0):
     """Fence design v4 (2026-08-26), one feedback step.
     R tracks Ehat in log space with the repayment term exp(-(k dt/D_r) q);
     when the queue is empty and Ehat is above R it jumps straight up.
-    Trust: recovers at 1/tau_r ONLY while the flow-set is clearly under
-    its share (gamma < -delta/2: its own CC is holding it back); decays by
-    the queue, a full queue clearing it within one period. Without the
-    gate an aggressive CC kept ~1% trust from the recovery term alone,
-    and 1% of line rate is 10% of a 20G share - a standing queue of 14 ms
-    in simulation. Returns (R, T)."""
+    Trust: recovers at 1/tau_r ONLY while the flow-set owes nothing
+    (q == 0) AND is clearly under its share (gamma < -delta/2: its own CC
+    is holding it back), and only once that has held for under_n
+    consecutive feedbacks (one loop delay). Decays by the queue, a full
+    queue clearing it within one period.
+    Why each clause (lab, conf_i8 2026-08-28): with the gate on gamma
+    alone, the repayment phase itself - R pushed below E to drain the
+    queue - reads as "under share", trust recovered DURING repayment,
+    12% trust x 200G line rate leaked 24G into every TCP flow-set, the
+    link ran at 103%, DCQCN got CNPs and RDMA starved at 0.5G. The q == 0
+    clause removes that cycle; the consecutive-period clause keeps 20 ms
+    arrival noise from opening the gate. Third clause (sim, join
+    transient): a flow-set CLIMBING under the receiver's delta margin
+    also reads gamma = -delta/(1+delta) by construction (E chases A), so
+    it earned trust while joining and 5% trust x line rate threw it to
+    3x its share; recovery therefore also requires the arrival to be
+    flat over the run (A within delta/2 of where the run started) - a
+    CC-limited flow is flat, a climbing one is not.
+    Returns (R, T, under, a_ref)."""
     Ehat = max(float(Ehat), floor)
     R0 = max(R, floor)
     if q <= 0.0 and Ehat > R0:
@@ -124,10 +138,14 @@ def conf_step(R, T, Ehat, q, dt, k, d_r, tau_r, floor, gamma=0.0, delta=0.15):
     else:
         a = 1.0 - math.exp(-k * dt)
         R1 = max(R0 * (Ehat / R0) ** a * math.exp(-(k * dt / d_r) * q), floor)
-    T1 = T - min(q / d_r, 1.0) * T
-    if gamma < -0.5 * delta:
-        T1 += dt * (1.0 - T) / tau_r
-    return R1, min(max(T1, 0.0), 1.0)
+    # The trust itself lives in the executor (it is the only place that
+    # sees the tenant CC's rate next to ours; from the sender agent a
+    # CC-limited flow and one we are fencing look the same, since at zero
+    # trust the wire IS our rate). The agent forwards the queue fraction
+    # q/D_r; the executor decays its trust by it and recovers trust only
+    # while the CC asks for less than the fence allows.
+    T1 = min(q / d_r, 1.0)
+    return R1, T1, under, a_ref
 
 
 def track_step(R, target, dt, k, floor):
@@ -159,7 +177,8 @@ def track_step(R, target, dt, k, floor):
 class FlowState:
     __slots__ = ("R", "last_rx", "last_step", "last_seq", "mode", "pace", "r",
                  "log_R", "log_age", "log_mode", "esc_since", "esc_log",
-                 "shim_last", "epoch", "phase", "acts", "T", "Ehat")
+                 "shim_last", "epoch", "phase", "acts", "T", "Ehat", "under",
+                 "a_ref")
 
     def __init__(self, tree, now):
         self.R = tree          # optimistic start at the tree share (§4.2)
@@ -180,6 +199,8 @@ class FlowState:
         self.acts = 0          # mimd: multiplicative steps taken
         self.T = 0.0           # conf: trust in the tenant CC (starts at 0)
         self.Ehat = 0.0        # conf: expected rate reconstructed from gamma
+        self.under = 0         # conf: consecutive feedbacks clearly under share
+        self.a_ref = 0.0       # conf: arrival when that run started
 
 
 def waterfill(capacity, items):
@@ -660,9 +681,10 @@ def main():
             A = float(rec.get("r", 0))
             if A > 0 and 1.0 + gam > 0:
                 st.Ehat = A / (1.0 + gam)
-            st.R, st.T = conf_step(st.R, st.T, st.Ehat, q, dt, k,
-                                   vq_repay, conf_tr, floor,
-                                   gamma=gam, delta=ep["delta_demand"])
+            st.R, st.T, st.under, st.a_ref = conf_step(
+                st.R, st.T, st.Ehat, q, dt, k, vq_repay, conf_tr, floor,
+                gamma=gam, delta=ep["delta_demand"], under=st.under,
+                under_n=int(ep.get("trust_under_n", 20)), A=A, a_ref=st.a_ref)
         elif law == "vq2":
             g = max(float(rec.get("u", 0.0)), floor)
             d = rec.get("d", 0.0)
@@ -824,7 +846,7 @@ def main():
             # budget has not changed); the TCP path did not.
             if pace != st.pace or tnow - st.shim_last >= tcp_refresh_s:
                 shim.set_rate(src, dst, pace,
-                              st.T if law == "conf" else None)
+                              st.T if law == "conf" else None)   # T = queue fraction q/D_r
                 st.shim_last = tnow
         elif cls == "rdma":
             ft = pair_ft.get(src_dst, flowtags.get(src))
@@ -838,7 +860,7 @@ def main():
                 # belongs where the error was - in the receiver's split -
                 # not in refusing to use its output.
                 rdma_batch.append((ft, pace, r_bps,
-                                   st.T if law == "conf" else None))
+                                   st.T if law == "conf" else None))   # T = queue fraction
         st.pace = pace
         # executor-escape tripwire (log-only). Every stress-D1 failure class
         # was a silent one: an unpaced EDT pair, an unmatched flowtag and a

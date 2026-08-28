@@ -16,14 +16,23 @@ def check(name, ok, detail):
 def sim(fs, R0, cc, secs=2.0, cap=40e9, events=()):
     pol = {"vms": {"sgpu02/vf0": {"weight": 1, "max_rate_bps": cap, "class_weights": {"tcp": 1, "rdma": 1}}}}
     sched = rx_agent.Scheduler(pol, 100e9, 0.0, 0.0); sched.set_downlink(100e9)
-    R = dict(R0); T = {f: 0.0 for f in fs}; Q = {f: 0.0 for f in fs}; Ehat = dict(R0)
-    pend = []; hist = []; t = 0.0; active = set(fs)
+    R = dict(R0); T = {f: 0.0 for f in fs}; Q = {f: 0.0 for f in fs}; Ehat = dict(R0); U = {f: 0 for f in fs}; AR = {f: 0.0 for f in fs}; QF = {}; UN = {}
+    pend = []; hist = []; t = 0.0; active = set(f for f in fs if not any(ev[1] == f and ev[2] for ev in events))
     for i in range(int(secs / T_P)):
         for (te, f, on) in events:
             if abs(t - te) < T_P / 2: (active.add if on else active.discard)(f)
         rates = {}
         for f in active:
-            c = cc(f, t); r = T[f] * c + (1 - T[f]) * R[f]; rates[f] = r
+            c = cc(f, t)
+            # executor-owned trust: decay by the queue fraction (carried in QF), recover while c < R(1-delta/2) for 20 ms
+            qf = QF.get(f, 0.0)
+            T[f] -= min(qf, 1.0) * T[f]
+            if qf <= 0 and c < R[f] * (1 - 0.5 * DELTA):
+                UN[f] = UN.get(f, 0) + 1
+                if UN[f] >= 20: T[f] += T_P * (1 - T[f]) / TR
+            else:
+                UN[f] = 0
+            r = T[f] * c + (1 - T[f]) * R[f]; rates[f] = r
         demand = {f: rates[f] * (1 + DELTA) for f in active}
         ents, _ = sched.entitlements(rates, demand)
         rec = {}
@@ -39,7 +48,7 @@ def sim(fs, R0, cc, secs=2.0, cap=40e9, events=()):
                 if f not in active: continue
                 q, g, A = rc[f]
                 if A > 0 and 1 + g > 0: Ehat[f] = A / (1 + g)
-                R[f], T[f] = tx_agent_e.conf_step(R[f], T[f], Ehat[f], q, T_P, K, DR, TR, FLOOR, gamma=g, delta=DELTA)
+                R[f], QF[f], U[f], AR[f] = tx_agent_e.conf_step(R[f], T[f], Ehat[f], q, T_P, K, DR, TR, FLOOR, gamma=g, delta=DELTA, under=U[f], A=A, a_ref=AR[f])
         hist.append((t, dict(rates), dict(Q), dict(T))); t += T_P
     return hist
 A, B = "sgpu01/vf0>sgpu02/vf0|rdma", "sgpu03/vf0>sgpu02/vf0|rdma"
