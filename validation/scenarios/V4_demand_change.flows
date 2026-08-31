@@ -1,0 +1,5 @@
+# src_host src_vf dst_vf class count start_s end_s options   (dst host = sgpu02; times on the experiment clock, after the 5 s warm-up)
+sgpu01 0 0 tcp 4 0 90 -
+sgpu01 0 0 rdma 1 0 30 rate_limit=10
+sgpu01 0 0 rdma 4 30 60 -
+sgpu01 0 0 rdma 1 60 90 rate_limit=10

@@ -56,3 +56,17 @@ results/vf_caps_20260826/results/
 
 # raw data of the Swift bring-up (distilled figures + summary stay)
 results/swift_20260827/results/
+
+# validation/: the suite (README, criteria, scenarios, runner, distiller,
+# plots) and its DERIVED artefacts (data/ fig/ reports/) are tracked; the
+# raw per-run capture is not - it is ~20 MB a run and is reproducible only
+# in the sense that the lab state that produced it is gone anyway.
+validation/results/
+validation/__pycache__/
+
+# bulk raw telemetry the older patterns did not reach (the earlier
+# globs assumed a <tag>_tx.jsonl name; the arms carry <arm>_tx_<host>)
+results/*/results/*_tx_*.jsonl
+results/*/results/*_rx_*.jsonl
+results/conf_20260828/
+results/step_arms_20260825/results/
