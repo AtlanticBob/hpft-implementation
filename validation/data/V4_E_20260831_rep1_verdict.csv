@@ -1,6 +1,0 @@
-criterion,pass,detail
-1 稳态贴合,FAIL,0-30s sgpu01/vf0>sgpu02/vf0|tcp 48.77 vs 37.66; 0-30s sgpu01/vf0>sgpu02/vf0|rdma 0.31 vs 10.73; 30-60s sgpu01/vf0>sgpu02/vf0|rdma 23.00 vs 25.00
-2 队列消得掉,PASS,ok
-3 收敛 ≤ 1 s,FAIL,30s tcp x1 7084 ms; 30s rdma x1 7155 ms
-4 不塌,FAIL,sgpu01/vf0>sgpu02/vf0|rdma below half its share from 2.0s; sgpu01/vf0>sgpu02/vf0|rdma below half its share from 2.0s; sgpu01/vf0>sgpu02/vf0|rdma below half its share from 2.0s
-5 平台健康,PASS,ok

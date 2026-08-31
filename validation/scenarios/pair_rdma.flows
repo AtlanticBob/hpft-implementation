@@ -1,0 +1,4 @@
+# src_host src_vf dst_vf class count start_s end_s options   (dst host = sgpu02; times on the experiment clock, after the 5 s warm-up)
+# Two tenants competing for one destination VM's 50 G cap, RDMA only.
+sgpu01 0 0 rdma 10 0 30 -
+sgpu03 0 0 rdma 10 0 30 -
