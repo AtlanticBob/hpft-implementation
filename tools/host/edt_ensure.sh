@@ -43,10 +43,16 @@ for d in $(ls /sys/class/net | grep -E '^dpu1vf[0-9]+$'); do
     want=$(sudo "$B" prog show pinned "$PIN/hpft_tcp_edt" 2>/dev/null \
            | head -1 | cut -d: -f1)
     [ -n "$want" ] || echo "  WARN $d: cannot read the pinned program id ($B)"
+    # Every program id attached, not just the first one tc prints: `tc filter
+    # replace` without a handle ADDS a filter, so a re-apply used to leave the
+    # previous program (with its now-unpinned maps and stale rates) attached
+    # underneath the new one. Anything other than exactly {want} is torn down.
     have=$(tc filter show dev "$d" egress 2>/dev/null \
-           | grep -o 'id [0-9]*' | head -1 | cut -d' ' -f2)
-    [ -n "$want" ] && [ "$have" = "$want" ] \
-        || sudo tc filter replace dev "$d" egress pref 10 protocol all \
+           | grep -o 'id [0-9]*' | cut -d' ' -f2 | sort -u | tr '\n' ' ')
+    if [ -z "$want" ] || [ "$have" != "$want " ]; then
+        sudo tc filter del dev "$d" egress pref 10 2>/dev/null
+        sudo tc filter add dev "$d" egress pref 10 handle 1 protocol all \
                bpf da object-pinned "$PIN/hpft_tcp_edt"
-    echo "$d: fq=$(tc qdisc show dev "$d" | grep -c '^qdisc fq') edt_prog=$(tc filter show dev "$d" egress | grep -o 'id [0-9]*' | head -1 | cut -d' ' -f2) want=$want"
+    fi
+    echo "$d: fq=$(tc qdisc show dev "$d" | grep -c '^qdisc fq') edt_prog=$(tc filter show dev "$d" egress | grep -o 'id [0-9]*' | cut -d' ' -f2 | sort -u | tr '\n' ',') want=$want"
 done

@@ -70,6 +70,15 @@ start_sender() { # $1 = host
   # fail; a role switch that restarts agents alone reproduces it every time.
   ssh -o BatchMode=yes "$d" "bash /opt/hpft/rp_service.sh start" >/dev/null 2>&1 \
     || echo "  WARN $h ($d): RP restart failed - the executor will not pace"
+  # The sender's vport meter feeds the sender-liveness report (per-VF tx
+  # counters at ~1 ms) that the receiver uses to split a VM's class pool
+  # between senders and to notice a departed sender at once. Without it
+  # the receiver falls back to the ~1 s megaflow cache for that sender:
+  # joins settle seconds late and a departed sender lingers for the mix
+  # window (V2, 2026-08-28: sgpu03's meter had never been started).
+  ssh -o BatchMode=yes "$d" "sudo install -m644 /opt/hpft/hpft-vport-meter.service /etc/systemd/system/ && sudo systemctl daemon-reload
+    sudo systemctl enable --now hpft-vport-meter 2>/dev/null" >/dev/null 2>&1 \
+    || echo "  WARN $h ($d): vport meter did not start - sender liveness feed absent"
   ssh -o BatchMode=yes "$d" "sudo systemctl reset-failed hpft-txagent-e 2>/dev/null
     sudo rm -f /tmp/hpft_txagent_e.jsonl
     sudo systemd-run --unit hpft-txagent-e /usr/bin/python3 /opt/hpft/tx_agent_e.py --local-host $h" >/dev/null 2>&1 \

@@ -12,11 +12,23 @@
 #             dropped, nothing is marked, no signal reaches any CC)
 #
 # Both are installed on EVERY DPU, because any node may send or receive in a
-# given experiment. The meter flow matches on nw_dst only: traffic to a VF
-# arrives on some tunnel port, traffic leaving a VF never carries its own IP
-# as destination, so no in_port qualifier is needed and the flow survives
-# tunnel renames. The meter id is 11 + VF index (11..18), below any id an
-# experiment might add by hand.
+# given experiment. The meter flows match on nw_dst: traffic to a VF arrives
+# on some tunnel port, traffic leaving a VF never carries its own IP as
+# destination, so no in_port qualifier is needed and the flow survives tunnel
+# renames. The meter id is 11 + VF index (11..18), below any id an experiment
+# might add by hand.
+#
+# THREE rules per VF, one per class, all pointing at the same meter, and that
+# is not cosmetic. A single nw_dst-only rule at a priority above the receiver
+# agent's classification rules (50 RoCE / 45 TCP / 40 ip) resolves the lookup
+# without the classifier ever examining nw_proto, so the datapath megaflow it
+# produces carries no proto field - and the receiver, which reads its per-class
+# arrivals out of exactly those megaflow keys, then books every packet as
+# ip_other, schedules nothing, and reports zero for every flow-set (measured
+# 2026-08-29: V7 showed 24 flow-sets at 0.00 G with the wire carrying 6 G
+# each). Splitting the rule by class forces the lookup to examine the L4
+# fields, so the megaflow keeps them. The cap is unchanged: every packet still
+# passes exactly one meter action, and it is the same meter.
 #
 #   vf_caps.sh sync        devlink caps + meters on all DPUs from the policy
 #   vf_caps.sh clear       release every devlink cap and delete every meter
@@ -52,9 +64,13 @@ meter_on() { # $1 host $2 dpu
   local rows; rows=$(vf_rows "$1")
   ssh -o BatchMode=yes "$2" "while read -r i ip kbps; do
       [ -n \"\$i\" ] || continue
+      sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"udp,nw_dst=\$ip,tp_dst=4791\" 2>/dev/null
+      sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"tcp,nw_dst=\$ip\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"ip,nw_dst=\$ip\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 del-meter $BR \"meter=\$((11+i))\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 add-meter $BR \"meter=\$((11+i)),kbps,band=type=drop,rate=\$kbps\"
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=122,udp,nw_dst=\$ip,tp_dst=4791,actions=meter:\$((11+i)),NORMAL\"
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=121,tcp,nw_dst=\$ip,actions=meter:\$((11+i)),NORMAL\"
       sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=120,ip,nw_dst=\$ip,actions=meter:\$((11+i)),NORMAL\"
     done <<'EOF'
 $rows
@@ -63,7 +79,9 @@ EOF
 }
 meter_off() {
   ssh -o BatchMode=yes "$2" "for i in 0 1 2 3 4 5 6 7; do
-      sudo ovs-ofctl -O OpenFlow13 dump-flows $BR 2>/dev/null | grep -o 'nw_dst=[0-9.]* actions=meter:'\$((11+i)) | cut -d' ' -f1 | while read -r m; do
+      sudo ovs-ofctl -O OpenFlow13 dump-flows $BR 2>/dev/null | grep -o 'nw_dst=[0-9.]* actions=meter:'\$((11+i)) | cut -d' ' -f1 | sort -u | while read -r m; do
+        sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"udp,\$m,tp_dst=4791\" 2>/dev/null
+        sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"tcp,\$m\" 2>/dev/null
         sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"ip,\$m\"; done
       sudo ovs-ofctl -O OpenFlow13 del-meter $BR \"meter=\$((11+i))\" 2>/dev/null
     done; echo '  $1 ($2): meters removed'"

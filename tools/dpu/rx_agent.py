@@ -287,7 +287,8 @@ class VportMeter:
         self.mm = None
         self.slot_of_vnic = {}
 
-    def sample(self, now, nkeep):
+    def sample(self, now, nkeep, window_s=0.02):
+        self.window_s = window_s
         """Ingest the newest record per local vnic; sets self.fresh."""
         self.fresh = set()
         if self.mm is None and not self._open(now):
@@ -311,7 +312,15 @@ class VportMeter:
                 self.last_t[vnic] = t_ns
                 ring = self.ring.setdefault(vnic, [])
                 ring.append((t_ns / 1e9, rx_ib, rx_eth))
-                while len(ring) > nkeep:
+                # Trim by TIME on the meter's own timestamps, not by sample
+                # count: the meter's round over 8 vports takes ~13 ms, so
+                # nkeep samples sized for a 1 ms cadence (21 for a 20 ms
+                # window) spanned ~270 ms and every receiver-side rate
+                # lagged the wire by ~130 ms (found 2026-08-29 with synced
+                # DPU clocks). The meter's timestamps are exact, so a time
+                # window is jitter-robust here; keep at least two samples.
+                horizon = ring[-1][0] - self.window_s
+                while len(ring) > 2 and ring[1][0] <= horizon:
                     ring.pop(0)
         if self.fresh:
             self._last_any_fresh = now
@@ -350,6 +359,11 @@ class SenderLiveness:
 
     STALE_S = 0.3
     IDLE_BPS = 50e6      # below the pace floor => not sending
+    SMOOTH_S = 0.0       # ratio smoothing (see poll); 0 = use each report as it comes.
+                         # 100 ms was tried (2026-08-29, r10): for a VM with 2-3
+                         # senders the ratio IS inside the control loop, and the
+                         # lag turned 5 % attribution jitter into 33 % real
+                         # oscillation with 40 ms queues. Jitter is the lesser evil.
 
     def __init__(self, port):
         self.rate = {}                 # "host/vnic|class" -> bps
@@ -376,8 +390,17 @@ class SenderLiveness:
                 # keys arrive as "<vnic_id>|<class>" and vnic_id already
                 # carries the host ("sgpu01/vf0"), which is exactly the
                 # form the flow-set id uses -- store verbatim.
+                # Smooth the reported rates over ~100 ms before they become
+                # the split RATIO: each report is one ~13 ms sample of the
+                # sender's meter and jitters by a few percent while the
+                # fence moves every feedback (v4). The pool it splits is the
+                # receiver's own 20 ms rate, so smoothing the ratio adds no
+                # lag to the total and takes the jitter out of every
+                # flow-set's arrival (5 % -> 2 % at 20 ms, V1 2026-08-29).
+                a = min(1.0, (now - self.t) / self.SMOOTH_S) if (self.t and self.SMOOTH_S > 0) else 1.0
                 for k, v in msg["r"].items():
-                    self.rate[k] = float(v)
+                    old = self.rate.get(k)
+                    self.rate[k] = float(v) if old is None else old + (float(v) - old) * a
                 self.t = now
             except (ValueError, KeyError):
                 continue
@@ -573,7 +596,7 @@ class HybridRates:
         # sysfs ring above is still maintained every tick, so a meter
         # death fails over with a warm window.
         if self.meter is not None:
-            for vnic in self.meter.sample(now, nkeep):
+            for vnic in self.meter.sample(now, nkeep, self.rate_window):
                 mr = self.meter.rates(vnic)
                 if mr is not None:
                     self.r_d[vnic] = mr[0] + mr[1]
@@ -779,8 +802,10 @@ class Scheduler:
         Root capacity must follow, or the account never sees the shortage."""
         self.c_root = speed_bps * (1.0 - self.headroom)
 
-    def entitlements(self, rates, demand_in=None):
+    def entitlements(self, rates, demand_in=None, vm_minus=None):
         """See _entitlements_py for the reference implementation.
+        vm_minus: {dst_vm: bps} already consumed on that VM by traffic the
+        scheduler does not control (C path only; the Python fallback ignores it).
 
         The C path computes the same two outputs in one crossing of the
         ctypes boundary; it is property-tested to agree with the Python
@@ -791,10 +816,10 @@ class Scheduler:
             demand = demand_in if demand_in is not None else \
                 {f: r * (1.0 + self.delta) for f, r in rates.items()}
             if demand:
-                return self._entitlements_c(demand)
+                return self._entitlements_c(demand, vm_minus)
         return self._entitlements_py(rates, demand_in)
 
-    def _entitlements_c(self, demand):
+    def _entitlements_c(self, demand, vm_minus=None):
         vms = self.policy["vms"]
         upw = self.policy.get("per_sender_weights", {})
         fsids = list(demand)
@@ -818,6 +843,8 @@ class Scheduler:
             vm_w[i] = float(p.get("weight", 1))
             m = p.get("max_rate_bps")
             vm_max[i] = float(m) if m else float("inf")
+            if vm_minus and d in vm_minus:
+                vm_max[i] = max(vm_max[i] - float(vm_minus[d]), 0.0)
             cwd = p.get("class_weights", {})
             for c, j in cls_ids.items():
                 cls_w[i * n_cls + j] = float(cwd.get(c, 1))
@@ -1412,13 +1439,18 @@ def main():
     # law=conf (fence design v4, 2026-08-26): demand = A(1+delta) for every
     # flow-set, Q += (A-E)T clipped to [0, D_r*E], feedback {q, gamma}.
     conf_q = {}                       # fsid -> Q bits
+    conf_other, conf_other_vm = 0.0, {}   # smoothed unscheduled arrival: total, per dst VM
+    conf_other_tau = float(ep.get("other_tau_s", 0.1))
+    conf_eps = float(ep.get("eps_at_share", 0.03))   # v4: "at share" band for the direction bit
+    conf_aavg, conf_avg_tau = {}, float(ep.get("decision_avg_s", 0.1))   # v4: averaged arrival for b / lender decisions
+    conf_croot = sched.c_root
     conf_dr = float(ep.get("d_repay_s", 0.15))
     vqs = VirtualQueueScheduler(sched, ep.get("d_clip_s", 0.2),
                                 hold_s=ep.get("backlog_hold_s", 0.0))
     delays = {}
     print("rx_agent: law=%s%s" % (law, "  d_clip=%.0fms hold=%.0fms" % (
         ep.get("d_clip_s", 0.2) * 1e3, ep.get("backlog_hold_s", 0.0) * 1e3)
-        if law in ("vq", "vq2", "conf") else ""), flush=True)
+        if law in ("vq", "vq2", "conf", "conf_v3") else ""), flush=True)
     last_speed = c_link
     sched.set_downlink(c_link)
 
@@ -1538,20 +1570,86 @@ def main():
             # Hysteresis (enter 0.95, leave 0.85) keeps the two regimes
             # from chattering when a genuinely small flow leaves capacity
             # unused and utilisation drops back.
-            if law == "conf":
-                demand = {f: max(active.get(f, 0.0), 0.0) * (1.0 + ep["delta_demand"])
-                          for f in active}
-                ents, ceils = sched.entitlements(active, demand)
+            if law in ("conf", "conf_v3"):
+                # Expected rate E (fence design, 2026-08-28 revision).
+                # share = what each flow-set is guaranteed given who is
+                # present (everyone asks for everything). A flow-set using
+                # less than its share is a LENDER: its E stays at the share
+                # (so it can climb back to it in one step - its arrival is
+                # not read as "does not want more"), and what it leaves
+                # unused is lent through the water-filling by giving it the
+                # demand A(1+delta) there. Everyone else asks for everything
+                # and is granted share + a fair part of what was lent; that
+                # grant is its E, and the virtual queue reclaims it the
+                # moment a lender comes back.
+                # Physical capacity, not nominal: traffic this scheduler does
+                # not control (ip_other - anything that is neither RDMA nor
+                # TCP) still crosses the same port and the same VM cap, so
+                # the root and the VM caps are what is left after it. Without
+                # this the account allocates the full port while the port is
+                # already partly taken, the surplus queues at the switch, and
+                # the tenants' CCs get crushed there (V7, 2026-08-28: 40 G of
+                # UDP left RDMA at 0.7 % while TCP was lent RDMA's share).
+                # Smoothed over ~100 ms so one burst does not move the root;
+                # lending is bounded by the same water-filling, so it cannot
+                # hand out capacity the port does not physically have.
+                other_now, other_vm_now = 0.0, {}
+                for f, r_ in rates.items():
+                    if f.rsplit("|", 1)[1] not in SCHED_CLASSES:
+                        d_ = f.split(">")[1].rsplit("|", 1)[0]
+                        other_now += max(r_, 0.0)
+                        other_vm_now[d_] = other_vm_now.get(d_, 0.0) + max(r_, 0.0)
+                a_ = min(1.0, dt / conf_other_tau)
+                conf_other += (other_now - conf_other) * a_
+                for d_ in set(conf_other_vm) | set(other_vm_now):
+                    conf_other_vm[d_] = conf_other_vm.get(d_, 0.0) + (other_vm_now.get(d_, 0.0) - conf_other_vm.get(d_, 0.0)) * a_
+                link_ = sched.c_root / (1.0 - sched.headroom)
+                root_nominal = sched.c_root
+                sched.c_root = max(link_ - conf_other, 0.05 * link_) * (1.0 - sched.headroom)
+                conf_croot = sched.c_root
+                vm_minus = {d_: v_ for d_, v_ in conf_other_vm.items() if v_ > 0}
+                big = 10.0 * root_nominal
+                share, _ = sched.entitlements(active, {f: big for f in active}, vm_minus)
+                # Decisions (who lends, who is at share) use a ~100 ms average
+                # of the arrival; the queue keeps using the raw arrival. The
+                # 20 ms attribution samples jitter by +-7 % on a VM with three
+                # senders, which flipped lender status and the direction bit
+                # on noise and made the borrowers' entitlement whipsaw.
+                a_ = min(1.0, dt / conf_avg_tau)
+                for f in active:
+                    conf_aavg[f] = conf_aavg.get(f, active[f]) + (max(active.get(f, 0.0), 0.0) - conf_aavg.get(f, active[f])) * a_
+                for f in [f for f in conf_aavg if f not in active]:
+                    del conf_aavg[f]
+                demand = {}
+                lenders = set()
+                for f in active:
+                    want = conf_aavg[f] * (1.0 + ep["delta_demand"])
+                    if want < share.get(f, 0.0):
+                        demand[f] = want
+                        lenders.add(f)
+                    else:
+                        demand[f] = big
+                ents, ceils = sched.entitlements(active, demand, vm_minus)
+                sched.c_root = root_nominal
+                ents = dict(ents)
+                for f in lenders:
+                    ents[f] = share[f]
                 hybrid.prev_ents = ents
+                # Feedback (design v4): the virtual queue, normalised to
+                # periods of expected bytes, and one direction bit b: 1 =
+                # this flow-set is already at its share (A >= (1-eps) E),
+                # 0 = below it. Nothing on the wire can be turned back into
+                # a rate. Internally the queue is kept in bits with rates,
+                # which is the same arithmetic as bytes per period.
                 marks = {}
                 delays = {}
-                gam = {}
+                bflag = {}
                 for f in active:
                     A = sched_rates.get(f, 0.0)
                     E = ents.get(f, 0.0)
                     if E <= 0:
                         conf_q.pop(f, None)
-                        gam[f] = 0.0
+                        bflag[f] = 0.0
                         continue
                     Qn = conf_q.get(f, 0.0) + (A - E) * dt
                     Qn = min(max(Qn, 0.0), conf_dr * E)
@@ -1559,14 +1657,20 @@ def main():
                         conf_q[f] = Qn
                     else:
                         conf_q.pop(f, None)
-                    delays[f] = Qn / E            # q, seconds
-                    gam[f] = (A - E) / E          # gamma
+                    delays[f] = Qn / E            # q in seconds = periods * period
+                    # design v4: no direction bit, the queue is the only signal.
+                    # law "conf_v3" is the ablation arm that ALSO sends the
+                    # explicit rate as (1+gamma) = A/E (v3 wire format).
+                    bflag[f] = ((A - E) / E + 1.0) if law == "conf_v3" else 0.0
                 for f in [f for f in conf_q if f not in active]:
                     del conf_q[f]
-                # wire: field1 = (1+gamma)*1e6, field2 = r, field3 = q (us)
-                targets = {f: (1.0 + gam.get(f, 0.0)) * 1e6 for f in active}
+                # wire: field1 = 0 (the direction bit was dropped: a flow-set
+                # probes whenever its queue is empty), field2 = r (used only by
+                # the RDMA executor's legacy pace_limited check, not by the
+                # law), field3 = q (us)
+                targets = {f: bflag.get(f, 0.0) * 1e6 for f in active}
                 telem.send(targets, sched_rates, delays)
-            elif law in ("vq", "vq2", "conf"):
+            elif law in ("vq", "vq2", "conf", "conf_v3"):
                 ents, ceils, delays = vqs.step(active, sched_rates, dt, now)
                 # Split prior = the share HINT, never the service rate: a
                 # newcomer's service equals whatever arrival the split
@@ -1580,7 +1684,7 @@ def main():
                 targets = {f: ceils.get(f, ents.get(f, 0.0)) for f in active}
                 telem.send(targets, sched_rates, delays)
             root_congested = rootcong.update(sum(active.values()),
-                                             sched.c_root) if law not in ("vq", "vq2", "conf") else False
+                                             sched.c_root) if law not in ("vq", "vq2", "conf", "conf_v3") else False
             # Every node of the policy tree that is at its capacity, not
             # just the root. A dst VM at its MaxRate saturates the node its
             # senders share, so all of them are contending - and this test
@@ -1589,11 +1693,11 @@ def main():
             sat = nodesat.update(active, {
                 v: p.get("max_rate_bps")
                 for v, p in sched.policy.get("vms", {}).items()}) \
-                if law not in ("vq", "vq2", "conf") else set()
+                if law not in ("vq", "vq2", "conf", "conf_v3") else set()
             # a finite "big" (root capacity), NOT inf: it saturates the
             # class demand cap exactly like inf but survives int(ceil_f)
             # in the telemetry pack (inf overflows).
-            if law not in ("vq", "vq2", "conf"):
+            if law not in ("vq", "vq2", "conf", "conf_v3"):
                 demand = demand_estimate(active, ep["delta_demand"],
                                          sched.c_root, root_congested,
                                          saturated_dsts=sat)
@@ -1618,7 +1722,7 @@ def main():
             # dead control channel, which is a positive feedback into
             # fail-open. Iterate `active` (present in the flow table, plus
             # the membership grace) and default an absent mark to 0.
-            if law not in ("vq", "vq2", "conf"):
+            if law not in ("vq", "vq2", "conf", "conf_v3"):
                 targets = {f: ceils.get(f, ents.get(f, 0.0))
                               * (1.0 - gamma * marks.get(f, 0.0))
                            for f in active}
@@ -1647,7 +1751,8 @@ def main():
                    # vq law: virtual queueing delay (ms) per flow-set
                    "d": {f: round(v * 1e3, 3) for f, v in delays.items()
                          if v > 0},
-                   "held": vqs.held}
+                   "held": vqs.held,
+                   "oth": int(conf_other), "croot": int(conf_croot)}
             logf.write(json.dumps(rec) + "\n")
 
         _tick_us = (time.monotonic() - now) * 1e6
