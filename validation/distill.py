@@ -7,7 +7,7 @@ Reads (the only script that reads raw results/):
   vpm_series.csv   receiver vport-meter counters (per VF, RoCE/other, 100 ms)
   rx.jsonl         receiver agent: per flow-set attributed rate r, expected
                    rate e, virtual queue d (ms), every 20 ms
-  flow<k>_*.log    perftest / iperf3 client output (application goodput)
+  flow<k>_*.log    perftest / tcp_blast client output (application goodput)
 Writes:
   data/<tag>_vmclass.csv    t, vf<i>_rdma, vf<i>_tcp  (Gb/s per 100 ms, wire)
   data/<tag>_flowsets.csv   one row per (phase, flow-set): expected, attributed
@@ -40,6 +40,27 @@ Q_MEAN_MAX_MS, Q_CLEAR_MAX_S, Q_ZERO_MS = 1.0, 1.0, 0.05
 # throughput. Q_ZERO_MS is float tolerance, not a budget.
 CONV_TOL, CONV_HOLD, CONV_MAX = 0.10, 1.0, 1.0
 COLLAPSE_FRAC, COLLAPSE_HOLD, AGG_MIN, EVENT_GRACE = 0.5, 1.0, 0.90, 2.0
+
+
+def bin_mean(t, v, dt=0.1):
+    """Average an irregularly-logged series onto a fixed grid of dt seconds.
+
+    The receiver logs every 20 ms, which on a 30-90 s x-axis draws far more
+    measurement granularity than delivered rate: at 20 ms a point is one
+    10 ms rate window, and that noise averages down as 1/sqrt(window) (it is
+    independent per sample, not a loop hunting - measured 2026-08-31). The
+    figures therefore draw the same series at 100 ms, matching the hardware
+    wire panel. THE CRITERIA BELOW ARE NOT BINNED: they read the raw ledger.
+    """
+    t = np.asarray(t, dtype=float); v = np.asarray(v, dtype=float)
+    if len(t) == 0:
+        return t, v
+    k = np.floor((t - t[0]) / dt).astype(int)
+    n = k[-1] + 1
+    s = np.bincount(k, weights=v, minlength=n)
+    c = np.bincount(k, minlength=n)
+    ok = c > 0
+    return t[0] + (np.arange(n)[ok] + 0.5) * dt, s[ok] / c[ok]
 
 
 def load_flows(path):
@@ -126,13 +147,8 @@ def phases(rows):
 def goodput(path, cls):
     txt = open(path, errors="replace").read()
     if cls == "tcp":
-        try:
-            j = json.loads(txt)
-            if "error" in j:
-                return None, j["error"]
-            return j["end"]["sum_received"]["bits_per_second"] / 1e9, ""
-        except Exception as e:
-            return None, "unparseable iperf3 json: %s" % e
+        m = re.search(r"([\d.]+) Gb/s goodput", txt)
+        return (float(m.group(1)), "") if m else (None, "no tcp_blast summary")
     if cls == "udp":
         m = re.search(r"([\d.]+) Gb/s payload sent", txt)
         return (float(m.group(1)), "") if m else (None, "no udp_blast summary")

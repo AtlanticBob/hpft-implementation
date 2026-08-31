@@ -10,7 +10,7 @@
 # table); starts one listener per flow-table row on the receiver; starts
 # the receiver's vport-meter sampler; launches every row from its own host
 # so that its first packet lands at T0 + warm-up + start (RDMA: perftest
-# --start_at on both ends; TCP: sleep until the slot); collects the three
+# --start_at on both ends; TCP: tcp_blast -S); collects the three
 # data paths (vport-meter series, per-flow application logs, agent jsonl)
 # plus the trust/CNP/switch snapshots; restores nothing because it changed
 # nothing standing.
@@ -66,6 +66,38 @@ bad = [v for v, p in r["policy"]["vms"].items()
 if bad or r["policy"].get("per_sender_weights"):
     print("non-standard policy:", bad, r["policy"].get("per_sender_weights")); sys.exit(1)
 EOF
+# The RP mailbox costs either ~13.3 ms or ~21.9 ms per send, switching
+# between the two on a ~40 min cycle that we have not traced to anything on
+# the DPU (load, interrupts, context switches and temperature are all flat
+# across a transition) and that survives a doca_pcc restart. The call is
+# blocking, so the slow mode cuts how often a fence can be pushed to the
+# RDMA executor from 74/s to 46/s. It is NOT a delay in the control path -
+# the wire responds 6 ms after the command, well before the call returns.
+#
+# Runs are no longer pinned to the fast mode (2026-08-31). Each DPU spends
+# only a third of its time fast and the DPUs are on different periods, so a
+# window with two senders fast at once lasts 4-7 min and comes round every
+# ~35 min - a cost worth paying only if the mode changes results, which has
+# not been shown and became much less likely once the QP-count miscount was
+# fixed. So measure it, record it per run, and let the runs proceed: with
+# the mode in results/<tag>/mailbox_mode.txt any two runs of one scenario
+# can be compared across modes after the fact.
+for h in $SENDERS; do
+  d=$(dpu_of $h)
+  # An idle lab has no budgets to push, so there may be nothing recent to
+  # read. Ask directly then: 0xded is a pure readback and costs one mailbox
+  # slot each, which is exactly what we want to time.
+  mbcost="tail -400 /tmp/pcc_rp.log 2>/dev/null | grep -a HPFT_SET | sed -n 's/.*send_ns=\\([0-9]*\\).*/\\1/p' | sort -n | awk '{a[NR]=\$1} END{if(NR>20) printf \"%.1f\", a[int(NR/2)+1]/1e6}'"
+  mbms=$(ssh -n -o BatchMode=yes "$d" "$mbcost" 2>/dev/null)
+  if [ -z "$mbms" ]; then
+    ssh -n -o BatchMode=yes "$d" "exec 3>/tmp/rp_fifo; for i in \$(seq 1 30); do echo '0xded 0' >&3; sleep 0.02; done; sleep 1" 2>/dev/null
+    mbms=$(ssh -n -o BatchMode=yes "$d" "$mbcost" 2>/dev/null)
+  fi
+  [ -n "$mbms" ] || { echo "$d mailbox unknown" >> "$OUT/mailbox_mode.txt"; echo "WARN: $d mailbox mode could not be measured"; continue; }
+  mode=fast; awk -v v="$mbms" 'BEGIN{exit !(v>17)}' && mode=slow
+  echo "$d $mbms $mode" >> "$OUT/mailbox_mode.txt"
+  echo "$d mailbox ${mbms} ms/send ($mode)"
+done
 cp config/lab-registry.json "$OUT/registry.json"
 for h in $RECV $SENDERS; do
   d=$(dpu_of $h); cur=$(ssh -o BatchMode=yes "$d" 'cat /sys/class/net/p1/speed' 2>/dev/null)
@@ -107,6 +139,13 @@ for e in d:
 snap_cnp > "$OUT/cnp_pre.txt"; snap_switch > "$OUT/switch_pre.txt"
 
 # ---- T0, listeners, sampler, launches -------------------------------------
+# tcp_blast replaces iperf3 for every TCP row: it connects before the event and
+# puts its first byte ON it, which iperf3 cannot do (no absolute start; its
+# ~0.5-1.1 s of startup used to land after the event and be charged to the run).
+for h in $RECV $(echo "$ROWS" | awk '$4=="tcp"{print $1}' | sort -u); do
+  on_host "$h" "[ -x /tmp/tcp_blast ] && [ /tmp/tcp_blast -nt $REPO/tools/host/tcp_blast.c ] || gcc -O2 -pthread -o /tmp/tcp_blast $REPO/tools/host/tcp_blast.c" \
+    || { echo "ABORT: tcp_blast build failed on $h"; exit 1; }
+done
 if echo "$ROWS" | awk '{print $4}' | grep -q '^udp$'; then
   for h in $RECV $(echo "$ROWS" | awk '$4=="udp"{print $1}' | sort -u); do
     on_host "$h" "[ -x /tmp/udp_blast ] || gcc -O2 -pthread -o /tmp/udp_blast $REPO/tools/host/udp_blast.c" || { echo "ABORT: udp_blast missing on $h"; exit 1; }
@@ -139,7 +178,7 @@ while read -r sh sv dv cls n st en opt; do
   elif [ "$cls" = udp ]; then
     SRV+="setsid nohup /tmp/udp_blast -r -p $((5900+k)) -B $(ip_of $RECV $dv) >/tmp/val_s$k.log 2>&1 </dev/null & "
   else
-    SRV+="setsid nohup iperf3 -s -p $((5600+k)) >/tmp/val_s$k.log 2>&1 </dev/null & "
+    SRV+="setsid nohup /tmp/tcp_blast -r -p $((5600+k)) -B $(ip_of $RECV $dv) >/tmp/val_s$k.log 2>&1 </dev/null & "
   fi
   k=$((k+1))
 done <<<"$ROWS"
@@ -164,7 +203,7 @@ while read -r sh sv dv cls n st en opt; do
     # the flow's OWN use) and the fence stayed there for the whole phase -
     # measured r23, the phase delivered 0.26 G of a 10 G demand.
     rate_limit=*) extra="--rate_limit=${opt#rate_limit=}" ;;
-    tcp_cc=*)     extra="-C ${opt#tcp_cc=}" ;;
+    tcp_cc=*)     extra="-C ${opt#tcp_cc=}" ;;   # tcp_blast: setsockopt(TCP_CONGESTION)
     gbps=*)       extra="${opt#gbps=}" ;;
   esac
   if [ "$cls" = rdma ]; then
@@ -172,7 +211,7 @@ while read -r sh sv dv cls n st en opt; do
   elif [ "$cls" = udp ]; then
     cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-time.time()))\"; /tmp/udp_blast -c $dip -p $((5900+k)) -B $sip -G $extra -t $dur' >/tmp/val_c$k.log 2>&1 </dev/null & "
   else
-    cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-time.time()))\"; iperf3 -B $sip%dpu1vf$sv -c $dip -p $((5600+k)) -P $n -t $dur -J $extra' >/tmp/val_c$k.log 2>&1 </dev/null & "
+    cmd="setsid nohup /tmp/tcp_blast -c $dip -p $((5600+k)) -B $sip -I dpu1vf$sv -P $n -t $dur -S $((T0+off)) $extra >/tmp/val_c$k.log 2>&1 </dev/null & "
   fi
   CLI[$sh]+="$cmd"
   k=$((k+1))
