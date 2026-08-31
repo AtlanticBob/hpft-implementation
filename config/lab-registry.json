@@ -666,10 +666,10 @@
   },
   "e_params": {
     "comment": "design.md \u00a76 (tracking-audit law). RESPONSE LAW: the receiver synthesises one target per flow-set, u_f = ceil_f*(1-gamma*s_f) (\u00a73.4), and the sender does first-order tracking in log space, R <- R*(u/R)^(k*T) (\u00a74.2). Fairness still lives entirely in the receiver's water-filling, not in the law. Params are wall-clock quantities (rate constants in s^-1, integrals in bits), so they do not need retuning when period_ms changes -- there is no ref_period_ms scaling any more. k=20 s^-1 is capped by target staleness (k*tau_eff <~ 0.4, tau_eff ~20ms); gamma=0.25 sets both the audit discount band (u >= 0.75*ceil) and the audit-loop damping (zeta = 0.5*sqrt(k*V/(gamma*ceil))); V = v_seconds*headroom*C = 1.6 Gbit is a wall-clock excess-integral: it must NOT scale with the control period, and it IS anchored on C, the downlink bottleneck capacity the receiver actually schedules against (100G here), not on the NIC port line rate -- ehat scales with C, so V must too or the audit loop's damping becomes link-rate dependent (design.md \u00a73.3). rx_agent reads C from the uplink and recomputes V whenever the link speed changes. HEADROOM=0.08 (2026-07-29, overlay-resident): 3% queue-warning + ~5% VxLAN encap tax (inner-byte ledger vs outer-byte wire, measured 4.99% at 1500 MTU); covers inner packets >= ~625 B, smaller-packet overshoot falls back to tenant CC. V IS NOT DERIVED FROM HEADROOM: the real rule is V = 4*zeta^2*gamma*ehat*/k at the typical contention point (design_theory par.3; ehat*=23G, zeta=1/sqrt(2) => V=576 Mbit, revalidated by results/vtune_20260729). v_seconds=0.072 is only the dial that lands V there through the legacy v_sec*headroom*C packaging -- when headroom or C' changes, re-solve V from the zeta rule and re-set v_seconds, do NOT let V drift; design_theory \u00a73 shows it lands 1% from the optimal-damping inverse V = 4*zeta^2*gamma*ehat_star/k at zeta=1/sqrt(2), which is post-hoc confirmation, not a derivation -- re-derive it if the tenant count, flow count, link rate or loop delay changes. Derivations and tuning rules: hpft-design/docs/design_theory.md.",
-    "period_ms": 1,
+    "period_ms": 10,
     "law": "conf",
     "eps": 0.02,
-    "d_repay_s": 0.15,
+    "d_repay_s": 0.3,
     "phi_min": 0.5,
     "d_clip_s": 0.05,
     "backlog_hold_s": 0.05,
@@ -689,7 +689,7 @@
     "log_every_ms": 20,
     "rdma_push_ms": 5,
     "tcp_refresh_ms": 100,
-    "rate_window_s": 0.02,
+    "rate_window_s": 0.01,
     "fs_grace_s": 0.5,
     "backlog_congestion_aware": true,
     "policy": null,
@@ -702,7 +702,20 @@
     "rdma_unknown_comment": "per-QP cap for RDMA flows the executor has no budget for yet (mailbox 0xccf); the DPA applies rate per QP, so a 4-QP flow-set gets 4x this",
     "d_star_s": 0.003,
     "trust_recover_s": 1.0,
-    "conf_comment": "law=conf (fence design v4, 2026-08-26): rx demand=A(1+delta_demand), Q clipped to [0, d_repay_s*E], wire {(1+gamma)*1e6, r, q_us}; tx Ehat=A/(1+gamma), R tracks Ehat (k) with repayment exp(-(k dt/d_repay_s) q), jumps up when q=0; trust T'=(1-T)/trust_recover_s-(q/d_repay_s)(T/d_repay_s), T0=0; executors blend r=T*cc+(1-T)*R"
+    "conf_comment": "law=conf = design v4 (hpft_design_v4.md, 2026-08-28): receiver root = (port - unscheduled arrival)(1-h), two water-fillings (share; lenders demand A(1+delta) but keep E = share), virtual queue Q <- clip(Q + A - E, 0, D E), feedback {q = Q/E in periods} (no direction bit: the sender probes whenever q = 0); sender R <- R exp(alpha min(m, m_max)) (m = consecutive empty-queue feedbacks; the step grows with the silence, alpha = alpha_max/m_max) exp(-kappa dq) (dq signed while a queue exists) exp(-(kappa/D) q), the probe bounded by R <- max(R, min(R e^step, min(maxrate, r_cap_mult x own send rate))); executors blend r = T cc + (1-T) R with executor-owned trust (decay by q/D, rise only while the CC is binding: TCP cwnd-limited 100 ms, RDMA cc below 98% level and not rising over 100 epochs); kappa 0.01 / D 300 (zeta 0.87) chosen for a loop delay of 40-60 feedbacks plus the executor's own lag (offline model); PERIOD 10 ms (= one meter round, 2026-08-29): per-feedback constants are the 1 ms ones scaled by the period (kappa 0.1 linearly, D 30 unchanged, alpha 3e-4 quadratically since it is the growth rate of the step; alpha_max = alpha m_max = 3%, overshoot alpha_max tau ~ 9%); the trust epoch in the executors stays 1 ms",
+    "kappa": 0.1,
+    "D": 30,
+    "rdma_budget_hyst": 0.0,
+    "tree_backlog_theta": 0.85,
+    "probe_cap_tree": false,
+    "tree_period_ms": 100,
+    "r_cap_mult": 2.0,
+    "r_cap_floor_bps": 2000000000.0,
+    "alpha": 3e-4,
+    "m_max": 100,
+    "r_floor_bps": 1000000000.0,
+    "decision_avg_s": 0.1,
+    "other_tau_s": 0.1
   },
   "nodes": [
     {

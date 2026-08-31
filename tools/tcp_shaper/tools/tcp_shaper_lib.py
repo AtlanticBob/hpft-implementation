@@ -180,9 +180,11 @@ def pack_rate_cfg(rate_bps: int, generation: int, burst_bytes: int, flags: int =
 
 
 def pack_pair_state(next_ns: int = 0, generation: int = 0) -> bytes:
-    """struct hpft_pair_state: lock, reserved0, next_ns, generation, then the
-    observer's cc_sum, cc_prev, d_ts, d, reserved1. The datapath initialises
-    d itself when it reads zero, so seeding zeros stays correct."""
+    """struct hpft_pair_state: lock, shot_ms, next_ns, generation, the
+    observer's cc_sum, cc_prev, d_ts, d, cuts, then the executor's trust,
+    loss_ep, trust_ns, loss_ns. The datapath initialises d itself when it
+    reads zero, so seeding zeros stays correct, and every other field
+    means "nothing seen yet" at zero."""
     return struct.pack("<IIQQQQQIIIIQQ", 0, 0, next_ns, generation, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 

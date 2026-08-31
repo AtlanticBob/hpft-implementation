@@ -63,14 +63,25 @@
 #define HPFT_D_FLOOR (HPFT_D_ONE >> 6)
 #define HPFT_D_RECOVER_NS 300000ULL /* one half-gap step, as on the DPA */
 /* fence design (2026-08-26): cfg->flags bit31 set => trust mode, low 16
- * bits = trust T in fxp16. The pair is shaped to T*cc + (1-T)*rate where
- * cc is the flow-set's aggregate cwnd*mss/srtt, capped at line rate. */
+ * bits = trust T in fxp16. The pair is shaped to clip(cc, (1-T)*rate,
+ * rate) where cc is the flow-set's aggregate cwnd*mss/rtt_min (6.1). */
 #define HPFT_TRUST_FLAG 0x80000000U
 #define HPFT_LINE_BPS 200000000000ULL
 #define HPFT_TRUST_EPOCH_NS 1000000ULL      /* trust updated once per ms */
-#define HPFT_TRUST_UNDER_NS 20000000ULL     /* 20 ms clearly under the fence */
 #define HPFT_TRUST_STEP 66ULL               /* fxp16 per ms = 1 ms / 1 s */
-#define HPFT_TRUST_MARGIN 60555ULL          /* fxp16: 1 - 0.075 */
+/* design v4 6.3: how far back a retransmission still counts as "the
+ * network is dropping this flow-set right now" - the observation window. */
+#define HPFT_LOSS_WIN_NS 100000000ULL
+/* How long a drop of our own keeps the fast path shut, in ms. It has to
+ * outlast the retransmission that drop will provoke plus the window that
+ * retransmission would then sit in, so any loss the shaper could have
+ * caused is out of the picture before loss is read as the network's. */
+#define HPFT_SHOT_QUIET_MS 300U
+/* "no baseline yet" for a flow's retransmission counter: an entry created
+ * on a packet that carried no socket has nothing to compare against, and
+ * comparing against zero would read the connection's whole history as one
+ * fresh loss. */
+#define HPFT_RETR_UNKNOWN 0xffffffffU
 
 struct hpft_vlan_hdr {
     __u16 h_vlan_TCI;
@@ -86,7 +97,12 @@ struct hpft_rate_cfg {
 
 struct hpft_pair_state {
     struct bpf_spin_lock lock;
-    __u32 reserved0;
+    /* ms (monotonic) of the last packet this shaper dropped at its debt
+     * cap. The loss fast path treats a retransmission as the NETWORK's
+     * statement of loss, which it only is if the loss was not ours: the
+     * design's premise is a shaper that never drops, and the debt cap is
+     * the one place this one does. */
+    __u32 shot_ms;
     __u64 next_ns;
     __u64 generation;
     /* observer: cc_sum is this flow-set's aggregate CC window, maintained
@@ -101,12 +117,15 @@ struct hpft_pair_state {
      * the active branch is working; this counter is the evidence that it
      * is. */
     __u32 cuts;
-    /* fence design: executor-owned trust (fxp16), its last update time,
-     * and how long the CC has asked for less than the fence allows */
+    /* fence design: executor-owned trust (fxp16) and its last update time */
     __u32 trust;
-    __u32 pad1;
+    /* epochs in which loss evidence raised the trust (6.3). Trust alone
+     * is a level; this counts the events that moved it. */
+    __u32 loss_ep;
     __u64 trust_ns;
-    __u64 under_ns;
+    /* when this flow-set last retransmitted anything (design v4 6.3).
+     * Zero means it never has. */
+    __u64 loss_ns;
 };
 
 struct {
@@ -143,6 +162,8 @@ struct {
 struct hpft_flow_state {
     __u64 last_send_ns;
     __u64 cc_win;      /* this connection's last cwnd*mss, in the pair sum */
+    __u32 retrans;     /* this connection's last total_retrans, for the delta */
+    __u32 pad0;
 };
 
 struct {
@@ -281,7 +302,14 @@ int hpft_tcp_edt(struct __sk_buff *skb)
                    (__u64)segs * HPFT_FRAME_OVERHEAD;
         }
 
-        /* inter-packet gap per flow (5-tuple) */
+        /* inter-packet gap per flow (5-tuple). A flow seen for the first
+         * time is not entered here but after the socket has been read:
+         * its window and its retransmission count are the baselines the
+         * next packet subtracts from, and seeding either with zero makes
+         * the next packet read the connection's whole history as one
+         * step. (Seeding cc_win with zero also added this connection's
+         * window to the pair's aggregate twice - once as the new flow's
+         * whole window, once as the first delta against zero.) */
         flow_key = ((__u64)(iph->saddr ^ iph->daddr) << 32) |
                    ((__u64)tcph->source << 16) | (__u64)tcph->dest;
         flow_key ^= pair_key;
@@ -289,16 +317,19 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         if (fs) {
             gap = now - fs->last_send_ns;
             fs->last_send_ns = now;
-        } else {
-            fs_new.last_send_ns = now;
-            fs_new.cc_win = 0;
-            bpf_map_update_elem(&hpft_flow_state_map, &flow_key, &fs_new, BPF_ANY);
         }
 
         /* Step 1: read the CC. cwnd*mss is this connection's contribution to
          * the flow-set's aggregate window; cc_delta is what it changed by,
-         * which is what the pair's running sum needs. */
+         * which is what the pair's running sum needs. total_retrans is the
+         * stack's own count of what it had to send again, whichever CC is
+         * driving it - the fast path of 6.3 step three reads its delta. */
         __u64 srtt_us = 0;
+        __u64 rtt_min_us = 0;
+        __u32 saw_loss = 0;
+        __u32 have_tp = 0;
+        __u64 win = 0;
+        __u32 retr = 0;
         {
             struct bpf_sock *sk = skb->sk;
 
@@ -309,19 +340,32 @@ int hpft_tcp_edt(struct __sk_buff *skb)
                     struct bpf_tcp_sock *tp = bpf_tcp_sock(full);
 
                     if (tp) {
-                        __u64 win = (__u64)tp->snd_cwnd * (__u64)tp->mss_cache;
+                        win = (__u64)tp->snd_cwnd * (__u64)tp->mss_cache;
+                        retr = tp->total_retrans;
+                        have_tp = 1;
 
                         srtt_us = (__u64)tp->srtt_us >> 3;
-
+                        rtt_min_us = (__u64)tp->rtt_min;
                         if (fs) {
                             cc_delta = (__s64)win - (__s64)fs->cc_win;
                             fs->cc_win = win;
+                            if (fs->retrans != HPFT_RETR_UNKNOWN &&
+                                retr > fs->retrans)
+                                saw_loss = 1;
+                            fs->retrans = retr;
                         } else {
                             cc_delta = (__s64)win;
                         }
                     }
                 }
             }
+        }
+        if (!fs) {
+            fs_new.last_send_ns = now;
+            fs_new.cc_win = win;
+            fs_new.retrans = have_tp ? retr : HPFT_RETR_UNKNOWN;
+            fs_new.pad0 = 0;
+            bpf_map_update_elem(&hpft_flow_state_map, &flow_key, &fs_new, BPF_ANY);
         }
 
         /* shared pair debt: always accumulate (cap + fairness + smooth pacing,
@@ -341,6 +385,8 @@ int hpft_tcp_edt(struct __sk_buff *skb)
                 state->next_ns = now + HPFT_DEBT_CAP_NS;
             state->generation = cfg->generation;
         }
+        if (saw_loss)
+            state->loss_ns = now;
         /* Step 2: combine the CC's reading with the policy share. A stamp
          * already in the future means the shaper is the reason this
          * flow-set is not sending faster, so a cut taken now is one we
@@ -380,38 +426,72 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         }
         /* Step 3: shape to it. */
         if (cfg->flags & HPFT_TRUST_FLAG) {
-            /* trust blend: r = T*cc + (1-T)*rate. cc = aggregate window
-             * over this connection's srtt, capped at line rate. The
-             * flags' low 16 bits carry the queue fraction q/D_r; the
-             * trust itself is kept here, once per ms: decayed by the
-             * queue fraction, recovered while the CC asks for less than
-             * the fence allows for 20 ms. */
+            /* design v4 6.1: r = clip(cc, (1-T)*rate, rate). The fence
+             * is the upper bound at every trust value - trust buys the
+             * right to send LESS, never more - and the lower bound opens
+             * linearly with trust. Inside the band the wire carries
+             * exactly what the CC asked for, so a CC that is behaving
+             * sees an unmodified network and its own loop is intact;
+             * r = T*cc + (1-T)*rate never has that property, and its
+             * upper bound (1-T)*rate + T*line let 12% of trust leak 24 G
+             * per flow-set at line rate (measured).
+             *
+             * cc = the CC's allowance as a rate: aggregate window over
+             * the connection's MINIMUM rtt (what it would send with
+             * nothing queued; over srtt it merely restates the paced
+             * rate), capped at line rate. The flags' low 16 bits carry
+             * the queue fraction q/D_r.
+             *
+             * Trust, once per ms: decayed by the queue fraction, raised
+             * only on evidence of a bottleneck the receiver's ledger
+             * cannot see (6.3). That evidence is loss: our shaper only
+             * delays, so a retransmission is the network's own statement
+             * that it dropped this flow-set. Asking instead whether the
+             * CC is what limits the flow - the old cwnd-limited test -
+             * cannot tell a CC that yields too early at a bottleneck we
+             * DO manage from one facing a bottleneck we do not, and in
+             * the first case it raises trust exactly when the flow is
+             * giving its share away.
+             *
+             * "Not us" has one exception here: the debt cap below drops.
+             * A drop of ours provokes a retransmission of ours, so the
+             * evidence is ignored for HPFT_SHOT_QUIET_MS after the
+             * shaper last dropped anything for this flow-set. The RDMA
+             * executor needs no such clause - it only makes a QP wait. */
             __u64 qf = cfg->flags & 0xffffULL;
             __u64 cc_bps = 0;
-            __u64 t;
+            __u64 rtt_ref = rtt_min_us ? rtt_min_us : srtt_us;
+            __u64 t, lo;
 
-            if (srtt_us) {
-                cc_bps = (state->cc_sum * 8000000ULL) / srtt_us;
+            if (rtt_ref) {
+                cc_bps = (state->cc_sum * 8000000ULL) / rtt_ref;
                 if (cc_bps > HPFT_LINE_BPS)
                     cc_bps = HPFT_LINE_BPS;
             }
             if (now - state->trust_ns >= HPFT_TRUST_EPOCH_NS) {
-                __u64 el = now - state->trust_ns;
+                __u32 now_ms = (__u32)(now / 1000000ULL);
+                int ours = state->shot_ms &&
+                           now_ms - state->shot_ms < HPFT_SHOT_QUIET_MS;
+                int lost = !ours && state->loss_ns &&
+                           now - state->loss_ns < HPFT_LOSS_WIN_NS &&
+                           cc_bps && cc_bps < cfg->rate_bps;
 
                 state->trust_ns = now;
                 t = state->trust;
                 t -= (t * qf) >> 16;
-                if (qf == 0 && cc_bps * 65536ULL < cfg->rate_bps * HPFT_TRUST_MARGIN) {
-                    state->under_ns += el;
-                    if (state->under_ns >= HPFT_TRUST_UNDER_NS)
-                        t += ((65536ULL - t) * HPFT_TRUST_STEP) >> 16;
-                } else {
-                    state->under_ns = 0;
+                if (qf == 0 && lost) {
+                    t += ((65536ULL - t) * HPFT_TRUST_STEP) >> 16;
+                    state->loss_ep++;
                 }
                 state->trust = t > 65536ULL ? 65536U : (__u32)t;
             }
             t = state->trust;
-            eff_rate = (cc_bps * t + cfg->rate_bps * (65536ULL - t)) >> 16;
+            lo = (cfg->rate_bps * (65536ULL - t)) >> 16;
+            eff_rate = cc_bps;
+            if (eff_rate > cfg->rate_bps)
+                eff_rate = cfg->rate_bps;
+            if (eff_rate < lo)
+                eff_rate = lo;
         } else {
             eff_rate = (cfg->rate_bps * (__u64)d) >> 20;
         }
@@ -428,6 +508,7 @@ int hpft_tcp_edt(struct __sk_buff *skb)
              * into the future. Bounds fq queueing delay to the cap and
              * hands rate-based CCs (BBR) a real loss signal; loss-based
              * CCs never dig this deep. State is NOT advanced. */
+            state->shot_ms = (__u32)(now / 1000000ULL);
             bpf_spin_unlock(&state->lock);
             return TC_ACT_SHOT;
         }

@@ -36,7 +36,6 @@ import mmap
 
 import fastfill
 import hw_maxrate
-from fastfill import waterfill_ceilings
 
 FIFO = "/tmp/rp_fifo"   # PCC RP mailbox (batched: 0xb47c000N ft bud rate ...)
 
@@ -105,6 +104,76 @@ def mimd_factor(R, g, d, eps, beta_max, d_repay, phi_min, floor):
     if d <= 0.0:
         return min((1.0 + eps) * g / R, beta_max)
     return max((g / R) * (1.0 - d / d_repay), phi_min)
+
+
+def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
+            keep_silence=False):
+    """Design v4 (§5.2), one feedback: three multiplicative factors.
+    probe   x exp(alpha*m_hat)  m = consecutive feedbacks with an empty
+                                queue, m_hat = min(m, m_max); the step
+                                grows with the silence and is capped
+    brake   x exp(-kappa dq)    dq = signed queue change since last feedback
+    repay   x exp(-(kappa/D) q) by queue length
+    q, dq are in periods of expected bytes (dimensionless); no time in here.
+
+    Why the step grows with the silence (§5.5): probing too hard only
+    costs anything when the fence is ALREADY at the share - that step
+    crosses, the excess becomes queue, and it has to be repaid; if the
+    fence is far below, the same step is free. How likely "still at the
+    share" is falls monotonically as the silence lengthens, so the step
+    should start near zero and grow. A THRESHOLD ("switch to a big step
+    after N quiet feedbacks") is the crude form of the same idea and must
+    err on one side: the quiet stretch of an ordinary sawtooth is not
+    reliably shorter than N - the receiver's per-sender split jitters by
+    a few percent and one jitter empties the queue for a few extra
+    feedbacks - so the big step fires in the steady state and the fence
+    runs far past its share within one loop delay. Measured on
+    V7_conf6_20260829_r18, quiet phase: 31% of queue-free probe intervals
+    ran at the fast band, and the fence reached +38% over its share.
+    m_max bounds the worst-case overshoot at alpha*m_max*tau (§5.3 bounds
+    where the probe may go, which is a different thing).
+    Returns (R, dq, below)."""
+    # signed queue change while a queue exists: growing -> cut, draining ->
+    # let the fence back up in proportion. The drain-side half is what keeps
+    # the fence from being pushed far below the share while the queue is
+    # being paid off (with only the repayment term acting during the drain,
+    # the fence undershoots, the probe then overshoots, and the loop cycles
+    # - offline model, 2026-08-28)
+    dq = (q - q_prev) if (q > 0.0 or q_prev > 0.0) else 0.0
+    R1 = max(R, floor)
+    if q <= 0.0:
+        # probe whenever the queue is empty: the receiver's queue is the only
+        # signal; a probe that crosses the share shows up as a queue within
+        # one loop delay and is taken back by the brake and the repayment.
+        below += 1
+        # §5.3, cap = min(maxrate, 2 x own send rate over ~100 ms): the
+        # inner min stops the probe at the cap, the outer max makes the cap
+        # incapable of pulling R DOWN. Clipping R to the cap outright fed on
+        # itself - a dip in the send-rate sample cut R, which cut the send
+        # rate, which cut the cap - and rode a 1-QP flow to the floor.
+        # The silence keeps counting while the cap holds the probe: the step
+        # is already bounded by m_max, so all a long block does is let an
+        # app-limited flow resume at the maximum step, which is right - a
+        # flow that has been using a fraction of its share IS far from it.
+        R1 = max(R1, min(R1 * math.exp(alpha * min(below, m_max)), cap))
+    elif not keep_silence:
+        below = 0
+    # keep_silence: this flow-set has never yet been held by its fence, so a
+    # queue it produced says nothing about where its share is and must not
+    # zero the silence. Every new RDMA flow-set does this: the executor
+    # admits an unknown QP at a blind allowance before any budget reaches
+    # it, the burst overruns the entitlement, and the queue that follows
+    # used to zero the silence of a flow-set that had just been told to
+    # start at maximum uncertainty - so the probe ramped from alpha*1
+    # instead of alpha*m_max and took 1100 ms instead of 630 ms to reach
+    # the share (measured V2, 2026-08-30). The exemption ends for good at
+    # the first evidence that the fence is in force; it must not be a
+    # standing condition, because a fence falling faster than the wire can
+    # follow also shows a send rate above the fence, and THAT queue is ours
+    # and must reset the silence. The brake and the repayment act on the
+    # queue either way - it is real and must be paid.
+    R1 *= math.exp(-kappa * dq) * math.exp(-(kappa / D) * min(q, D))
+    return max(R1, floor), dq, below
 
 
 def conf_step(R, T, Ehat, q, dt, k, d_r, tau_r, floor, gamma=0.0, delta=0.15,
@@ -178,6 +247,7 @@ class FlowState:
     __slots__ = ("R", "last_rx", "last_step", "last_seq", "mode", "pace", "r",
                  "log_R", "log_age", "log_mode", "esc_since", "esc_log",
                  "shim_last", "epoch", "phase", "acts", "T", "Ehat", "under",
+                 "q_prev", "dq", "b", "below", "as_avg", "enforced",
                  "a_ref")
 
     def __init__(self, tree, now):
@@ -198,7 +268,13 @@ class FlowState:
         self.phase = 0.0       # mimd gating: per-flow-set phase offset (s)
         self.acts = 0          # mimd: multiplicative steps taken
         self.T = 0.0           # conf: trust in the tenant CC (starts at 0)
-        self.Ehat = 0.0        # conf: expected rate reconstructed from gamma
+        self.Ehat = 0.0        # (v3 leftover, unused by v4)
+        self.q_prev = 0.0      # v4: last feedback's queue (periods)
+        self.dq = 0.0          # v4: last queue growth
+        self.b = 0             # v4: last direction bit
+        self.below = 0         # v4: consecutive feedbacks below share with no queue
+        self.enforced = False  # v4: has the fence ever actually held this flow-set
+        self.as_avg = 0.0      # v4: own send rate, ~100 ms average (for the probe cap)
         self.under = 0         # conf: consecutive feedbacks clearly under share
         self.a_ref = 0.0       # conf: arrival when that run started
 
@@ -232,14 +308,14 @@ class SenderTree:
     Tree ~= 0, which contradicts both.
     Class borrowing between the two actuator planes (fq+edt / PCC) falls
     out of the work-conserving fill: this IS the budget arbiter, feasible
-    in one process because both actuators hang off this agent.
-    cap-hit boost: a flow using >=theta of its pace advertises appetite."""
+    in one process because both actuators hang off this agent."""
 
-    def __init__(self, policy, line, headroom, delta, floor):
+    def __init__(self, policy, line, headroom, delta, floor, theta=0.85):
         self.policy = policy
         self.cap = line * (1.0 - headroom)
         self.delta = delta
         self.floor = floor
+        self.theta = theta
 
     def _fill(self, demand):
         tree = {}
@@ -266,7 +342,7 @@ class SenderTree:
                 out.update(waterfill(cls_share[c], fs_items))
         return out
 
-    def _trees_c(self, demand):
+    def _alloc_c(self, demand):
         vms = self.policy["vms"]
         fsids = list(demand)
         vm_ids, cls_ids = {}, {"rdma": 0, "tcp": 1}
@@ -292,55 +368,53 @@ class SenderTree:
             cwd = p.get("class_weights", {})
             for c, j in cls_ids.items():
                 cls_w[i * n_cls + j] = float(cwd.get(c, 1))
-        _, ceil = fastfill.entitlements_c(fsids, src_idx, cls_idx, wfs, dem,
-                                          n_vm, n_cls, vm_w, vm_max, cls_w,
-                                          self.cap)
-        return ceil
+        alloc, _ = fastfill.entitlements_c(fsids, src_idx, cls_idx, wfs, dem,
+                                           n_vm, n_cls, vm_w, vm_max, cls_w,
+                                           self.cap)
+        return alloc
 
     def trees(self, flows):
-        """Tree_f for every local flow-set.
+        """Tree_f for every local flow-set (design v4 5.6), two fills.
 
-        Structurally the same three-layer ceiling cascade the receiver
-        runs - src VM -> class -> flow-set, with the root capacity being
-        this sender's uplink and the leaf weights all 1 - so it uses the
-        same C entry point. Measured first: the sender was the TIGHTER of
-        the two agents (132% of the period at 288 flow-sets against the
-        receiver's 97%), because it rebuilds this tree on every telemetry
-        datagram and was paying per-layer ctypes marshalling."""
+        Pass 1 gives every flow-set its SHARE S_f under the current
+        occupants (everyone demands the root). Pass 2 gives the
+        ALLOCATION G_f: a flow-set that is using >= theta of the pace we
+        gave it still wants more and demands R_f - the most its receiver
+        would let it take, and more than that it could not use - while one
+        that is not asks only for what it uses. Tree_f = max(G_f, S_f), so
+        a flow-set that is not pressing keeps its whole share and can
+        climb back into it at once, exactly as a lender does at the
+        receiver (4.3), and a flow-set with no traffic at all still gets
+        S_f rather than nothing (which is what a new flow-set and the
+        fail-open path both start from).
+
+        Why demand is NOT the measured send rate for a pressing
+        flow-set: send rate <- pace <- Tree <- demand closes a loop, and
+        this loop has neither damping nor a stability criterion, so
+        wherever it binds at the same time as the fence it is the one
+        that decides the transient (measured V2 exit, 2026-08-30: the
+        fence reached the new share in 0.78 s and was never the
+        constraint, while the tree wandered between 23.9 and 25.0 G for
+        ~600 ms). R_f comes from the receiver's damped loop instead, and
+        an unpressed flow-set's send rate is set by its application - so
+        neither branch is a function of this tree's own output. The
+        theta test is still a downstream observation, but it only
+        classifies; it does not produce a number."""
+        big = self.cap
+        share = self._fill_any({f: big for f in flows})
         demand = {}
         for f, st in flows.items():
-            d = max(st.r * (1.0 + self.delta), self.floor)
-            if st.pace > 0 and st.r >= 0.85 * st.pace:
-                d = max(d, st.pace * (1.0 + self.delta))   # cap-hit boost
-            demand[f] = d
+            if st.pace > 0 and st.r >= self.theta * st.pace:
+                demand[f] = max(st.R, self.floor)
+            else:
+                demand[f] = max(st.r * (1.0 + self.delta), self.floor)
+        alloc = self._fill_any(demand)
+        return {f: max(alloc.get(f, 0.0), share.get(f, 0.0)) for f in flows}
+
+    def _fill_any(self, demand):
         if fastfill.USING_C and demand:
-            return self._trees_c(demand)
-        # single-pass ceiling cascade (same math as the per-fs N-fill
-        # loop; property-tested) - O(N log N)
-        tree = {}
-        for f, d in demand.items():
-            src_dst, cls = f.rsplit("|", 1)
-            src = src_dst.split(">")[0]
-            tree.setdefault(src, {}).setdefault(cls, {})[f] = d
-        vms = self.policy["vms"]
-        vm_items, vm_repl = {}, {}
-        for src, classes in tree.items():
-            dsum = sum(d for fs in classes.values() for d in fs.values())
-            maxr = vms.get(src, {}).get("max_rate_bps") or float("inf")
-            vm_items[src] = (vms.get(src, {}).get("weight", 1),
-                             min(maxr, dsum))
-            vm_repl[src] = maxr
-        vm_ceil = waterfill_ceilings(self.cap, vm_items, vm_repl)
-        out = {}
-        for src, classes in tree.items():
-            cw = vms.get(src, {}).get("class_weights", {})
-            cls_items = {c: (cw.get(c, 1), sum(fs.values()))
-                         for c, fs in classes.items()}
-            cls_ceil = waterfill_ceilings(vm_ceil[src], cls_items)
-            for c, fs in classes.items():
-                out.update(waterfill_ceilings(
-                    cls_ceil[c], {f: (1, d) for f, d in fs.items()}))
-        return out
+            return self._alloc_c(demand)
+        return self._fill(demand)
 
 
 class RpMailbox:
@@ -671,20 +745,104 @@ def main():
     # exception: q == 0 and Ehat > R jumps straight up. Trust
     # T' = (1-T)/tau_r - (q/D_r)(T/D_r). The executor blends r = T c + (1-T) R.
     conf_tr = float(ep.get("trust_recover_s", 1.0))
+    # design v4 (per-feedback, dimensionless): probe alpha, brake kappa,
+    # repayment horizon D in feedbacks, fence cap = mult x own send rate
+    # probe (§5.2/§5.5): step = alpha * min(m, m_max) per feedback, m =
+    # consecutive empty-queue feedbacks. alpha = alpha_max / m_max, where
+    # alpha_max is the overshoot budget (alpha_max * tau <= 10%) and m_max
+    # is how long a silence has to be before the share is believed to have
+    # moved. alpha has units of "per feedback squared" - it is the growth
+    # rate of the step, not the step - so it scales with the SQUARE of the
+    # period, while kappa scales linearly.
+    v4_alpha = float(ep.get("alpha", 3e-4))
+    v4_mmax = float(ep.get("m_max", 100))
+    v4_kappa = float(ep.get("kappa", k * period))
+    v4_D = float(ep.get("D", vq_repay / period))
+    # Budget hysteresis toward the RDMA executor: how far the fence has to
+    # move before a new budget is written instead of re-sending the last one.
+    # 0 = always write the current value.
+    rdma_hyst = float(ep.get("rdma_budget_hyst", 0.03))
+    tree_theta = float(ep.get("tree_backlog_theta", 0.85))
+    # 5.3 third term; togglable so the tree's contribution to the probe
+    # ceiling can be isolated against a control run
+    probe_cap_tree = bool(ep.get("probe_cap_tree", True))
+    tree_period_s = float(ep.get("tree_period_ms", 100)) / 1e3
+    v4_cap_mult = float(ep.get("r_cap_mult", 2.0))
+    v4_cap_floor = float(ep.get("r_cap_floor_bps", 2e9))
+    v4_floor = max(floor, float(ep.get("r_floor_bps", 1e9)))   # the RDMA executor misbehaves near zero
 
     def step_law(st, rec, now, fsid=""):
-        if law == "conf":
+        if law == "conf_v3":
+            # ablation arm: the same receiver ledger, but the sender also gets
+            # the explicit rate (A/E on the wire) and tracks it (v3 law)
             dt = min(max(now - st.last_step, dt_min), dt_max)
             st.last_step = now
-            gam = rec.get("u", 1e6) / 1e6 - 1.0     # (1+gamma) scaled
-            q = rec.get("d", 0.0)                   # seconds
+            gam = rec.get("u", 1e6) / 1e6 - 1.0
+            q_s = rec.get("d", 0.0)                 # seconds
             A = float(rec.get("r", 0))
             if A > 0 and 1.0 + gam > 0:
                 st.Ehat = A / (1.0 + gam)
-            st.R, st.T, st.under, st.a_ref = conf_step(
-                st.R, st.T, st.Ehat, q, dt, k, vq_repay, conf_tr, floor,
-                gamma=gam, delta=ep["delta_demand"], under=st.under,
-                under_n=int(ep.get("trust_under_n", 20)), A=A, a_ref=st.a_ref)
+            if st.mode == "fresh":
+                st.R = min(st.R, st.Ehat if st.Ehat > 0 else v4_cap_floor); st.mode = "v3"
+            st.R, _T, _u, _a = conf_step(st.R, 0.0, st.Ehat, q_s, dt, k, vq_repay, conf_tr, v4_floor)
+            st.q_prev = q_s / period; st.T = min(q_s / vq_repay, 1.0)
+        elif law == "conf":
+            # design v4: q (periods), b (1 = at share), own send rate for the cap
+            q = rec.get("d", 0.0) / period          # seconds -> periods
+            b = 1 if rec.get("u", 0.0) >= 5e5 else 0
+            src, cls = fsid.split(">")[0], fsid.rsplit("|", 1)[1]
+            a_s = live.rate.get("%s|%s" % (src, cls)) if live is not None else None
+            if a_s is not None:
+                st.as_avg += (float(a_s) - st.as_avg) * min(1.0, (now - st.last_step) / 0.1) if st.as_avg > 0 else float(a_s) - st.as_avg
+            # 5.3: the probe may not climb into rates the flow-set could
+            # never use. pace = min(R, Tree), so a fence above the local
+            # tree buys nothing and only lengthens the fall when the share
+            # drops - measured on V2, the incumbents sat at 2 x their send
+            # rate (46 G) while the tree held them at 23 G, so a halving of
+            # the share meant falling a factor of four instead of two.
+            # The margin matters: 5.6 takes R as a pressing flow-set's
+            # demand on the tree, so capping R AT the tree would make
+            # demand == tree, the fill would sit at its own fixed point and
+            # the tree could never grow again. One delta of headroom keeps
+            # the demand above the tree and the growth path open.
+            cap = line if a_s is None else max(v4_cap_mult * st.as_avg, v4_cap_floor)
+            if probe_cap_tree:
+                cap = min(cap, tree_of(fsid) * (1.0 + ep["delta_demand"]))
+            if st.mode == "fresh":
+                # no rate feedback to start from: begin at the cap floor and
+                # probe. The silence starts at its cap, not at zero: a flow
+                # set that has never seen a queue has no evidence at all about
+                # where its share is, which is the maximum-uncertainty state
+                # and the one case where the largest step is the right one
+                # (§5.4). From zero the ramp would spend its first hundred
+                # feedbacks barely moving, and a cold start cannot then be
+                # done inside a second at any alpha.
+                st.R = min(st.R, v4_cap_floor)
+                st.below = int(v4_mmax)
+                st.mode = "v4"
+            if not st.enforced and (a_s is None or float(a_s)
+                                    <= max(st.R, v4_floor) * (1.0 + ep["delta_demand"])):
+                st.enforced = True          # latched: the fence has taken hold
+            # An empty ledger is a statement by the receiver that this
+            # flow-set did NOT exceed its entitlement, so the rate it is
+            # already putting on the wire is one the receiver has just
+            # certified. The fence may adopt it at once; probing up to a
+            # rate that has already been sent and accounted for is work the
+            # loop does not need to do. In the steady state the flow is
+            # held at its fence, so this is a no-op; it fires only where
+            # the wire is ahead of the fence, which is exactly a flow-set
+            # whose executor admitted it at a startup allowance before any
+            # budget arrived - and that is the 810 ms the newcomer used to
+            # spend climbing from the floor at the maximum step.
+            if q <= 0.0 and not st.enforced and a_s is not None:
+                st.R = max(st.R, min(float(a_s), cap, line))
+            st.R, st.dq, st.below = v4_step(st.R, q, st.q_prev, st.below,
+                                            v4_alpha, v4_mmax, v4_kappa, v4_D,
+                                            v4_floor, min(cap, line),
+                                            not st.enforced)
+            st.q_prev, st.b = q, b
+            st.last_step = now
+            st.T = min(q / v4_D, 1.0)               # queue fraction for the executors' trust
         elif law == "vq2":
             g = max(float(rec.get("u", 0.0)), floor)
             d = rec.get("d", 0.0)
@@ -724,9 +882,24 @@ def main():
                                   _live_ip, int(ep.get("liveness_port", 9713)),
                                   local_host)
     mailbox = RpMailbox(line)
-    # Cap for RDMA flows the executor has no budget for yet (mailbox 0xccf):
-    # a joiner otherwise runs at line rate until its first budget lands.
-    unknown_bps = float(ep.get("rdma_unknown_rate_bps", 20e9))
+    # What an RDMA flow the executor has no budget for yet may send
+    # (mailbox 0xccf); without it a joiner runs at line rate until its
+    # first budget lands. This is the SAME question 5.4 answers for the
+    # fence - what may a flow-set use before anything is known about it -
+    # so making it take the same answer - the fence's floor - was tried
+    # (leave the key null and it still does). It is WORSE: measured on V2,
+    # 2026-08-30, the join event went from 1168 to 1473 ms on RDMA and 922
+    # to 1823 ms on TCP, while the transient it was meant to remove barely
+    # moved (queue peak 50 -> 45 ms, rate peak 29.8 -> 26.0 G). The reason
+    # is that the peak is not the joiner bursting at all: it is the
+    # INCUMBENT holding the joiner's unused share while the joiner ramps
+    # (4.3 lending), so throttling the joiner lengthens the very lending it
+    # was supposed to shorten. The allowance is kept above the floor
+    # deliberately: a joiner that is already on the wire and drawing no
+    # queue is a joiner whose fence can adopt that rate at once (5.2), and
+    # that is what makes the join fast.
+    unknown_bps = float(ep.get("rdma_unknown_rate_bps") or 0) \
+        or max(floor, float(ep.get("r_floor_bps", 1e9)))
     _unk_units = mailbox._units(unknown_bps)
     _unk_sent = 0.0
     flowtags = {v["vnic_id"]: int(v["flowtag"], 16)
@@ -740,8 +913,10 @@ def main():
                for key, v in reg.get("rdma_flowtags", {}).items()
                if ">" in key}
     stree = SenderTree(reg["policy"], line, ep["headroom"],
-                       ep["delta_demand"], floor)
-    trees = {}   # fsid -> Tree_f, recomputed on telemetry / ticker
+                       ep["delta_demand"], floor, tree_theta)
+    trees = {}   # fsid -> Tree_f, recomputed on tree_period_s (5.6)
+    tree_recomputed = 0.0
+    tree_keys = frozenset()
 
     # §4.3 layer one. The hardware cap is programmed from the same policy
     # that feeds the tree, so the two layers can never be configured apart,
@@ -844,9 +1019,9 @@ def main():
             # law happens to move a rate. The RDMA path has always had
             # this property (it reflushes every rdma_push_ms even when the
             # budget has not changed); the TCP path did not.
-            if pace != st.pace or tnow - st.shim_last >= tcp_refresh_s:
+            if abs(pace - st.pace) > 0.005 * max(st.pace, 1.0) or tnow - st.shim_last >= tcp_refresh_s:
                 shim.set_rate(src, dst, pace,
-                              st.T if law == "conf" else None)   # T = queue fraction q/D_r
+                              st.T if law in ("conf", "conf_v3") else None)   # T = queue fraction q/D_r
                 st.shim_last = tnow
         elif cls == "rdma":
             ft = pair_ft.get(src_dst, flowtags.get(src))
@@ -860,7 +1035,7 @@ def main():
                 # belongs where the error was - in the receiver's split -
                 # not in refusing to use its output.
                 rdma_batch.append((ft, pace, r_bps,
-                                   st.T if law == "conf" else None))   # T = queue fraction
+                                   st.T if law in ("conf", "conf_v3") else None))   # T = queue fraction
         st.pace = pace
         # executor-escape tripwire (log-only). Every stress-D1 failure class
         # was a silent one: an unpaced EDT pair, an unmatched flowtag and a
@@ -926,10 +1101,29 @@ def main():
     # turns a late decision into a missed one.
     proc_us = []
     proc_report = time.monotonic()
+    tele_skipped = 0
+    sock_timeout = sock.gettimeout()
     while True:
         # --- telemetry-driven law ---
         try:
             data, _ = sock.recvfrom(65536)
+            # LATEST WINS: the receiver sends one datagram per period and
+            # this loop costs more than a period under load (24 flow-sets:
+            # tree rebuild, 8 law steps, shim writes, log lines), so the
+            # socket buffer filled and every decision was taken on a
+            # datagram ~130 ms old (V1, 2026-08-28) - a loop delay the law
+            # cannot tolerate. q and b are levels, so skipping stale
+            # datagrams loses nothing; only the newest one is processed.
+            sock.setblocking(False)
+            try:
+                while True:
+                    more, _ = sock.recvfrom(65536)
+                    data = more
+                    tele_skipped += 1
+            except (BlockingIOError, socket.timeout, OSError):
+                pass
+            finally:
+                sock.settimeout(sock_timeout)
             seq, recs_all = parse_telemetry(data)
         except socket.timeout:
             seq, recs_all = None, {}
@@ -960,7 +1154,16 @@ def main():
                     fresh.append(fsid)
                 st.r = rec.get("r", 0)
             _t0 = time.monotonic()
-            trees = stree.trees(flows)      # §4.3 tree follows demand
+            # 5.6: the tree is an upper bound, not a second controller, so
+            # it is rebuilt on its own period rather than on every
+            # telemetry datagram - a cap that moves as fast as the thing
+            # it caps is not a cap. A change in WHICH flow-sets exist is
+            # a structural change and is taken at once.
+            keys_now = frozenset(flows)
+            if (now - tree_recomputed >= tree_period_s
+                    or keys_now != tree_keys or not trees):
+                trees = stree.trees(flows)
+                tree_recomputed, tree_keys = now, keys_now
             apply_trees(now)                # §5.1 transition limiting
             tree_us = int((time.monotonic() - _t0) * 1e6)
             for fsid in fresh:
@@ -1013,7 +1216,8 @@ def main():
                          "seq": st.last_seq, "u": int(u), "r": r,
                          "d": round(rec.get("d", 0.0) * 1e3, 3),
                          "acts": st.acts, "T": round(st.T, 3),
-                         "Ehat": int(st.Ehat),
+                         "Ehat": int(st.Ehat), "q": round(st.q_prev, 3), "b": st.b, "dq": round(st.dq, 4),
+                         "As": int(live.rate.get("%s|%s" % (fsid.split(">")[0], fsid.rsplit("|", 1)[1]), 0)) if live is not None else -1,
                          "R": int(st.R), "pace": int(st.pace),
                          "tree": int(tree_of(fsid)), "tus": tree_us,
                          "mode": st.mode}) + "\n")
@@ -1091,15 +1295,16 @@ def main():
                          "R": int(st.R), "mode": st.mode}) + "\n")
         # coalesce RDMA budgets: keep the latest per flowtag, flush the
         # freshest snapshot to the FIFO only at the mailbox rate.
-        # Budget hysteresis (stress D1, 2026-07-11): the RP treats ANY budget
-        # change as a cap change - it re-arms the settle-hold and marks the
-        # rate sample used, so its integral level control never steps while
-        # the budget keeps moving. Re-sending the same budget while the
-        # drift is <3% keeps the budget quasi-static (the 20Hz-era
-        # semantics the RP was built against); the rate field stays fresh
-        # every flush, so the hold expires after 3 samples and the integral
-        # climbs the level back (~12.5%/step). This is executor semantics
-        # (design_theory §2.7).
+        # Budget hysteresis (rdma_budget_hyst). It was added when the RP
+        # searched for its water level with an integral: any budget change
+        # re-armed a settle-hold, so a budget that kept moving stopped the
+        # search from ever stepping. That executor is gone - the device now
+        # ASSIGNS level = budget/N every epoch, statelessly, and explicitly
+        # discards the freshness gate ((void)do_ctrl) - so the hysteresis
+        # now only makes the device pace on a stale budget. It costs
+        # nothing to drop: the push happens on its own timer and carries
+        # every pair in one message either way, so this only decides which
+        # number that message contains.
         #
         # There is deliberately NO rate limit on descending budget writes.
         # One would only be needed if the budget could swing violently at
@@ -1120,10 +1325,8 @@ def main():
             trust_mode = False
             for ft, (bud, rate, tr) in latest_rdma.items():
                 sent = rdma_sent_budget.get(ft)
-                if sent is None or bud == 0:
+                if sent is None or bud == 0 or abs(bud - sent) > rdma_hyst * sent:
                     sent = bud
-                elif abs(bud - sent) > 0.03 * sent:
-                    sent = bud     # 3% hysteresis, symmetric
                 rdma_sent_budget[ft] = sent
                 ent = [ft, sent,
                        max(rate + (1 if rp_dither_flip else -1)
@@ -1141,12 +1344,13 @@ def main():
             q = sorted(proc_us)
             n_ = len(q)
             print("proc_us n=%d p50=%.0f p90=%.0f p99=%.0f max=%.0f "
-                  "over_period=%d"
+                  "over_period=%d tele_skipped=%d"
                   % (n_, q[n_ // 2], q[int(n_ * 0.90)], q[int(n_ * 0.99)],
-                     q[-1], sum(1 for x in q if x > period * 1e6)),
+                     q[-1], sum(1 for x in q if x > period * 1e6), tele_skipped),
                   flush=True)
             proc_us = []
             proc_report = now
+            tele_skipped = 0
         if now - last_print >= 5.0:
             act = " ".join("%s R=%.2fG %s" % (f, st.R / 1e9, st.mode)
                            for f, st in sorted(flows.items()))

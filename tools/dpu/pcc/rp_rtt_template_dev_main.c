@@ -287,7 +287,11 @@ typedef struct {
 	volatile uint32_t trust;	/* fxp16, executor-owned (fence design) */
 	volatile uint32_t trust_mode;	/* 1: rate = T*cc + (1-T)*level */
 	volatile uint32_t qfrac;	/* fxp16: q/D_r from the sender agent */
-	volatile uint32_t under_ep;	/* epochs the CC asked for less than the fence */
+	volatile uint32_t loss_ts;	/* device us of the last NACK on this pair */
+	volatile uint32_t n_nack;	/* NACKs matched to this pair; 0 = never any,
+					 * which is what makes loss_ts readable */
+	volatile uint32_t loss_ep;	/* epochs the loss fast path, rather than the
+					 * trend window, is what granted the rise */
 	volatile uint32_t epoch_id;	/* bumped once per epoch, ages the map */
 	volatile uint32_t cnp_hits;	/* DIAG 2026-07-22: CNP events matched to THIS pair
 					 * (target>=0 && ev_type==ROCE_CNP), vs g_hpft_cnp_any
@@ -486,12 +490,23 @@ static volatile uint32_t g_hpft_cc_algo = HPFT_CC_DCQCN;
  * conservative allowance; without an agent it stays MAX, i.e. the old
  * behaviour. */
 static volatile uint32_t g_hpft_unknown_rate = DOCA_PCC_DEV_MAX_RATE;
-/* fence design trust (executor-owned): per epoch T -= (q/D_r)*T; when the
- * queue is empty and the CC asks for less than the fence allows (cc <
- * level*(1-margin)) for HPFT_TRUST_UNDER_EP epochs, T += (1-T)/tau_r per
- * epoch. Margin = half the receiver's demand margin (15%). */
-#define HPFT_TRUST_MARGIN_FXP16 (60555u)   /* 1 - 0.075 */
-#define HPFT_TRUST_UNDER_EP     (20u)
+/* fence design trust (executor-owned, design v4 6.2/6.3): per epoch
+ * T -= (q/D_r)*T, and T rises at (1-T)/tau_r per epoch only on evidence of
+ * a bottleneck the receiver's ledger cannot see. That evidence is LOSS.
+ * Our own rate limiter never drops a packet - it only makes a QP wait - so
+ * a NACK is the fabric stating that it dropped this pair's packets, a fact
+ * belonging to no particular CC.
+ *
+ * Asking instead whether the CC is what BINDS the flow - the trend test
+ * this replaces - cannot separate a CC that yields too early at a
+ * bottleneck we DO manage from one facing a bottleneck we do not: both
+ * read as "cc below the fence and not rising". In the first case that test
+ * raises the trust exactly while the flow is giving its share away, which
+ * is the wrong direction. The fence is feasible at the receiver's port by
+ * construction, so enforcing it can never overrun that port; deferring to
+ * the CC is only ever justified by a bottleneck somewhere else. */
+#define HPFT_TRUST_BELOW_FXP16  (64225u)   /* 1 - 0.02 */
+#define HPFT_LOSS_WIN_US        (100000u)  /* the observation window, in us */
 static volatile uint32_t g_trust_step = 66u;   /* fxp16 per epoch = 1 ms / 1 s */
 static volatile uint32_t g_hpft_rtt_events;   /* RTT events seen, any flowtag */
 /* DIAG 2026-08-27: which event types carry a stable QPN? Per ev_type&7:
@@ -611,7 +626,9 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					c->remote_rx_rate = erx;
 					c->qfrac = etr;
 					c->trust = 0;
-					c->under_ep = 0;
+					c->loss_ts = 0;
+					c->n_nack = 0;
+					c->loss_ep = 0;
 					c->trust_mode = (w == 4u);
 					for (int s = 0; s < HPFT_MAX_THREADS; s++)
 						c->b32_shard[s] = 0;
@@ -638,18 +655,22 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 		if (ft == 0xdedu) {
 			/* observer readback: 0xded <pair>. The host prints a fixed
 			 * eleven words, so the slots are reused - in its output
-			 * ft=flowtag bud=level lvl=paced avg16=achieved r=d
-			 * s16=cc_rate ep=cc_prev evb32=pace_limited. */
+			 * ft=flowtag bud=level lvl=paced avg16=loss_ep r=d
+			 * s16=cc_rate ep=n_nack evb32=pace_limited.
+			 * avg16 and ep carried dbg_r_units and cc_prev, which
+			 * belong to the observer coupling and are dead under the
+			 * fence arm; dbg_r_units is still reported by 0xdea, and
+			 * d_cuts (w9) is what shows the observer arm working. */
 			hpft_pair_t *c = &g_hpft_pairs[budget % HPFT_PAIRS];
 			volatile uint32_t *rsp = (volatile uint32_t *)response;
 
 			rsp[0] = c->flowtag;
 			rsp[1] = c->level;
 			rsp[2] = c->paced;
-			rsp[3] = c->dbg_r_units;
+			rsp[3] = c->loss_ep;
 			rsp[4] = c->d;
 			rsp[5] = c->cc_rate;
-			rsp[6] = c->cc_prev;
+			rsp[6] = c->n_nack;
 			rsp[7] = (uint32_t)hpft_pace_limited(c);
 			rsp[8] = c->dbg_hits;   /* events the DPA processed for this pair */
 			rsp[9] = c->d_cuts;
@@ -1020,9 +1041,17 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				c->cc_rate = (nr < HPFT_MIN_LEVEL) ? HPFT_MIN_LEVEL : nr;
 			}
 		}
-		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_NACK &&
-		    (g_hpft_cc_algo == HPFT_CC_ZTR || g_hpft_cc_algo == HPFT_CC_SWIFT))
-			c->ztr_flags |= 2u;
+		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_NACK) {
+			/* Counted for every CC, not just the two that act on it:
+			 * the trust rule reads it as the network's own statement
+			 * of loss, which is true whichever algorithm is running
+			 * underneath (design v4 6.3 step three). */
+			c->loss_ts = now;
+			c->n_nack++;
+			if (g_hpft_cc_algo == HPFT_CC_ZTR ||
+			    g_hpft_cc_algo == HPFT_CC_SWIFT)
+				c->ztr_flags |= 2u;
+		}
 		if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT) {
 			/* The RTT responder is the remote NIC's HW handler; its
 			 * payload is the standard response, NOT NP-authored data.
@@ -1235,16 +1264,18 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 					/* executor-owned trust, once per epoch */
 					uint32_t t = c->trust;
 					uint32_t qf = c->qfrac > 65536u ? 65536u : c->qfrac;
+					uint32_t under, lost;
 
 					t -= (uint32_t)(((uint64_t)t * qf) >> 16);
-					if (qf == 0 &&
-					    (uint64_t)c->cc_rate * 65536u <
-					    (uint64_t)c->level * HPFT_TRUST_MARGIN_FXP16) {
-						if (++c->under_ep >= HPFT_TRUST_UNDER_EP)
-							t += (uint32_t)(((uint64_t)(65536u - t)
-								* g_trust_step) >> 16);
-					} else {
-						c->under_ep = 0;
+					under = (qf == 0 &&
+						 (uint64_t)c->cc_rate * 65536u <
+						 (uint64_t)c->level * HPFT_TRUST_BELOW_FXP16);
+					lost = (under && c->n_nack &&
+						(uint32_t)(now - c->loss_ts) < HPFT_LOSS_WIN_US);
+					if (lost) {
+						t += (uint32_t)(((uint64_t)(65536u - t)
+							* g_trust_step) >> 16);
+						c->loss_ep++;
 					}
 					c->trust = t > 65536u ? 65536u : t;
 				}
@@ -1299,11 +1330,20 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		uint32_t lvl = c->level;
 
 		if (c->trust_mode) {
-			/* fence design: r = T*cc + (1-T)*level, T fxp16 */
+			/* design v4 6.1: r = clip(cc, (1-T)*level, level). The
+			 * fence is the upper bound at every trust value - trust
+			 * buys the right to send LESS, never more - and the
+			 * lower bound opens linearly with trust. Inside the band
+			 * the QP is paced at exactly what the CC asked for, so a
+			 * CC that is behaving sees an unmodified fabric and its
+			 * own loop is intact. */
 			uint64_t t = c->trust;
-			uint32_t r = (uint32_t)((((uint64_t)cc * t)
-					+ ((uint64_t)lvl * (65536u - t))) >> 16);
+			uint32_t lo = (uint32_t)(((uint64_t)lvl
+					* (65536u - t)) >> 16);
+			uint32_t r = cc < lvl ? cc : lvl;
 
+			if (r < lo)
+				r = lo;
 			if (r < HPFT_MIN_LEVEL)
 				r = HPFT_MIN_LEVEL;
 			c->paced = r;
