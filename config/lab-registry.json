@@ -707,7 +707,7 @@
     "D": 30,
     "rdma_budget_hyst": 0.0,
     "tree_backlog_theta": 0.85,
-    "probe_cap_tree": false,
+    "probe_cap_tree": true,
     "tree_period_ms": 100,
     "r_cap_mult": 2.0,
     "r_cap_floor_bps": 2000000000.0,

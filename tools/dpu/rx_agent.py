@@ -223,6 +223,7 @@ class FlowSetMeter:
         return fs_bytes, fs_present
 
 
+
 class VportMeter:
     """Reader for the vport_meter.c shared-memory file: per-VF vport
     counters with the ib(RoCE)/eth(kernel-path) class split, queried from
@@ -474,6 +475,9 @@ class HybridRates:
         self.young_active = set()         # partially-visible newcomers
         self.liveness = None              # SenderLiveness (advisory)
         self.sender_ratio = False         # split pools by sender reports
+        self.attr_tol = 0.15              # how far a pool may exceed the senders'
+                                          # own reports before the excess is read
+                                          # as an undiscovered sender's traffic
 
     def _rep_tx_bytes(self, dev):
         fd = self._fd.get(dev)
@@ -740,10 +744,36 @@ class HybridRates:
                 w_s = live.rates_for(fs, now)
                 if w_s is not None and sum(w_s.values()) > 0:
                     wsum = sum(w_s.values())
+                    # The pool is the receiver's exact total for this (VM,
+                    # class) and it counts EVERY sender, including one whose
+                    # flow-set the receiver has not admitted yet: membership
+                    # comes from the megaflow dump, which is ~1 s stale, while
+                    # the bytes appear in the vport counter at once. Dividing
+                    # the pool over the members we happen to know charges them
+                    # for bytes no known sender claims to have sent, and the
+                    # ledger cannot tell that mark from real over-taking.
+                    # Measured on V2 (2026-08-31): for the 128 ms between the
+                    # newcomer's first byte and its admission, the incumbent
+                    # TCP flow-set was attributed 48.3 G against a true 22.7,
+                    # its ledger reached 191 ms, and its fence was then cut to
+                    # 2.9 G - a quarter of the 11.5 G share it had just been
+                    # given. That single mark is what V2's join convergence
+                    # has been failing on.
+                    #
+                    # So never attribute to a flow-set more than its OWN
+                    # sender reports having sent, beyond attr_tol for the skew
+                    # between two counters read at different instants. Below
+                    # that bound this is algebraically what it always was
+                    # (w_s[f] * pool / wsum), so the steady state is untouched;
+                    # it engages only when the pool exceeds every known
+                    # sender's account of it, which is the signature of a
+                    # sender we cannot yet name. The excess is charged to
+                    # nobody - the alternative, charging a flow-set for a
+                    # stranger's bytes, is the bug above.
+                    k = min(pool / wsum, 1.0 + self.attr_tol)
                     for f in fs:
-                        share = w_s[f] / wsum
-                        if share > 0:
-                            out[f] = pool * share
+                        if w_s[f] > 0:
+                            out[f] = w_s[f] * k
                     return
         young = bool(self.young_active & set(fs))
         if young or any(f in self.unmeasured for f in fs):

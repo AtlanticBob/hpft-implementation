@@ -234,6 +234,9 @@ static inline uint32_t hpft_isqrt(uint32_t x)
 #define HPFT_PAIR_QPS (64)          /* QPs tracked per pair for N */
 #define HPFT_QP_ACTIVE_EPOCHS (8u)  /* seen within this many epochs = active */
 #define HPFT_QP_FORGET_EPOCHS (2000u)
+/* How long a lower reading of N must stand before it is believed. See
+ * the epoch block: N is one-sided on purpose. */
+#define HPFT_QP_HOLD_EPOCHS (64u)
 
 /* byte accumulation is sharded per DPA thread (each thread owns its slot),
  * so no atomics are needed on the hot path; the epoch winner sums the shards */
@@ -277,8 +280,9 @@ typedef struct {
 	volatile uint32_t d_cuts;	/* decreases the observer counted; d recovers
 					 * in about a millisecond, so sampling d
 					 * alone cannot show the branch working */
-	volatile uint32_t qp_count;	/* QPs sending in the last epoch */
-	volatile uint32_t qp_seen;	/* QPs counted so far in THIS epoch */
+	volatile uint32_t qp_count;	/* N: QPs the pair is sending on */
+	volatile uint32_t qp_hi;	/* highest reading seen during the current dip */
+	volatile uint32_t qp_dip;	/* epochs the reading has stood below qp_count */
 	/* map slots of the QPs this pair has seen; N = how many of them were
 	 * seen within the last HPFT_QP_ACTIVE_EPOCHS epochs (see the epoch
 	 * block) */
@@ -584,6 +588,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 						if (ebud == 0) {
 							c->flowtag = 0;
 							c->qp_count = 0;
+							c->qp_hi = 0;
+							c->qp_dip = 0;
 						} else {
 							if (c->budget != ebud) {
 									/* proportional feed-forward: level tracks bud/N,
@@ -622,6 +628,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					c->cc_prev = DOCA_PCC_DEV_MAX_RATE;
 					c->paced = 0;
 					c->qp_count = 0;	/* relearned from events */
+					c->qp_hi = 0;
+					c->qp_dip = 0;
 					c->qp_nslot = 0;
 					c->remote_rx_rate = erx;
 					c->qfrac = etr;
@@ -1163,8 +1171,52 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 						act++;
 				}
 				c->qp_nslot = w;
-				if (act)
+				/* N divides the budget - level = budget/N, and every
+				 * QP of the pair is paced at level, so the pair puts
+				 * N_sending x level on the wire. The two errors are
+				 * not symmetric. Too HIGH an N under-rates the pair;
+				 * the receiver then sees r < E and its allocator
+				 * lends the slack out, which is what 4.3 of the
+				 * design says should happen to capacity nobody is
+				 * using. Too LOW an N over-rates it by N_real/N_read,
+				 * and that is our own executor putting more than the
+				 * budget onto the bottleneck the fence exists to
+				 * bound - the one thing the design promises cannot
+				 * happen.
+				 *
+				 * A QP earns its place in N by raising events, and a
+				 * paced QP raises them less often the harder we pace
+				 * it, so an active QP does drop out of the activity
+				 * window now and then. Measured 2026-08-31 with the
+				 * budget frozen at 24 G and ten QPs sending flat out:
+				 * N read 10 in 92.4% of samples, 9 in 5.2% and 8 in
+				 * 2.4%, so the pair ran 11% and 25% over budget in
+				 * those epochs. With the control loop switched off
+				 * entirely that still left 9% jitter on the wire,
+				 * which is what charges the receiver's ledger and
+				 * sets the fence hunting.
+				 *
+				 * So make the error one-sided: N rises the instant a
+				 * QP is seen, and falls only after the lower reading
+				 * has stood for HPFT_QP_HOLD_EPOCHS. What it falls to
+				 * is the HIGHEST reading over that window, not the
+				 * one at its end, so a dip landing on the boundary
+				 * cannot latch. N is never lowered to zero - an idle
+				 * pair keeps its last count, so the first QP to
+				 * resume does not briefly own the whole budget.
+				 */
+				if (act > c->qp_hi)
+					c->qp_hi = act;
+				if (act >= c->qp_count) {
 					c->qp_count = act;
+					c->qp_hi = act;
+					c->qp_dip = 0;
+				} else if (++c->qp_dip >= HPFT_QP_HOLD_EPOCHS) {
+					if (c->qp_hi)
+						c->qp_count = c->qp_hi;
+					c->qp_hi = 0;
+					c->qp_dip = 0;
+				}
 			}
 			c->epoch_id++;
 			{
@@ -1389,6 +1441,8 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			c->cc_prev = DOCA_PCC_DEV_MAX_RATE;
 			c->paced = 0;
 			c->qp_count = 0;
+			c->qp_hi = 0;
+			c->qp_dip = 0;
 			c->qp_nslot = 0;
 			c->ztr_flags = 0;
 			c->rtt_min = 0;
