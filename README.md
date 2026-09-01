@@ -13,10 +13,10 @@ HPFT 在 BlueField-3 DPU 的边缘上用虚拟队列的差分标记，实现云�
 
 | 想知道什么 | 读哪里 |
 |---|---|
-| 系统是什么、每个部件解决什么问题、为什么这样设计 | `hpft-design/docs/design.md`（唯一权威设计说明；英文版 `design_en.md`） |
+| 系统是什么、每个部件解决什么问题、为什么这样设计 | `hpft-design/docs/design_v4.md`（唯一权威设计说明；英文版 `design_en.md`） |
 | lab 长什么样、怎么跑一场实验 | **本文**的"现在的系统"与"怎么跑实验" |
 | 动 lab 之前不能不知道的坑 | 本文"硬性规则" + `hpft-design/docs/ops_notes.md` |
-| 参数为什么取这个值、收敛闭式 | `hpft-design/docs/design_theory.md` |
+| 参数为什么取这个值、换规模怎么重新定 | `hpft-design/docs/design_theory_v4.md` |
 | 论文评估要跑哪些实验 | `hpft-paper/paper/evaluation_plan.md` |
 
 改代码之前**不需要**通读设计文档：`config/lab-registry.json` 是唯一真值配置，
@@ -70,21 +70,30 @@ sender→receiver 都是直达隧道，spoke 之间经 hub 的 eswitch 硬件转
   会各拿整份预算**。
 - **执行面只读租户 CC、不改它**。RDMA 侧是 `tools/dpu/pcc/rp_rtt_template_dev_main.c`
   （DOCA PCC device 码，跑在 DPA 上）：`cc_rate` 是 PCC 里自实现的 DCQCN 风格
-  状态机（可切 ZTR），原样运行；执行面把它的**下降**累积成一个相对政策份额的
-  偏离 d，自己把 d 收回 1，下发 `rate = d * level`。被自己的整形卡住时（实发
-  ≈ 已下发）那次降速不计入，否则会自我驱动。TCP 侧同一形态：
-  `tcp/bpf-opt3/hpft_tcp_edt_kern.c` 读内核 CC 的 `snd_cwnd*mss`，同一合成器，
-  落到 EDT 时间戳。取小值的旧组合 `min(cc_rate, level)` 作为对照臂保留
-  （邮箱 `0xcca 0`）。
+  状态机（可切 ZTR / Swift），原样运行；执行面下发的是**限幅**
+  $r=\operatorname{clip}(cc,\ (1-T)\cdot level,\ level)$——上界恒等于 level，
+  与信任度无关，所以租户拿不到超过份额的速率；下界随执行面自有的信任度 $T$ 放开，
+  而 $T$ 只在有丢包证据时上升。落在区间内时 $cc$ 一字不改。TCP 侧同一形态：
+  `tcp/bpf-opt3/hpft_tcp_edt_kern.c` 读内核 CC 的 `snd_cwnd/minRTT`，同一限幅，
+  落到 EDT 时间戳。两条对照臂仍在设备码里：`0xcca 1` 是旧的观测耦合
+  `rate = d * level`，`0xcca 0` 是基线 `min(cc_rate, level)`。
 
 ### 响应律
 
-接收端把政策裁定与审计账本压成一个目标 $u_f=\hat e_f(1-\gamma s_f)$ 下发，
-发送端在对数轴上做一阶跟踪 $R_f\leftarrow R_f(u_f/R_f)^{kT}$——无分支、无钳位、
-律侧只剩一个参数 $k$。遥测每流集合两个数 `{u, r}`，**rx/tx 是双端同步的二进制
-格式，必须一起下发**。控制周期 1ms，现行 `k=20`、`gamma=0.25`、
-`v_seconds=0.072`（V=576 Mbit，由 ζ 反解 `V=4ζ²γê*/k`，与 headroom 无关）。
-取值理由与收敛闭式见 `hpft-design/docs/design.md` §3.4/§4.2/§6 与 `design_theory.md`。
+接收端为每个流集合记一本虚拟队列 $Q\leftarrow\operatorname{clip}(Q+A-E,\ 0,\ D\cdot E)$，
+**只把归一化的队列 $q=Q/E$ 发出去**，线上没有任何能被反算成速率的量。发送端每收到
+一条反馈做一次乘性步进：
+
+$$R\leftarrow R\cdot e^{\alpha\hat m}\cdot e^{-\kappa\Delta q}\cdot e^{-(\kappa/D)\min(q,D)}$$
+
+三个因子各做一件事——账本空着时按沉默长度探涨、账本在涨时刹车、账本有存量时还账。
+$\Delta q$ 由发送端自己从相邻两条反馈相减得到，所以一个标量同时带了误差和它的积分。
+遥测**rx/tx 是双端同步的二进制格式，必须一起下发**。控制周期 10 ms，现行
+`kappa=0.1`、`D=30`、`alpha=3e-4`、`m_max=100`。
+
+这些常数全是每条反馈的无量纲量，**不随链路速率或流数改变**；换平台只需重测周期
+$T_p$ 与环路滞后 $\tau$，其余是代数。推导、三条性质与调参配方见
+`hpft-design/docs/design_theory_v4.md`，设计本身见 `design_v4.md`。
 
 ### 离线检查（不需要 lab，直接跑）
 

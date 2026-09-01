@@ -103,9 +103,16 @@ for h in $RECV $SENDERS; do
   d=$(dpu_of $h); cur=$(ssh -o BatchMode=yes "$d" 'cat /sys/class/net/p1/speed' 2>/dev/null)
   [ "$cur" = "200000" ] || { echo "ABORT: $d p1 is ${cur} Mb, expected 200000"; exit 1; }
 done
-# environment as it actually is (UPCC, SR, p1 speed, agents, switch ECN);
-# the report copies these lines, and the SR column is checked by distill
+# environment as it actually is (UPCC, SR, p1 speed, agents, switch ECN).
+# The report copies these lines verbatim. NOTHING checks them - an earlier
+# comment here claimed distill verified the SR column and it never did, which
+# is how every run to date went out under GBN while README and EXECUTION both
+# specify SR. Read the retransmission line below before trusting a report's
+# environment table.
 bash tools/lab_env.sh status > "$OUT/env_status.txt" 2>&1
+sr=$(grep -o "SR current=[01]" "$OUT/env_status.txt" | head -1 | tr -d ' ')
+echo "retransmission: $([ "$sr" = "SRcurrent=1" ] && echo SR || echo GBN)  ($sr)" \
+  | tee "$OUT/retrans_mode.txt"
 bash tools/lab-infra/roles.sh set --receiver "$RECV" --senders "$(echo $SENDERS | tr ' ' ',')" >/dev/null
 sleep 4
 for h in $RECV $SENDERS; do on_host "$h" 'pkill -f "ib_write_b[w]" 2>/dev/null; pkill -x iperf3 2>/dev/null; true'; done

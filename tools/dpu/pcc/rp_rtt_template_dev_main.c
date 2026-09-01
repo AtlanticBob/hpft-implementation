@@ -289,7 +289,10 @@ typedef struct {
 	volatile uint32_t qp_slot[HPFT_PAIR_QPS];
 	volatile uint32_t qp_nslot;
 	volatile uint32_t trust;	/* fxp16, executor-owned (fence design) */
-	volatile uint32_t trust_mode;	/* 1: rate = T*cc + (1-T)*level */
+	volatile uint32_t trust_mode;	/* 1: rate = clip(cc, (1-T)*level, level).
+				 * NOT a weighted average - that form leaks
+				 * upward (12% trust let 24 G through, measured)
+				 * and design v4 rejects it. */
 	volatile uint32_t qfrac;	/* fxp16: q/D_r from the sender agent */
 	volatile uint32_t loss_ts;	/* device us of the last NACK on this pair */
 	volatile uint32_t n_nack;	/* NACKs matched to this pair; 0 = never any,

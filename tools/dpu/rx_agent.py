@@ -310,7 +310,7 @@ class VportMeter:
                 ring = self.ring.setdefault(vnic, [])
                 ring.append((t_ns / 1e9, rx_ib, rx_eth))
                 # Trim by TIME on the meter's own timestamps, not by sample
-                # count: the meter's round over 8 vports takes ~13 ms, so
+                # count: the meter's round over 8 vports takes ~0.8 ms, so
                 # nkeep samples sized for a 1 ms cadence (21 for a 20 ms
                 # window) spanned ~270 ms and every receiver-side rate
                 # lagged the wire by ~130 ms (found 2026-08-29 with synced
@@ -388,7 +388,7 @@ class SenderLiveness:
                 # carries the host ("sgpu01/vf0"), which is exactly the
                 # form the flow-set id uses -- store verbatim.
                 # Smooth the reported rates over ~100 ms before they become
-                # the split RATIO: each report is one ~13 ms sample of the
+                # the split RATIO: each report is one ~1 ms sample of the
                 # sender's meter and jitters by a few percent while the
                 # fence moves every feedback (v4). The pool it splits is the
                 # receiver's own 20 ms rate, so smoothing the ratio adds no
