@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks for the receiver's decision logic.
 
-law_check covers the sender's law, loop_dryrun covers the sender's
+conf_check covers the sender's law, loop_dryrun covers the sender's
 process, fastfill_test covers the allocation arithmetic. The receiver's
 DECISIONS - which flow-sets count as backlogged, what target comes out,
 who appears in telemetry - had only lab A/B coverage, and each of them is

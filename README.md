@@ -88,10 +88,14 @@ sender→receiver 都是直达隧道，spoke 之间经 hub 的 eswitch 硬件转
 
 ### 离线检查（不需要 lab，直接跑）
 
-`tools/tests/` 下六组：`law_check.py`（wire 往返 + 三条收敛闭式 + 账本自愈）、
-`couple_check.py`（执行面与 CC 的合成）、`rx_check.py`（接收端判定逻辑）、
-`loop_dryrun.py`（tx_agent 对合成遥测跑整环）、`fastfill_test.py`（C 与 Python
-分配器对拍）、`hw_maxrate_test.py`（硬件层单位）。
+`tools/tests/` 下六组：`conf_check.py`（现行围栏律 law=conf 的离线闭环：生产的
+接收端分配加生产的发送端步进，两种 CC 模型）、`couple_check.py`（执行面与 CC 的
+合成）、`rx_check.py`（接收端判定逻辑）、`loop_dryrun.py`（tx_agent 对合成遥测跑
+整环，含真 FIFO 与本地 UDP 假接收端）、`fastfill_test.py`（C 与 Python 分配器
+对拍）、`hw_maxrate_test.py`（硬件层单位——devlink 入参 bit/s、读回 byte/s）。
+
+另有两个要 lab 的：`executor_step.sh`（绕过控制环，直接往 RP FIFO 写预算，单测
+执行面能有多快）和 `analyze_conf.py`（law=conf 运行的稳态统计与围栏状态）。
 
 ## 怎么跑实验
 
@@ -101,16 +105,17 @@ tools/lab_env.sh hpft                         # 环境：PCC+HPFT（另有 plain
 tools/lab-infra/roles.sh set --receiver sgpu02 --senders sgpu01,sgpu03,sgpu04
 tools/lab-infra/deploy_check.sh               # 必须通过，否则数据无意义
 tools/lab-infra/flow_preflight.sh "0,0 1,1 2,2 3,3" sgpu03 sgpu02   # 每个发送端各验一次
-tools/tests/incast8_regression.sh <tag> --receiver sgpu02 --senders sgpu01,sgpu03,sgpu04
-python3 tools/tests/analyze_incast8.py <tag>
+bash validation/run/run.sh V1_incast <tag>    # 场景与判据的定义在 validation/README.md
+python3 validation/distill.py <tag>
+python3 validation/plot/timeline.py <tag>
 ```
 
 每一步都幂等。`roles.sh` 与 `deploy_check.sh` 的节点集来自 registry 的 `nodes`；
-`incast8_regression.sh`、`flow_preflight.sh`、`eval_lib.sh` 不带参数时退回
+`flow_preflight.sh`、`eval_lib.sh` 不带参数时退回
 registry 的 `sender_host`/`receiver_host`。评估战役的 runner 用环境变量
 `EVAL_RECEIVER` / `EVAL_SENDERS` 选节点。
 
-**读结果**：`analyze_incast8.py` 按**类内**和**按目的 VM** 报公平性，而不是一个
+**读结果**：`validation/distill.py` 按**类内**和**按目的 VM** 报公平性，而不是一个
 扁平 Jain。类权重把每个目的 VM 在 TCP 与 RDMA 之间对半分，所以两类的发送端
 数量不同时，发送端少的那一类每条流**本来就该**拿得多；扁平 Jain 会把正确的
 策略行为报成不公平，只有当每个目的 VM 的类混合相同时才有意义。
@@ -122,7 +127,7 @@ registry 的 `sender_host`/`receiver_host`。评估战役的 runner 用环境变
 - **每场实验开跑前重启该发送端的 RP**（`bash /opt/hpft/rp_service.sh start`）。
   执行面会跨实验、以及在 tx agent 被替换之后失去限速能力：预算照收、`0xdeb`
   回读的 level 照样正确，就是不作用到线上——20G 授权实测跑出 52.9G，重启 RP 后
-  同一授权变 18.5G。`roles.sh set`、`incast8_regression.sh`、`cc_mode.sh pcc`
+  同一授权变 18.5G。`roles.sh set`、`validation/run/run.sh`、`cc_mode.sh pcc`
   都已按"RP 先、agent 后"编排；手工起流之前自己补一次。
 - **交叉对流量必须走非 CM 路径**（`ib_write_bw -d <源设备> -x 3 … <目的IP>`，
   不能用 `-R`）。用 rdma_cm 时内核按**目的子网**先选路，选中的是拥有那个子网的
@@ -143,7 +148,7 @@ registry 的 `sender_host`/`receiver_host`。评估战役的 runner 用环境变
   报 `unable to send control message` 且一个字节都不发——那条流集合根本不存在，
   与"没要求跑"无法区分。`deploy_check.sh` 会比对四台的版本并检查 perftest fork。
 - **一次只跑一场实验**。两场重叠时，后一场的角色重启会打断前一场，而前一场
-  仍会写出一整套看起来完整的产物。`incast8_regression.sh` 用 `/tmp/hpft_run.lock`
+  仍会写出一整套看起来完整的产物。`validation/run/run.sh` 用 `/tmp/hpft_run.lock`
   互斥。
 - **不要在实验运行期间改它的脚本**。bash 边读边执行，改文件会让运行中的实例
   读到写了一半的内容。
