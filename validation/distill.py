@@ -7,7 +7,7 @@ Reads (the only script that reads raw results/):
   vpm_series.csv   receiver vport-meter counters (per VF, RoCE/other, 100 ms)
   rx.jsonl         receiver agent: per flow-set attributed rate r, expected
                    rate e, virtual queue d (ms), every 20 ms
-  flow<k>_*.log    perftest / tcp_blast client output (application goodput)
+  flow<k>_*.log    perftest / iperf3 client output (application goodput)
 Writes:
   data/<tag>_vmclass.csv    t, vf<i>_rdma, vf<i>_tcp  (Gb/s per 100 ms, wire)
   data/<tag>_flowsets.csv   one row per (phase, flow-set): expected, attributed
@@ -147,8 +147,13 @@ def phases(rows):
 def goodput(path, cls):
     txt = open(path, errors="replace").read()
     if cls == "tcp":
-        m = re.search(r"([\d.]+) Gb/s goodput", txt)
-        return (float(m.group(1)), "") if m else (None, "no tcp_blast summary")
+        try:
+            j = json.loads(txt)
+            if "error" in j:
+                return None, j["error"]
+            return j["end"]["sum_received"]["bits_per_second"] / 1e9, ""
+        except Exception as e:
+            return None, "unparseable iperf3 json: %s" % e
     if cls == "udp":
         m = re.search(r"([\d.]+) Gb/s payload sent", txt)
         return (float(m.group(1)), "") if m else (None, "no udp_blast summary")

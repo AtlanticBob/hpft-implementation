@@ -1,27 +1,35 @@
 #!/usr/bin/env python3
-"""Sender-side agent: the tracking law (design.md §4). Runs on the sender
+"""Sender-side agent: the fence law of design v4 (§5). Runs on the sender
 DPU Arm.
 
-Per telemetry record {fsid: {u, r}} from the owner (receiver DPU), one
-first-order step towards the target in log space (§4.2):
+Per telemetry record from the owner (receiver DPU) the fence takes one
+multiplicative step (design v4 §5.2). The record carries the normalised
+virtual queue q and nothing else; the sender differences consecutive q to
+recover dq itself:
 
-    R_f <- R_f * (u_f / R_f) ** alpha,   alpha = 1 - exp(-k * dt)
+    R <- R * exp(alpha * min(m, m_max)) * exp(-kappa * dq)
+           * exp(-(kappa/D) * min(q, D))
 
-k = 20 s^-1 (time constant 50 ms). No branches, no clamps: the target is
-already bounded on both sides at the receiver (u >= (1-gamma)*ceil, §3.4)
-and tracking approaches it asymptotically from either side. The one clamp
-is the 50 Mbps pace floor (§6), and its justification is numerical rather
-than protective: it keeps u > 0 so the log law has a domain, and keeps the
-pace above the executor's quantisation step. It is NOT an anti-wedge - a
-steady low rate is safe (a 1G cap runs at 87-91% realisation
-indefinitely); what endangers an RDMA connection is the RATIO of a fall,
-which §5.1's transition clause handles.
+The three factors do one thing each: probe up while the ledger is empty
+with a step that grows with the silence (§5.3), brake on how fast the
+ledger is filling, repay on how full it is. Nothing here carries a rate
+unit - the whole law lives in log space on dimensionless inputs, which is
+why the constants do not change with link speed or flow count
+(design_theory_v4.md §5).
 
-fail-open (§4.4): no telemetry for n1_freeze_s -> R frozen; for
-n2_failopen_s -> the same tracking step with the target set to Tree_f, so
-the flow degrades to sender-local policy only.
-Actuation: pace_f = min(R_f, Tree_f); tcp -> host pace shim (UDP ->
-DirectBpfMapWriter); rdma -> PCC RP mailbox as a flow-pair budget.
+The probe is separately bounded (§5.3): it may not climb past twice the
+flow-set's own send rate, the local tree plus one tolerance, or maxrate,
+and the bound only blocks the probe - it never pushes the fence down.
+
+Startup (§5.4): a fresh flow-set begins at the fence floor with the
+silence counter already at its cap, because a flow-set that has never
+seen a queue has no evidence about where its share is, and that is the one
+case where the largest step is the right one.
+
+fail-open: no telemetry for n1_freeze_s -> R frozen; for n2_failopen_s ->
+R tracks Tree_f, so the flow degrades to sender-local policy only.
+Actuation: pace_f = max(min(R_f, Tree_f), floor); tcp -> host pace shim
+(UDP -> DirectBpfMapWriter); rdma -> PCC RP mailbox as a flow-pair budget.
 """
 import argparse
 import json
@@ -63,47 +71,8 @@ def parse_telemetry(data):
     return seq, recs
 
 
-def vq_step(R, g, d, dt, k, eps, d_repay, phi_min, floor):
-    """THE LAW of the redesign (proposal §2 + the two optimisations).
-
-    g: the receiver's share hint (what the virtual scheduler would serve
-       this flow-set if it were backlogged); d: its virtual queueing
-       delay in seconds.
-    Queue empty (d == 0): one first-order step in log space towards
-       (1+eps)*g - a fractional jump to a known destination, not a
-       search. The destination sits eps ABOVE the share on purpose: every
-       backlogged flow-set keeps nudging its queue, so the queue, not the
-       hint, is what fixes the equilibrium.
-    Queue non-empty: cut to the rate that drains the queue with time
-       constant d_repay - R = g*(1 - d/d_repay) - but never below
-       phi_min*g in one step (executor safety: it is the ratio of a fall
-       that kills an RDMA connection, not the destination).
-    Both factors come from the signal; nothing here is a fixed step."""
-    g = max(float(g), floor)
-    if d <= 0.0:
-        return track_step(R, (1.0 + eps) * g, dt, k, floor)
-    return max(g * (1.0 - d / d_repay), phi_min * g, floor)
 
 
-def mimd_factor(R, g, d, eps, beta_max, d_repay, phi_min, floor):
-    """Pure multiplicative law: the FACTOR the flow-set multiplies its rate
-    by, computed from the receiver's signal and nothing else.
-
-    up   (d == 0): beta = min((1+eps)*g / R, beta_max) - one step to the
-                   destination, capped so a single step never more than
-                   beta_max-folds the rate (what the executor and the
-                   switch buffer can absorb in one loop delay).
-    down (d > 0):  beta = max((g/R)*(1 - d/d_repay), phi_min) - land at
-                   the rate that drains the queue in d_repay, never
-                   deeper than phi_min in one step.
-    The factor is meant to be applied ONCE PER LOOP DELAY (see the
-    gating in main): applied every period it would compound 24 times on
-    the same stale signal, which is the overreaction MIMD is known for."""
-    g = max(float(g), floor)
-    R = max(R, floor)
-    if d <= 0.0:
-        return min((1.0 + eps) * g / R, beta_max)
-    return max((g / R) * (1.0 - d / d_repay), phi_min)
 
 
 def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
@@ -218,14 +187,18 @@ def conf_step(R, T, Ehat, q, dt, k, d_r, tau_r, floor, gamma=0.0, delta=0.15,
 
 
 def track_step(R, target, dt, k, floor):
-    """THE LAW (design.md §4.2): one first-order step of R towards `target`
+    """First-order step of R towards `target` in log space. Under design v4
+    this is no longer the law - it is the fail-open actuator (§5.5): when
+    telemetry is stale the fence tracks the local tree instead of freezing.
+
+    One step towards `target`
     in log space, over a wall-clock interval dt.
 
         R <- R * (u/R) ** alpha,     alpha = 1 - exp(-k*dt)
 
     This is the exact discretisation of zdot = k*(ln u - z), z = ln R. At
-    the nominal 1 ms tick alpha = 0.0198 against design.md's literal
-    k*T = 0.0200 (0.99% apart); unlike k*T, alpha can never exceed 1, so a
+    the nominal 1 ms tick alpha = 0.0198 against a literal k*T = 0.0200
+    (0.99% apart); unlike k*T, alpha can never exceed 1, so a
     late or coalesced update converges towards the target instead of
     shooting past it.
 
@@ -299,7 +272,7 @@ def waterfill(capacity, items):
 
 
 class SenderTree:
-    """design.md §4.3: the sender-side tree over the local uplink, sharing
+    """design_v4.md §5.5: the sender-side tree over the local uplink, sharing
     the rx scheduler's structure (src VM MaxRate -> class weights -> fs).
     Tree_f is the fs's fair-share CEILING (its own demand set to infinity,
     siblings at their measured demands) rather than a demand-capped fill:
@@ -638,7 +611,7 @@ def main():
     # stability. The exact discretisation of zdot = k(ln u - z) over dt is
     #   z <- z + (1 - exp(-k*dt)) * (ln u - z)
     # i.e. R <- R*(u/R)**alpha with alpha = 1-exp(-k*dt). At the nominal
-    # 1 ms tick alpha = 0.0198 vs design.md §4.2's literal k*T = 0.0200
+    # 1 ms tick alpha = 0.0198 vs a literal k*T = 0.0200
     # (0.99% apart); unlike k*T it can never exceed 1, so a late datagram
     # converges towards the target instead of shooting past it.
     k = ep["k"]
@@ -656,7 +629,7 @@ def main():
     # the law is unaffected - purely delivery robustness, so it can be
     # slow relative to the 1 ms period.
     tcp_refresh_s = ep.get("tcp_refresh_ms", 100) / 1e3
-    # N_3 (design.md §4.4): forget a flow-set the receiver has stopped
+    # Forget a flow-set the receiver has stopped
     # reporting for this long. Without it the table only ever grows -
     # every flow-set ever seen stays in fail-open forever, ticking,
     # actuating and writing budgets.
@@ -699,12 +672,11 @@ def main():
         st.last_step = now
         st.R = track_step(st.R, target, dt, k, floor)
 
-    # LAW ARM: "track" (design.md v2) or "vq" (redesign: virtual-queue
-    # signal, share hint as the climb destination, delay-proportional cut).
-    law = ep.get("law", "track")
-    vq_eps = float(ep.get("eps", 0.05))
+    # law=conf is design v4 (design_v4.md §5): probe by silence, brake on
+    # the ledger's rate of change, repay on its depth. conf_v3 is the
+    # ablation arm that is also handed the explicit rate.
+    law = ep.get("law", "conf")
     vq_repay = float(ep.get("d_repay_s", 0.06))
-    vq_phi = float(ep.get("phi_min", 0.5))
 
     # Pure-factor MIMD arm. gate_s is the loop delay: one multiplicative
     # step per gate per flow-set. mi_gate selects HOW the once-per-delay
@@ -715,30 +687,14 @@ def main():
     #   random - sparse MI: every record acts with probability T/gate_s
     #            (one step per delay on average, desynchronised by chance)
     #   none   - act on every record (the overreaction control arm)
-    mimd_gate = float(ep.get("gate_s", 0.024))
-    mimd_mode = ep.get("mi_gate", "phase")
-    mimd_bmax = float(ep.get("beta_max", 2.0))
     _rng = __import__("random").Random(0x4851)
 
-    def mimd_due(st, fsid, now):
-        if mimd_mode == "none":
-            return True
-        if mimd_mode == "random":
-            return _rng.random() < period / mimd_gate
-        if st.epoch < 0:
-            st.phase = (hash(fsid) & 0xffff) / 65536.0 * mimd_gate
-        idx = int((now + st.phase) / mimd_gate)
-        if idx == st.epoch:
-            return False
-        st.epoch = idx
-        return True
 
     # vq2: ONE target, tracked with the v2 first-order step.
     #   u = g * (1 + (d_star - d)/d_repay), floored at phi_min*g
     # "your share, corrected by how far your queue is from the standing
     # delay d_star". Linearised: x'' + k x' + (k/d_repay) x = 0, so
     # zeta = 0.5*sqrt(k*d_repay) for every flow-set regardless of share.
-    vq_dstar = float(ep.get("d_star_s", 0.003))
 
     # conf (fence design v4): Ehat = A/(1+gamma); R tracks Ehat with the
     # log first-order step plus the repayment term exp(-(k dt/D_r) q);
@@ -843,25 +799,6 @@ def main():
             st.q_prev, st.b = q, b
             st.last_step = now
             st.T = min(q / v4_D, 1.0)               # queue fraction for the executors' trust
-        elif law == "vq2":
-            g = max(float(rec.get("u", 0.0)), floor)
-            d = rec.get("d", 0.0)
-            u = g * (1.0 + (vq_dstar - d) / vq_repay)
-            track(st, max(u, vq_phi * g), now)
-        elif law == "mimd":
-            if mimd_due(st, fsid, now):
-                beta = mimd_factor(st.R, rec.get("u", 0.0), rec.get("d", 0.0),
-                                   vq_eps, mimd_bmax, vq_repay, vq_phi, floor)
-                st.R = max(st.R * beta, floor)
-                st.acts += 1
-            st.last_step = now
-        elif law == "vq":
-            dt = min(max(now - st.last_step, dt_min), dt_max)
-            st.last_step = now
-            st.R = vq_step(st.R, rec.get("u", 0.0), rec.get("d", 0.0), dt,
-                           k, vq_eps, vq_repay, vq_phi, floor)
-        else:
-            track(st, rec.get("u", 0.0), now)
     shim = PaceShim(ctl["pace_shim"][local_host])
     # sender-liveness feed (advisory, see SenderLiveness): tells the receiver
     # which senders are actually sending, at vport freshness (~1 ms), so its
@@ -994,10 +931,6 @@ def main():
     flows = {}   # fsid -> FlowState
     last_any_rx = time.monotonic()   # last telemetry from ANY flow-set
     logf = open(args.log, "a", buffering=1)
-    if law == "mimd":
-        print("tx_agent_e: mimd gate=%.0fms mode=%s beta_max=%.1f eps=%.2f "
-              "d_repay=%.0fms phi_min=%.2f" % (mimd_gate * 1e3, mimd_mode,
-              mimd_bmax, vq_eps, vq_repay * 1e3, vq_phi), flush=True)
     print("tx_agent_e: local=%s T=%.0fms law=%s k=%.1f/s (tau=%.0fms, "
           "alpha@T=%.4f) failopen=%.2f/%.1fs evict=%.0fs tree=%s shim=%s "
           "log=%s"
@@ -1221,7 +1154,7 @@ def main():
                          "R": int(st.R), "pace": int(st.pace),
                          "tree": int(tree_of(fsid)), "tus": tree_us,
                          "mode": st.mode}) + "\n")
-        # --- local ticker: fail-open (design.md §4.4) ---
+        # --- local ticker: fail-open (design_v4.md §5.5) ---
         # No telemetry for n1_freeze_s: R frozen (the law needs a fresh
         # permit to move at all). Still nothing after n2_failopen_s: the
         # SAME tracking step, with the target set to the sender-local
@@ -1315,7 +1248,7 @@ def main():
         # (1.05 s^-1) the convergence bottleneck instead of the law
         # (k*ln2 = 13.9 s^-1). Descent is one step, and the RP's
         # proportional feed-forward scales its level by the budget ratio
-        # (design.md §5.2).
+        # (design_v4.md §6).
         for ft, bud, rate, tr in rdma_batch:
             latest_rdma[ft] = (bud, rate, tr)
         if latest_rdma and now - last_rdma_push >= rdma_push_s:

@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""Receiver-side agent: the hierarchical virtual scheduler (design.md
-§3.2-§3.4). Runs on the receiver DPU Arm as root.
+"""Receiver-side agent: the virtual-queue ledger of design v4 (§4). Runs on
+the receiver DPU Arm as root.
 
 Pipeline per control period T:
-  meter   hybrid r_f (see below): fresh per-dst-VF totals x flow-set mix
-  sched   demand D_f = r_f(1+delta) -> 3-layer weighted water-filling
-          (VM cap MaxRate_d -> class -> per-sender) -> entitled rate e_f
-          and the fair-share ceiling ceil_f (§3.2)
-  marker  vq_f <- clip(vq_f + (r_f - e_f)T, 0, V); s_f = min(vq_f/V, 1)
-  target  u_f = ceil_f * (1 - gamma * s_f)   (§3.4: policy ceiling x audit
-          discount; bounded, u_f >= (1-gamma)*ceil_f)
-  telem   one UDP datagram per sender DPU per tick, TWO numbers per active
-          flow-set: {fsid: {u, r}}. u drives the sender's tracking law
-          (§4.2); r is the class-level arrival rate the sender forwards to
-          the RDMA executor as rate feedback (§5.2) and uses as its own
-          tree demand input (§4.3). A record is sent every tick even with
-          no excess (u = ceil_f then) - the record IS the explicit
-          freshness permit, and its absence is what triggers the sender's
-          fail-open (§4.4).
+  meter   hybrid r_f: fresh per-dst-VF hardware totals x the flow-set mix
+  sched   physical root C' = (port - unscheduled arrival)(1-h), then TWO
+          water-fillings over the policy tree (VM cap -> class -> sender):
+          the first with everyone demanding infinity gives the SHARE, the
+          second gives lenders a finite demand and yields the ENTITLEMENT
+          E_f (§4.3)
+  ledger  Q_f <- clip(Q_f + A_f - E_f, 0, D*E_f);  q_f = Q_f / E_f (§4.4)
+  telem   one UDP datagram per sender DPU per tick: the normalised queue
+          q_f and nothing that can be turned back into a rate (principle
+          two). A record every tick even when q = 0 - the record IS the
+          freshness permit, and its absence triggers the sender's fail-open.
 
-e_f, s_f, ceil_f and vq_f stay local: they are the intermediate ledger the
-target is synthesised from, kept in the jsonl log for offline analysis but
-not on the wire - the sender consumes one number.
+E_f, the share and the ceiling stay local: they are what the ledger is
+computed from, kept in the jsonl log for offline analysis but never on the
+wire - the sender consumes one number and cannot invert it into a rate.
 
 Hybrid r_f measurement (lab fact, 2026-07-09): megaflow HW byte counters
 are exact but only refresh ~1 Hz (mlx5 fc bulk-query period, hardcoded in
@@ -48,9 +44,9 @@ exporter > megaflow mix (each stage falls back on staleness, so the
 agent runs unchanged without the helper; the helper runs as the
 hpft-vport-meter systemd unit on the receiver DPU).
 
-Implementation choice (design silent on r_f = 0): an idle flow-set's vq
-drains fast (V per period). Frozen marks would otherwise pin the sender at
-the floor after the app pauses, which contradicts fail-open intent.
+An idle flow-set (r_f = 0) takes A_f < E_f every tick, so its ledger drains
+to zero and stays there: silence is never charged, and the sender's probe is
+free to climb back when the application returns.
 
 Policy (weights/MaxRate) hot-reloads when the registry file mtime changes.
 """
@@ -960,185 +956,12 @@ class Scheduler:
         return e
 
 
-class RootCongestion:
-    """Hysteretic saturation state of ONE node of the policy tree.
-
-    Named for the root because that is where it started, but the test is
-    not special to the root: any node whose capacity is fully claimed is
-    a place where flow-sets contend, and a flow-set below a saturated
-    node is contending whether or not it happens to be realising much
-    right now. One instance per node - see NodeSaturation.
-
-    Entering closes borrowing, which lowers utilisation, which would
-    immediately look like "not congested" again - so the exit threshold
-    has to sit below the entry one or the two regimes chatter every tick.
-    """
-
-    def __init__(self, enter=0.95, leave=0.85):
-        self.enter = enter
-        self.leave = leave
-        self.on = False
-
-    def update(self, total, capacity):
-        if capacity > 0:
-            if total >= self.enter * capacity:
-                self.on = True
-            elif total <= self.leave * capacity:
-                self.on = False
-        return self.on
 
 
-class NodeSaturation:
-    """Saturation of every dst-VM node, the layer between root and class.
-
-    Why this exists, and why it is a better criterion than the share test
-    it takes over from. Backlog discrimination has to answer "is this
-    flow-set held back by US, or does it simply have nothing to send",
-    and the share test answers it by thresholding the flow-set's own
-    measured rate against its share. That quantity is the one thing the
-    receiver CANNOT measure per sender: a dst VF's total is exact from
-    its vport counter, but splitting that total among several senders is
-    an estimate from a megaflow byte ratio that lags seconds behind a
-    sender joining. Threshold an estimate and you get the estimate's
-    errors amplified into policy - measured 2026-07-28, two RDMA senders
-    on one dst, the split reported 58.3G / 0.00G against a true 29 / 29.
-
-    The saturation test needs no split. The SUM of the estimates is the
-    exact vport total no matter how badly the split is wrong, because the
-    split is a partition of it. So compare that sum against the node's
-    own capacity: if a dst VM is at its MaxRate, every sender aimed at it
-    is contending, full stop, and each of their ceilings must collapse to
-    the joint fair share instead of each being computed as though it were
-    alone. Without this the ceilings are individually right and jointly
-    impossible - each flow-set's e-hat is defined with its OWN demand set
-    to infinity, so two senders both acting on theirs sum to twice the
-    cap, and the virtual queue cannot claw that back: its discount is
-    bounded by gamma = 0.25 by construction.
-
-    Root congestion was always this same test on one particular node. It
-    stays as it was; this generalises it downward.
-    """
-
-    def __init__(self, enter=0.95, leave=0.85):
-        self.enter, self.leave = enter, leave
-        self.nodes = {}
-
-    def update(self, active, caps):
-        """active: {fsid: rate}; caps: {dst_vnic: max_rate_bps}.
-
-        Returns the set of saturated dst vnics.
-        """
-        totals = {}
-        for f, r in active.items():
-            pair = f.rsplit("|", 1)[0]
-            if ">" not in pair:
-                continue
-            dst = pair.split(">")[1]
-            totals[dst] = totals.get(dst, 0.0) + r
-        for dst in list(self.nodes):
-            if dst not in totals:
-                del self.nodes[dst]
-        out = set()
-        for dst, tot in totals.items():
-            cap = caps.get(dst)
-            if not cap:
-                continue
-            n = self.nodes.get(dst)
-            if n is None:
-                n = self.nodes[dst] = RootCongestion(self.enter, self.leave)
-            if n.update(tot, cap):
-                out.add(dst)
-        return out
 
 
-def demand_estimate(active, delta, big, congested, saturated_dsts=()):
-    """Per-flow-set demand for the fill (design.md §3.2.1-§3.2.2).
-
-    An idle flow-set (r = 0) is never backlogged. A non-idle one is
-    backlogged through either entry:
-      share   it is realising at least theta_b of its pure weighted share,
-              so its own rate already demonstrates the appetite;
-      root    the root is congested, in which case a flow-set below its
-              share cannot be short of appetite - there is no spare
-              capacity it could have declined, so it is losing a race.
-    Backlogged means demand = big (a finite stand-in for infinity, chosen
-    so the derived ceiling still packs into a uint64 on the wire), which
-    claims the full weighted share; otherwise the r*(1+delta) ratchet.
-
-    Kept module-level so both entries and the hysteresis can be tested
-    without a DPU - they had only lab A/B coverage, and a regression in
-    either returns the allocator to the starvation it was built to stop.
-    """
-    out = {}
-    for f, r in active.items():
-        pair = f.rsplit("|", 1)[0]
-        backlogged = r > 0 and (
-            congested or
-            (saturated_dsts and ">" in pair
-             and pair.split(">")[1] in saturated_dsts))
-        out[f] = big if backlogged else r * (1.0 + delta)
-    return out
 
 
-class VQMarker:
-    """Per-flow-set virtual-queue integrator -> mark s_f (design.md §3.3).
-
-    The anti-windup clip is V itself (§3.3): a deeper integration bin only
-    makes the mark ring on for extra ticks after the excess has stopped,
-    deepening the undershoot."""
-
-    def __init__(self, v_full, v_mode="global", v_seconds_per_share=None,
-                 v_floor=None):
-        self.vq = {}            # fsid -> bits
-        # ARM SWITCH (experiment, 2026-08-24). "global": V is one constant
-        # for every flow-set, as in design.md today. "per_fs": V_f = c*ehat_f,
-        # which makes the mark scale-invariant - s is then "how many seconds
-        # of full-share excess", identical in meaning for a 1G share and a
-        # 100G one, and both zeta and omega_n stop depending on ehat. The
-        # arms exist to be measured against each other, not to be chosen from
-        # in production.
-        self.v_mode = v_mode
-        self.v_c = v_seconds_per_share      # seconds, used when per_fs
-        self.v_floor = v_floor              # bits, guards ehat -> 0
-        self.set_v(v_full)
-
-    def set_v(self, v_full):
-        """V follows the downlink bottleneck capacity (§3.3): zeta =
-        0.5*sqrt(k*V/(gamma*ehat)) must not depend on link rate, and ehat
-        scales with C, so V has to scale with C too. Recomputed whenever
-        the scheduler's root capacity moves."""
-        self.v_full = v_full    # bits at which s saturates to 1
-        self.v_max = v_full     # anti-windup clip = V (§3.3)
-
-    def _v_for(self, f, ceils, ents):
-        """The full-scale this flow-set's ledger is measured against."""
-        if self.v_mode != "per_fs":
-            return self.v_full
-        ehat = ceils.get(f) or ents.get(f) or 0.0
-        return max(self.v_c * ehat, self.v_floor)
-
-    def step(self, rates, ents, ceils, dt_s):
-        marks = {}
-        for f in set(self.vq) | set(rates):
-            r = rates.get(f, 0.0)
-            e = ents.get(f, 0.0)
-            vf = self._v_for(f, ceils, ents)
-            if r <= 0:
-                # idle flow-set: drain fast (see module docstring)
-                nv = self.vq.get(f, 0.0) - vf
-            elif r > e:
-                nv = self.vq.get(f, 0.0) + (r - e) * dt_s   # real excess
-            else:
-                # drain by unused fair-share ceiling, not by demand-capped
-                # e_f (see Scheduler.entitlements docstring)
-                nv = self.vq.get(f, 0.0) - max(ceils.get(f, e) - r, 0.0) * dt_s
-            nv = min(max(nv, 0.0), vf)
-            if nv <= 0 and r <= 0:
-                self.vq.pop(f, None)   # fully drained and idle: forget
-                continue
-            self.vq[f] = nv
-            marks[f] = min(nv / vf, 1.0)
-        return marks
 
 
 class VirtualQueueScheduler:
@@ -1347,17 +1170,6 @@ def main():
     # sensitive at 1ms - a few measurement spikes above the cap saturated
     # it and fired spurious marks, pinning the flow ~20% below its cap.
     #
-    # V = v_seconds * headroom * C, anchored on the DOWNLINK BOTTLENECK
-    # CAPACITY C, not on the NIC port line rate (design.md §3.3): the
-    # audit loop's damping zeta = 0.5*sqrt(k*V/(gamma*ehat)) has ehat
-    # scaling with C, so V must scale with C for zeta to be independent
-    # of link rate. v_seconds = 0.2 s, C = 100G here -> V = 600 Mbit.
-    # C is read from the uplink at startup and tracked on every change.
-    gamma = ep["gamma"]
-
-    def v_of(capacity):
-        return ep["v_seconds"] * ep["headroom"] * capacity
-
     def uplink_speed():
         # The capacity to schedule against is the one that can actually be
         # delivered, which is the port's own speed only while nothing
@@ -1378,13 +1190,12 @@ def main():
             return None
 
     c_link = uplink_speed() or line
-    v_full = v_of(c_link)
 
     added = install_class_rules(args.bridge)
     print("rx_agent: bridge=%s rules_added=%s T=%.0fms local=%s C=%.0fG "
-          "V=%.0fMbit gamma=%.2f fill=%s log=%s meter_only=%s vport_meter=%s"
+          "fill=%s log=%s meter_only=%s vport_meter=%s"
           % (args.bridge, added or "none", period * 1e3, local_host,
-             c_link / 1e9, v_full / 1e6, gamma,
+             c_link / 1e9,
              "C" if fastfill.USING_C else "python", args.log,
              args.meter_only, args.vport_meter or "off"), flush=True)
 
@@ -1417,13 +1228,6 @@ def main():
     # zeta = 1/sqrt(2) is exactly the seconds the shipping V corresponds to at
     # its own design point, so the two arms differ in how V VARIES, not in its
     # value at that point.
-    v_mode = ep.get("v_mode", "global")
-    v_c = ep.get("v_seconds_per_share") or (4 * 0.5 * gamma / ep["k"])
-    marker = VQMarker(v_full, v_mode=v_mode, v_seconds_per_share=v_c,
-                      v_floor=ep.get("v_floor_bits", 1e6))
-    print("rx_agent: V arm=%s%s" % (
-        v_mode, ("  c=%.1f ms floor=%.0f Mbit" % (v_c * 1e3, ep.get("v_floor_bits", 1e6) / 1e6))
-        if v_mode == "per_fs" else "  V=%.0f Mbit" % (v_full / 1e6)), flush=True)
     ctl = reg["control"]
     telem = Telemetry(vnic_host, ctl["telemetry_ip"], ep["telemetry_port"],
                       shim_ip=ctl.get("shim_ip"),
@@ -1460,14 +1264,11 @@ def main():
     next_tick = t_start
     last_print = t_start
     nticks_total = 0
-    rootcong = RootCongestion()
-    nodesat = NodeSaturation()
-    # LAW ARM. "track": design.md v2 (demand estimate + audit discount,
-    # target u = ceil*(1-gamma*s)). "vq": the redesign - backlog-fed
-    # virtual scheduler, wire carries {g, r, d}.
-    law = ep.get("law", "track")
-    # law=conf (fence design v4, 2026-08-26): demand = A(1+delta) for every
-    # flow-set, Q += (A-E)T clipped to [0, D_r*E], feedback {q, gamma}.
+    # law=conf is design v4 (design_v4.md §4): two water-fillings give the
+    # entitlement E_f, the ledger is Q += (A-E) clipped to [0, D*E], and the
+    # wire carries only q = Q/E. conf_v3 is the ablation arm that also sends
+    # the explicit rate, kept to show what principle two buys.
+    law = ep.get("law", "conf")
     conf_q = {}                       # fsid -> Q bits
     conf_other, conf_other_vm = 0.0, {}   # smoothed unscheduled arrival: total, per dst VM
     conf_other_tau = float(ep.get("other_tau_s", 0.1))
@@ -1539,13 +1340,8 @@ def main():
             if spd_bps is not None and spd_bps != last_speed:
                 last_speed = spd_bps
                 sched.set_downlink(spd_bps)
-                # V is anchored on C, so it moves with the link (§3.3):
-                # holding V fixed across a speed change would make the
-                # audit loop's damping link-rate dependent.
-                marker.set_v(v_of(spd_bps))
-                print("rx_agent: downlink %.0fG -> C_root %.1fG V %.0fMbit"
-                      % (spd_bps / 1e9, sched.c_root / 1e9,
-                         marker.v_full / 1e6), flush=True)
+                print("rx_agent: downlink %.0fG -> C_root %.1fG"
+                      % (spd_bps / 1e9, sched.c_root / 1e9), flush=True)
 
         # ---- fast loop: rates -> waterfill -> VQ -> telemetry ----
         rates = hybrid.rates(now)
@@ -1564,7 +1360,7 @@ def main():
                         and f not in sched_rates):
                     sched_rates[f] = 0.0
         if args.meter_only:
-            ents, ceils, marks, targets = {}, {}, {}, {}
+            ents, ceils, targets = {}, {}, {}
         else:
             nowm = now
             for f in sched_rates:
@@ -1582,24 +1378,6 @@ def main():
                         active[f] = 0.0
                     else:
                         del last_seen[f]
-            # Root-congestion state, hysteretic (design.md §3.2.2). The
-            # demand estimate exists to enable BORROWING, and borrowing
-            # only means anything when there is spare capacity. When the
-            # root is saturated there is none, so a flow-set running below
-            # its share is not evidence of small appetite - it is evidence
-            # that it is losing a race. Down-rating its demand there is
-            # what latches starvation in:
-            #   2026-07-27 incast8 - four TCP flow-sets started unevenly
-            #   (50/4/2/2 G at t+0.3 s, before any RDMA, purely TCP's own
-            #   startup race with no ECN). The three losers sat below
-            #   theta_b of their share, so their demand collapsed to
-            #   r*(1+delta), which raised their RDMA siblings' ceilings to
-            #   19-21 G against a 12.1 G share, which kept the link full,
-            #   which kept TCP down. A perfectly stable wrong equilibrium:
-            #   Jain 0.69, reproducible across three runs.
-            # Hysteresis (enter 0.95, leave 0.85) keeps the two regimes
-            # from chattering when a genuinely small flow leaves capacity
-            # unused and utilisation drops back.
             if law in ("conf", "conf_v3"):
                 # Expected rate E (fence design, 2026-08-28 revision).
                 # share = what each flow-set is guaranteed given who is
@@ -1671,7 +1449,6 @@ def main():
                 # 0 = below it. Nothing on the wire can be turned back into
                 # a rate. Internally the queue is kept in bits with rates,
                 # which is the same arithmetic as bytes per period.
-                marks = {}
                 delays = {}
                 bflag = {}
                 for f in active:
@@ -1710,53 +1487,16 @@ def main():
                 # 3-12G). The hint does not depend on the flow-set's own
                 # rate, so it cannot feed the error back.
                 hybrid.prev_ents = ceils
-                marks = {}
                 targets = {f: ceils.get(f, ents.get(f, 0.0)) for f in active}
                 telem.send(targets, sched_rates, delays)
-            root_congested = rootcong.update(sum(active.values()),
-                                             sched.c_root) if law not in ("vq", "vq2", "conf", "conf_v3") else False
-            # Every node of the policy tree that is at its capacity, not
-            # just the root. A dst VM at its MaxRate saturates the node its
-            # senders share, so all of them are contending - and this test
-            # needs no per-sender split, because however wrong the split
-            # is, the SUM of the estimates is the exact vport total.
-            sat = nodesat.update(active, {
-                v: p.get("max_rate_bps")
-                for v, p in sched.policy.get("vms", {}).items()}) \
-                if law not in ("vq", "vq2", "conf", "conf_v3") else set()
-            # a finite "big" (root capacity), NOT inf: it saturates the
-            # class demand cap exactly like inf but survives int(ceil_f)
-            # in the telemetry pack (inf overflows).
-            if law not in ("vq", "vq2", "conf", "conf_v3"):
-                demand = demand_estimate(active, ep["delta_demand"],
-                                         sched.c_root, root_congested,
-                                         saturated_dsts=sat)
-                ents, ceils = sched.entitlements(active, demand)
-                # the split prior for the next tick (see HybridRates.rates)
-                hybrid.prev_ents = ents
-                marks = marker.step(sched_rates, ents, ceils, dt)
-            # §3.4 target synthesis: the policy ceiling discounted by the
-            # audited sustained excess. Bounded by construction - no
-            # excess leaves the target AT the ceiling, saturated excess
-            # can press it no lower than (1-gamma)*ceil - so the sender's
-            # law needs no floor of its own.
             # Report membership is decided by the FLOW TABLE, never by the
-            # instantaneous rate (design.md §3.4). Building this from
-            # `marks` violated that: VQMarker.step drops a flow-set that is
-            # momentarily at r=0 with a drained ledger, so it vanished from
-            # telemetry entirely. Measured 2026-07-27 (deep-pit rep 3): a
-            # flow-set whose wire had died appeared in only 14-16% of
-            # ticks, and since the v2 law only steps when a record arrives,
-            # its effective k fell ~6x and a 200 ms recovery took 958 ms.
-            # §3.4 warns about exactly this: an absent record is read as a
-            # dead control channel, which is a positive feedback into
-            # fail-open. Iterate `active` (present in the flow table, plus
-            # the membership grace) and default an absent mark to 0.
-            if law not in ("vq", "vq2", "conf", "conf_v3"):
-                targets = {f: ceils.get(f, ents.get(f, 0.0))
-                              * (1.0 - gamma * marks.get(f, 0.0))
-                           for f in active}
-                telem.send(targets, sched_rates)
+            # instantaneous rate: a flow-set momentarily at r=0 with a
+            # drained ledger must still appear, or the sender reads the
+            # absent record as a dead control channel and fails open -
+            # positive feedback. Measured 2026-07-27: such a flow-set
+            # appeared in 14-16% of ticks and a 200 ms recovery took 958 ms.
+            # Both branches above therefore iterate `active`, which is the
+            # flow table plus the membership grace, not whoever had bytes.
 
         # throttled logging (default ~50 Hz), never every 1ms tick
         if nticks_total % log_every == 0 and nticks_total:
@@ -1776,8 +1516,6 @@ def main():
                    "u": {f: int(v) for f, v in targets.items()},
                    "e": {f: int(v) for f, v in ents.items()},
                    "c": {f: int(v) for f, v in ceils.items()},
-                   "s": {f: round(v, 4) for f, v in marks.items()},
-                   "vq": {f: int(v) for f, v in marker.vq.items()},
                    # vq law: virtual queueing delay (ms) per flow-set
                    "d": {f: round(v * 1e3, 3) for f, v in delays.items()
                          if v > 0},
@@ -1810,9 +1548,9 @@ def main():
 
         nticks_total += 1
         if now - last_print >= 1.0:
-            act = " ".join("%s r=%.2fG u=%.2fG s=%.2f d=%.1fms"
+            act = " ".join("%s r=%.2fG u=%.2fG d=%.1fms"
                            % (f, rates.get(f, 0) / 1e9,
-                              targets.get(f, 0) / 1e9, marks.get(f, 0),
+                              targets.get(f, 0) / 1e9,
                               delays.get(f, 0) * 1e3)
                            for f in sorted(targets) if rates.get(f, 0) > 0)
             print("t=%.0fs ticks/s=%d dump_ms=%.1f | %s"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""design.md §4.3 layer one: per-VM MaxRate in the NIC hardware limiter.
+"""design_v4.md §2 (the VM cap) in the NIC hardware limiter.
 
 The two layers of sender-side enforcement are meant to be independent.
 Layer two (the weighted water-filling tree in tx_agent_e) is where the

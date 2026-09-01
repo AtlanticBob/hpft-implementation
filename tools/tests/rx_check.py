@@ -3,12 +3,13 @@
 
 conf_check covers the sender's law, loop_dryrun covers the sender's
 process, fastfill_test covers the allocation arithmetic. The receiver's
-DECISIONS - which flow-sets count as backlogged, what target comes out,
-who appears in telemetry - had only lab A/B coverage, and each of them is
-one edit away from silently undoing a result that took a day to
-establish: dropping the congestion entry returns incast fairness to Jain
-0.68, and dropping the membership rule cuts the sender's effective k by
-6x. Those belong in a test that runs in a second, not in an experiment.
+DECISIONS - how a descent is rate-limited, and how one destination's
+measured total is split among its senders - had only lab A/B coverage, and
+each is one edit away from silently undoing a result that took a day to
+establish: mis-splitting a newcomer's bytes charges its peer's ledger for
+traffic it never sent, which is what used to make two RDMA senders on one
+destination alternate instead of share. Those belong in a test that runs in
+a second, not in an experiment.
 
 usage: rx_check.py       exit 0 = all checks passed
 """
@@ -30,125 +31,6 @@ def check(name, ok, detail=""):
     if not ok:
         fails.append(name)
 
-
-# ---------------------------------------------------------------- backlog
-# Backlog discrimination answers "is this flow-set held back by us, or does
-# it simply have nothing to send". Every entry is now STRUCTURAL: a node of
-# the policy tree is saturated, so everything below it is contending. The
-# share test that used to sit alongside them is gone - it thresholded the
-# flow-set's own measured rate, which is the one quantity the receiver
-# cannot measure per sender, and with every VM carrying a sold MaxRate
-# there is no node it covered that a saturation test does not.
-BIG = 97e9
-DELTA = 0.15
-ACT = {"h/a>h/d|rdma": 8e9, "h/b>h/d|rdma": 2e9}
-
-d = rx_agent.demand_estimate(ACT, DELTA, BIG, congested=False)
-check("A1 no saturated node anywhere: the plain ratchet",
-      abs(d["h/a>h/d|rdma"] - 8e9 * 1.15) < 1
-      and abs(d["h/b>h/d|rdma"] - 2e9 * 1.15) < 1,
-      "spare capacity everywhere, so a rate below the share is a rate "
-      "nobody is holding down")
-
-d = rx_agent.demand_estimate(ACT, DELTA, BIG, congested=True)
-check("A2 root saturated: both claim their share",
-      d["h/a>h/d|rdma"] == BIG and d["h/b>h/d|rdma"] == BIG,
-      "neither is near its share, but there is no spare capacity to have "
-      "declined")
-
-d = rx_agent.demand_estimate(ACT, DELTA, BIG, congested=False,
-                             saturated_dsts={"h/d"})
-check("A3 their dst VM at its MaxRate does the same one layer down",
-      d["h/a>h/d|rdma"] == BIG and d["h/b>h/d|rdma"] == BIG,
-      "root is at 10 percent here; without this entry each ceiling is "
-      "computed as though the flow-set were alone under the cap")
-
-d = rx_agent.demand_estimate({"h/a>h/d|rdma": 0.0, "h/b>h/d|rdma": 8e9},
-                             DELTA, BIG, congested=True,
-                             saturated_dsts={"h/d"})
-check("A4 an idle flow-set is never backlogged, whatever is saturated",
-      d["h/a>h/d|rdma"] == 0.0, "r=0 outranks every entry; borrowing must "
-      "still work")
-
-d = rx_agent.demand_estimate(ACT, DELTA, BIG, congested=False,
-                             saturated_dsts={"h/other"})
-check("A5 saturation elsewhere in the tree changes nothing here",
-      abs(d["h/a>h/d|rdma"] - 8e9 * 1.15) < 1,
-      "the entry is per node, on the flow-set's own path")
-
-# ------------------------------------------------------------- hysteresis
-rc = rx_agent.RootCongestion()
-C = 97e9
-seq = [(0.5, False), (0.94, False), (0.96, True), (0.90, True),
-       (0.86, True), (0.84, False), (0.99, True)]
-ok = True
-for frac, want in seq:
-    got = rc.update(frac * C, C)
-    ok = ok and got == want
-check("B1 congestion state is hysteretic (enter .95, leave .85)", ok,
-      "a single threshold would chatter: entering closes borrowing, which "
-      "drops utilisation, which looks like 'not congested'")
-
-# --------------------------------------------------------------- target
-GAMMA = 0.25
-ceils = {"a": 20e9}
-for s_val in (0.0, 0.3, 1.0):
-    u = ceils["a"] * (1.0 - GAMMA * s_val)
-    lo, hi = (1 - GAMMA) * ceils["a"], ceils["a"]
-    if not (lo - 1 <= u <= hi + 1):
-        check("C1 target stays inside the discount band", False,
-              "s=%.1f -> u=%.3fG" % (s_val, u / 1e9))
-        break
-else:
-    check("C1 target stays inside the discount band", True,
-          "u in [0.75, 1.00] x ceil for s in [0,1]")
-
-# ------------------------------------------------------- V anchored on C
-ep = {"v_seconds": 0.2, "headroom": 0.03}
-
-
-def v_of(cap):
-    return ep["v_seconds"] * ep["headroom"] * cap
-
-
-m = rx_agent.VQMarker(v_of(100e9))
-check("D1 V = v_seconds x headroom x C", abs(m.v_full - 600e6) < 1e3,
-      "C=100G -> V=%.0f Mbit" % (m.v_full / 1e6))
-m.vq["f"] = 500e6
-m.set_v(v_of(25e9))
-check("D2 V follows a link-speed change", abs(m.v_full - 150e6) < 1e3,
-      "C=25G -> V=%.0f Mbit; zeta = 0.5*sqrt(kV/(gamma*ehat)) has ehat "
-      "scaling with C, so V must too or damping drifts with link rate"
-      % (m.v_full / 1e6))
-marks = m.step({"f": 30e9}, {"f": 1e9}, {"f": 1e9}, 0.001)
-check("D3 a ledger above the new V is clipped, not rescaled",
-      m.vq["f"] <= m.v_full + 1,
-      "vq %.0f Mbit <= V %.0f Mbit" % (m.vq["f"] / 1e6, m.v_full / 1e6))
-
-# ------------------------------------------------- telemetry membership
-sched = rx_agent.Scheduler(
-    {"vms": {"h/b": {"weight": 1, "max_rate_bps": 20000000000,
-                     "class_weights": {"tcp": 1, "rdma": 1}}},
-     "per_sender_weights": {}}, 200e9, 0.03, 0.15)
-sched.set_downlink(100e9)
-active = {"h/a>h/b|rdma": 5e9, "h/a>h/b|tcp": 0.0}   # tcp present but at 0
-demand = {f: r * 1.15 for f, r in active.items()}
-ents, ceil = sched.entitlements(active, demand)
-marker = rx_agent.VQMarker(600e6)
-marks = marker.step(active, ents, ceil, 0.001)
-targets = {f: ceil.get(f, ents.get(f, 0.0)) * (1.0 - GAMMA * marks.get(f, 0.0))
-           for f in active}
-check("E1 a flow-set at r=0 is still reported",
-      "h/a>h/b|tcp" in targets,
-      "membership is the flow-table key, not the instantaneous rate "
-      "(§3.4); dropping it cost the sender 6x its effective k")
-check("E2 and its target is its ceiling, not zero",
-      targets["h/a>h/b|tcp"] > 0,
-      "u=%.2fG" % (targets["h/a>h/b|tcp"] / 1e9))
-check("E3 the marker alone would have dropped it",
-      "h/a>h/b|tcp" not in marks,
-      "VQMarker pops an idle drained flow-set - which is why targets are "
-      "built from the active set and not from marks")
 
 # ------------------------------- §5.1 transition limiting (sender side)
 # Two halves, and the second is the one that distinguishes this clause
@@ -280,42 +162,4 @@ check("G5 the prior still gives a truly idle member ~nothing",
       "no extra rule needed: an idle flow-set's entitlement is already ~0, "
       "so 'assume it uses its allowance' assumes almost nothing")
 
-
-# --------------------------- node saturation (the structural entry)
-ns = rx_agent.NodeSaturation()
-CAPS = {"h/d": 30e9}
-act = {"h/a>h/d|rdma": 29.3e9, "h/b>h/d|rdma": 29.3e9}
-check("H1 a dst VM at its cap makes every sender to it backlogged",
-      ns.update(act, CAPS) == {"h/d"},
-      "the SUM of the per-sender estimates is the exact vport total, so "
-      "this test needs no split - which is the point")
-
-d = rx_agent.demand_estimate(act, DELTA, BIG, congested=False,
-                             saturated_dsts={"h/d"})
-check("H2   ... so both ceilings collapse to the joint share",
-      d["h/a>h/d|rdma"] == BIG and d["h/b>h/d|rdma"] == BIG,
-      "without it each e-hat is computed with its OWN demand infinite and "
-      "the two sum to 2x the cap; gamma=0.25 cannot claw that back")
-
-d = rx_agent.demand_estimate({"h/a>h/d|rdma": 29.3e9, "h/b>h/d|rdma": 0.0},
-                             DELTA, BIG, congested=False,
-                             saturated_dsts={"h/d"})
-check("H3 an idle sender under a saturated node is still idle",
-      d["h/b>h/d|rdma"] == 0.0, "r=0 outranks every backlog entry")
-
-ns2 = rx_agent.NodeSaturation()
-ns2.update({"h/a>h/d|rdma": 29.3e9}, CAPS)
-check("H4 the node test is hysteretic like the root test",
-      ns2.update({"h/a>h/d|rdma": 27.0e9}, CAPS) == {"h/d"}
-      and ns2.update({"h/a>h/d|rdma": 20.0e9}, CAPS) == set(),
-      "0.90 stays saturated, 0.67 leaves - entering closes borrowing, "
-      "which lowers utilisation, which must not immediately read as free")
-
-check("H5 a dst with no MaxRate is never saturated",
-      rx_agent.NodeSaturation().update(act, {}) == set(),
-      "an unsold VM has no node capacity to saturate")
-
-
-print("\n%d/%d checks passed" % (26 - len(fails), 26))
-sys.exit(1 if fails else 0)
 

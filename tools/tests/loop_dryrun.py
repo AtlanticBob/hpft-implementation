@@ -66,7 +66,7 @@ reg["e_params"]["telemetry_port"] = PORT
 reg["e_params"]["n3_evict_s"] = 0.5
 # this dry run exercises the v2 tracking arm; the vq arm has its own
 # closed-loop check (vq_check.py)
-reg["e_params"]["law"] = "track"
+reg["e_params"]["law"] = "conf"
 reg["control"]["pace_shim"] = {"sgpu01": "127.0.0.1:%d" % SHIM_PORT}
 regpath = os.path.join(tmp, "registry.json")
 json.dump(reg, open(regpath, "w"))
@@ -110,9 +110,9 @@ sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 t0 = time.monotonic()
 
 
-def feed(u, r, until):
+def feed(u, r, until, q_us=0):
     while time.monotonic() - t0 < until:
-        sender.sendto(tel._pack([(FS, u, r, 0)]), ("127.0.0.1", PORT))
+        sender.sendto(tel._pack([(FS, u, r, q_us)]), ("127.0.0.1", PORT))
         time.sleep(EP["period_ms"] / 1e3)
 
 
@@ -128,9 +128,13 @@ def feed2(u, r, until, both=True):
         time.sleep(EP["period_ms"] / 1e3)
 
 
-feed2(6e9, 5.7e9, 1.2)        # both flow-sets
+# law=conf reads the 4th field as the virtual queue in us and treats u as
+# the direction bit, so the stimulus is a queue, not a target rate: an empty
+# ledger first (the fence must probe UP), then a sustained queue (it must
+# repay DOWN). Feeding a target rate here is what the v2 law wanted.
+feed2(6e9, 5.7e9, 1.2)        # q = 0: both flow-sets, fence probes up
 t_down = time.monotonic() - t0
-feed(3e9, 2.85e9, 2.0)
+feed(6e9, 5.7e9, 2.0, q_us=40000)   # 40 ms of queue: the fence must repay
 t_off = time.monotonic() - t0
 time.sleep(2.6)                              # telemetry silence
 stop.set()
@@ -158,28 +162,23 @@ check("D1 agent produced log records", len(rows) > 10,
       "%d records for %s" % (len(rows), FS))
 
 modes = [r["mode"] for r in rows]
-check("D2 only v2 modes appear",
-      set(modes) <= {"track", "frozen", "fail_open"},
+check("D2 only the live modes appear",
+      set(modes) <= {"conf", "track", "frozen", "fail_open"},
       "modes seen: %s" % sorted(set(modes)))
 
-# settle at 6G before the down-step
-pre = [r for r in rows if r.get("mode") == "track"
-       and r["ts"] - rows[0]["ts"] < t_down - 0.2]
-check("D3 tracks up to u=6G", bool(pre) and abs(pre[-1]["R"] - 6e9) < 0.3e9,
-      "R=%.2fG at the end of the 6G phase" % (pre[-1]["R"] / 1e9 if pre
-                                              else float("nan")))
+# an empty ledger must make the fence climb, and a sustained queue must
+# make it come back down. Under law=conf these are the two regimes of §5.2,
+# and the fence is the only state that moves - there is no target to track.
+up = [r for r in rows if r["ts"] - rows[0]["ts"] < t_down - 0.2]
+check("D3 an empty ledger makes the fence climb",
+      len(up) > 5 and up[-1]["R"] > up[0]["R"],
+      "R %.2fG -> %.2fG while q = 0" % (up[0]["R"] / 1e9, up[-1]["R"] / 1e9))
 
-# down-step: first record at u=3G, then time to enter the 5% band
-dn = [r for r in rows if r.get("u", 0) and abs(r["u"] - 3e9) < 1e8]
-if dn:
-    t_start = dn[0]["ts"]
-    settled = [r for r in dn if abs(r["R"] - 3e9) <= 0.05 * 3e9]
-    dt_dn = (settled[0]["ts"] - t_start) if settled else float("inf")
-else:
-    dt_dn = float("inf")
-check("D4 down-step settles like the law", dt_dn < 0.30,
-      "%.0f ms to the 5%% band (law predicts ~130 ms + telemetry lag; "
-      ")" % (dt_dn * 1e3))
+dn = [r for r in rows if r.get("d", 0) > 0]
+check("D4 a sustained queue makes the fence repay",
+      bool(dn) and dn[-1]["R"] < (up[-1]["R"] if up else float("inf")),
+      "R fell to %.2fG under a 40 ms ledger" % (dn[-1]["R"] / 1e9 if dn
+                                                else float("nan")))
 
 check("D5 pace floor respected",
       all(r.get("pace", 1) >= reg["control"]["pace_floor_bps"]
@@ -211,7 +210,10 @@ check("D8 RDMA budgets coalesced at ~13 ms",
 vals = []
 for _, line in budgets:
     parts = line.split()
-    if len(parts) >= 4 and parts[0].startswith("0xb47c"):
+    # 0xb47c is the three-word batch; the fence design writes 0xb47d, which
+    # carries the executor's trust as a fourth word per entry. Matching only
+    # the old header read every budget as absent.
+    if len(parts) >= 4 and parts[0][:6] in ("0xb47c", "0xb47d"):
         vals.append(int(parts[2]))
 check("D9 budget descends without a ramp",
       bool(vals) and min(vals) < max(vals) * 0.7,

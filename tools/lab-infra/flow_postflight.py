@@ -8,7 +8,7 @@ Three checks, each of which has produced wrong conclusions before:
          other layer reads healthy while this is true.
 INFORMATIONAL, never a failure: the grant-vs-wire reconciliation. A
 flow-set running below its pace is NOT a fault by itself - the target is
-the ceiling, not a grant (design.md §3.4/§4.2), so an app-limited or
+the ceiling, not a grant (design_v4.md §4.3), so an app-limited or
 sender-tree-limited flow-set legitimately sits below it. It is printed
 because it is the single most useful table in this system's failure
 analysis: it separates "the allocator was unfair" from "the executor did

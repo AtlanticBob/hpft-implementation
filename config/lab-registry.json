@@ -382,7 +382,7 @@
     }
   ],
   "policy": {
-    "comment": "design.md \u00a73.2. VM == vnic in this lab. weight = W_i (inter-tenant); max_rate_bps = MaxRate_i (null = uncapped); class_weights = W_{i,TCP}/W_{i,RDMA}. per_sender_weights: 'dst_vnic|class|src_vnic' -> u (absent = 1). LAB SHAPE 2026-08-26: every host carries 8 VFs and every VF is sold at 50 Gb/s. The 50G is enforced by two class-blind hardware/vswitch layers that do not know about each other (tools/lab-infra/vf_caps.sh): devlink tx_max on the VF's representor at its own DPU (uplink), and an OVS drop-band meter on the traffic addressed to the VF at its own DPU (downlink, a naive cloud policer: drops excess, marks nothing). HPFT reads the same number as MaxRate. 8 VMs x 50G = 400G > C' so the ROOT layer binds under full load; one VM alone stays capped below the 200G link.",
+    "comment": "design_v4.md §2. VM == vnic in this lab. weight = W_i (inter-tenant); max_rate_bps = MaxRate_i (null = uncapped); class_weights = W_{i,TCP}/W_{i,RDMA}. per_sender_weights: 'dst_vnic|class|src_vnic' -> u (absent = 1). LAB SHAPE 2026-08-26: every host carries 8 VFs and every VF is sold at 50 Gb/s, enforced by two class-blind layers that do not know about each other (tools/lab-infra/vf_caps.sh): devlink tx_max on the VF's representor at its own DPU (uplink), and an OVS drop-band meter on traffic addressed to the VF at its own DPU (downlink, a naive cloud policer: drops excess, marks nothing). HPFT reads the same number as MaxRate. 8 VMs x 50G = 400G > C' so the ROOT layer binds under full load; one VM alone stays capped below the 200G link.",
     "vms": {
       "sgpu01/vf0": {
         "weight": 1,
@@ -644,7 +644,7 @@
     "per_sender_weights": {}
   },
   "control": {
-    "comment": "Scheme-E control plane addressing. telemetry: host -> its DPU's in-band ctl IP (PF1 SF on underlay-p1, rides the p1/switch data path per design_e \u00a73.4 user note). pace_shim: sender host -> shim addr as reachable from that host's DPU (tmfifo). tree_stub_bps = static Tree_f until M5's sender tree. rate_export: receiver host -> its DPU rx_agent (tmfifo), fresh kernel-path byte counter for class attribution (2026-07-11).",
+    "comment": "Scheme-E control plane addressing. telemetry: host -> its DPU's in-band ctl IP (PF1 SF on underlay-p1, rides the p1/switch data path per design_e §3.4 user note). pace_shim: sender host -> shim addr as reachable from that host's DPU (tmfifo). tree_stub_bps = static Tree_f until M5's sender tree. rate_export: receiver host -> its DPU rx_agent (tmfifo), fresh kernel-path byte counter for class attribution (2026-07-11).",
     "telemetry_ip": {
       "sgpu01": "10.1.9.1",
       "sgpu02": "10.1.9.2",
@@ -665,18 +665,13 @@
     "rate_export_ms": 5
   },
   "e_params": {
-    "comment": "design.md \u00a76 (tracking-audit law). RESPONSE LAW: the receiver synthesises one target per flow-set, u_f = ceil_f*(1-gamma*s_f) (\u00a73.4), and the sender does first-order tracking in log space, R <- R*(u/R)^(k*T) (\u00a74.2). Fairness still lives entirely in the receiver's water-filling, not in the law. Params are wall-clock quantities (rate constants in s^-1, integrals in bits), so they do not need retuning when period_ms changes -- there is no ref_period_ms scaling any more. k=20 s^-1 is capped by target staleness (k*tau_eff <~ 0.4, tau_eff ~20ms); gamma=0.25 sets both the audit discount band (u >= 0.75*ceil) and the audit-loop damping (zeta = 0.5*sqrt(k*V/(gamma*ceil))); V = v_seconds*headroom*C = 1.6 Gbit is a wall-clock excess-integral: it must NOT scale with the control period, and it IS anchored on C, the downlink bottleneck capacity the receiver actually schedules against (100G here), not on the NIC port line rate -- ehat scales with C, so V must too or the audit loop's damping becomes link-rate dependent (design.md \u00a73.3). rx_agent reads C from the uplink and recomputes V whenever the link speed changes. HEADROOM=0.08 (2026-07-29, overlay-resident): 3% queue-warning + ~5% VxLAN encap tax (inner-byte ledger vs outer-byte wire, measured 4.99% at 1500 MTU); covers inner packets >= ~625 B, smaller-packet overshoot falls back to tenant CC. V IS NOT DERIVED FROM HEADROOM: the real rule is V = 4*zeta^2*gamma*ehat*/k at the typical contention point (design_theory par.3; ehat*=23G, zeta=1/sqrt(2) => V=576 Mbit, revalidated by results/vtune_20260729). v_seconds=0.072 is only the dial that lands V there through the legacy v_sec*headroom*C packaging -- when headroom or C' changes, re-solve V from the zeta rule and re-set v_seconds, do NOT let V drift; design_theory \u00a73 shows it lands 1% from the optimal-damping inverse V = 4*zeta^2*gamma*ehat_star/k at zeta=1/sqrt(2), which is post-hoc confirmation, not a derivation -- re-derive it if the tenant count, flow count, link rate or loop delay changes. Derivations and tuning rules: hpft-design/docs/design_theory.md.",
+    "comment": "design_v4.md: the fence law. The receiver keeps a virtual-queue ledger per flow-set (Q <- clip(Q + A - E, 0, D*E)) and sends only q = Q/E; the sender steps the fence multiplicatively R <- R*exp(alpha*min(m,m_max))*exp(-kappa*dq)*exp(-(kappa/D)*min(q,D)). Every constant below is per-feedback and dimensionless, so none of them change with link rate or flow count - see design_theory_v4.md §5 (scale invariance) and §6, which derives kappa, D and alpha_max from just two measurements (period T_p, loop delay tau) and two dimensionless choices (damping zeta, overshoot budget epsilon). HEADROOM=0.08: ~3% queue-warning margin plus the ~5% VxLAN encap tax (inner-byte ledger vs outer-byte wire, measured 4.99% at 1500 MTU).",
     "period_ms": 10,
     "law": "conf",
-    "eps": 0.02,
     "d_repay_s": 0.3,
-    "phi_min": 0.5,
     "d_clip_s": 0.05,
     "backlog_hold_s": 0.05,
-    "law_comment": "LAW ARM (branch vq-sched, 2026-08-24). law=vq: the receiver runs the virtual hierarchical fair scheduler (demand = backlog Q_f/T + r_f, no delta ratchet / saturation test) and sends {g = share hint, r, d = Q_f/g in us}; the sender climbs towards (1+eps)*g with the log first-order step (k) and, when d>0, cuts to g*(1-d/d_repay_s) floored at phi_min*g. d_clip_s bounds the queue (memory, not debt). law=track: design.md v2 (u = ceil*(1-gamma*s), k, gamma, v_seconds, delta_demand apply). Stability of the drain: d_repay_s > 0.64*tau_eff (no oscillation above 2.7*tau_eff); tau_eff ~24 ms here.",
     "k": 20.0,
-    "gamma": 0.25,
-    "v_seconds": 0.072,
     "delta_demand": 0.15,
     "headroom": 0.08,
     "n1_freeze_s": 0.25,
@@ -691,16 +686,11 @@
     "tcp_refresh_ms": 100,
     "rate_window_s": 0.01,
     "fs_grace_s": 0.5,
-    "backlog_congestion_aware": true,
     "policy": null,
     "liveness_port": 9713,
-    "mi_gate": "phase",
-    "gate_s": 0.016,
-    "beta_max": 2.0,
     "split_by_sender": true,
     "rdma_unknown_rate_bps": 5000000000.0,
     "rdma_unknown_comment": "per-QP cap for RDMA flows the executor has no budget for yet (mailbox 0xccf); the DPA applies rate per QP, so a 4-QP flow-set gets 4x this",
-    "d_star_s": 0.003,
     "trust_recover_s": 1.0,
     "conf_comment": "law=conf = design v4 (hpft_design_v4.md, 2026-08-28): receiver root = (port - unscheduled arrival)(1-h), two water-fillings (share; lenders demand A(1+delta) but keep E = share), virtual queue Q <- clip(Q + A - E, 0, D E), feedback {q = Q/E in periods} (no direction bit: the sender probes whenever q = 0); sender R <- R exp(alpha min(m, m_max)) (m = consecutive empty-queue feedbacks; the step grows with the silence, alpha = alpha_max/m_max) exp(-kappa dq) (dq signed while a queue exists) exp(-(kappa/D) q), the probe bounded by R <- max(R, min(R e^step, min(maxrate, r_cap_mult x own send rate))); executors blend r = T cc + (1-T) R with executor-owned trust (decay by q/D, rise only while the CC is binding: TCP cwnd-limited 100 ms, RDMA cc below 98% level and not rising over 100 epochs); kappa 0.01 / D 300 (zeta 0.87) chosen for a loop delay of 40-60 feedbacks plus the executor's own lag (offline model); PERIOD 10 ms (= one meter round, 2026-08-29): per-feedback constants are the 1 ms ones scaled by the period (kappa 0.1 linearly, D 30 unchanged, alpha 3e-4 quadratically since it is the growth rate of the step; alpha_max = alpha m_max = 3%, overshoot alpha_max tau ~ 9%); the trust epoch in the executors stays 1 ms",
     "kappa": 0.1,
@@ -711,7 +701,7 @@
     "tree_period_ms": 100,
     "r_cap_mult": 2.0,
     "r_cap_floor_bps": 2000000000.0,
-    "alpha": 3e-4,
+    "alpha": 0.0003,
     "m_max": 100,
     "r_floor_bps": 1000000000.0,
     "decision_avg_s": 0.1,

@@ -10,7 +10,7 @@
 # table); starts one listener per flow-table row on the receiver; starts
 # the receiver's vport-meter sampler; launches every row from its own host
 # so that its first packet lands at T0 + warm-up + start (RDMA: perftest
-# --start_at on both ends; TCP: tcp_blast -S); collects the three
+# --start_at on both ends; TCP: iperf3 --start-at); collects the three
 # data paths (vport-meter series, per-flow application logs, agent jsonl)
 # plus the trust/CNP/switch snapshots; restores nothing because it changed
 # nothing standing.
@@ -139,12 +139,13 @@ for e in d:
 snap_cnp > "$OUT/cnp_pre.txt"; snap_switch > "$OUT/switch_pre.txt"
 
 # ---- T0, listeners, sampler, launches -------------------------------------
-# tcp_blast replaces iperf3 for every TCP row: it connects before the event and
-# puts its first byte ON it, which iperf3 cannot do (no absolute start; its
-# ~0.5-1.1 s of startup used to land after the event and be charged to the run).
+# TCP rows use iperf3's --start-at, the local patch built from
+# ~/hyperfront/iperf320 and installed on all four hosts (paper/1-1_20260826/
+# perftest_start_at.md). It is NOT listed in --help - the patch adds the option
+# and its parsing, not the help text - so check for it the way that works.
 for h in $RECV $(echo "$ROWS" | awk '$4=="tcp"{print $1}' | sort -u); do
-  on_host "$h" "[ -x /tmp/tcp_blast ] && [ /tmp/tcp_blast -nt $REPO/tools/host/tcp_blast.c ] || gcc -O2 -pthread -o /tmp/tcp_blast $REPO/tools/host/tcp_blast.c" \
-    || { echo "ABORT: tcp_blast build failed on $h"; exit 1; }
+  on_host "$h" "strings /usr/local/lib/libiperf.so.0 2>/dev/null | grep -q start-at" \
+    || { echo "ABORT: $h has an iperf3 without the --start-at patch"; exit 1; }
 done
 if echo "$ROWS" | awk '{print $4}' | grep -q '^udp$'; then
   for h in $RECV $(echo "$ROWS" | awk '$4=="udp"{print $1}' | sort -u); do
@@ -178,7 +179,7 @@ while read -r sh sv dv cls n st en opt; do
   elif [ "$cls" = udp ]; then
     SRV+="setsid nohup /tmp/udp_blast -r -p $((5900+k)) -B $(ip_of $RECV $dv) >/tmp/val_s$k.log 2>&1 </dev/null & "
   else
-    SRV+="setsid nohup /tmp/tcp_blast -r -p $((5600+k)) -B $(ip_of $RECV $dv) >/tmp/val_s$k.log 2>&1 </dev/null & "
+    SRV+="setsid nohup iperf3 -s -p $((5600+k)) >/tmp/val_s$k.log 2>&1 </dev/null & "
   fi
   k=$((k+1))
 done <<<"$ROWS"
@@ -203,7 +204,7 @@ while read -r sh sv dv cls n st en opt; do
     # the flow's OWN use) and the fence stayed there for the whole phase -
     # measured r23, the phase delivered 0.26 G of a 10 G demand.
     rate_limit=*) extra="--rate_limit=${opt#rate_limit=}" ;;
-    tcp_cc=*)     extra="-C ${opt#tcp_cc=}" ;;   # tcp_blast: setsockopt(TCP_CONGESTION)
+    tcp_cc=*)     extra="-C ${opt#tcp_cc=}" ;;
     gbps=*)       extra="${opt#gbps=}" ;;
   esac
   if [ "$cls" = rdma ]; then
@@ -211,7 +212,7 @@ while read -r sh sv dv cls n st en opt; do
   elif [ "$cls" = udp ]; then
     cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-time.time()))\"; /tmp/udp_blast -c $dip -p $((5900+k)) -B $sip -G $extra -t $dur' >/tmp/val_c$k.log 2>&1 </dev/null & "
   else
-    cmd="setsid nohup /tmp/tcp_blast -c $dip -p $((5600+k)) -B $sip -I dpu1vf$sv -P $n -t $dur -S $((T0+off)) $extra >/tmp/val_c$k.log 2>&1 </dev/null & "
+    cmd="setsid nohup iperf3 -B $sip%dpu1vf$sv -c $dip -p $((5600+k)) -P $n -t $dur --start-at $((T0+off)) -J $extra >/tmp/val_c$k.log 2>&1 </dev/null & "
   fi
   CLI[$sh]+="$cmd"
   k=$((k+1))
