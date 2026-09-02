@@ -36,10 +36,20 @@ python3 validation/plot/timeline.py V8a_<tag> V8a
 python3 validation/plot/trust.py    V8b_<tag> V8b
 ```
 
-runner 自己在窗口起止时改接收端的 meter、跑完恢复 50 G，EXIT 陷阱保证异常中止也会恢复；臂 B 结束时把 `g_trust_step` 写回 66。跑完核对 `results/<tag>/hidden_meter.txt` 与 `trust_arm.txt` 是不是这次要的值。
+V9 同样两条臂，对照的开关换成到期步长（README §四 V9）：
+
+```
+bash validation/run/run.sh V9_trust_exit V9a_<tag>                   # 臂 A：租约（默认）
+HPFT_RDMA_TRUST_DECAY=0 \
+  bash validation/run/run.sh V9_trust_exit V9b_<tag>                 # 臂 B：锁存（无到期）
+python3 validation/plot/timeline.py V9a_<tag> V9a
+python3 validation/plot/trust.py    V9a_<tag> V9a
+```
+
+runner 自己在窗口起止时改接收端的 meter、跑完恢复 50 G，EXIT 陷阱保证异常中止也会恢复；对照臂结束时把 `g_trust_step` 写回 66、`g_trust_decay` 写回 13。跑完核对 `results/<tag>/hidden_meter.txt` 与 `trust_arm.txt` 是不是这次要的值。
 
 每跑完一个场景停下汇报，再跑下一个。
 
 ## 复原
 
-V6 之后把执行面切回 `0xccd 0`、iperf3 不再带 `-C bbr`。V8 的两样东西 runner 自己收尾（接收端 meter 回 50 G、`g_trust_step` 回 66），但跑完还是核一眼 `bash tools/lab-infra/vf_caps.sh status`，四台的八个 meter 都该是 50000000 kbps。其余场景不改任何常设配置，不需要复原。
+V6 之后把执行面切回 `0xccd 0`、iperf3 不再带 `-C bbr`。V8/V9 的三样东西 runner 自己收尾（接收端 meter 回 50 G、`g_trust_step` 回 66、`g_trust_decay` 回 13），但跑完还是核一眼 `bash tools/lab-infra/vf_caps.sh status`，四台的八个 meter 都该是 50000000 kbps。其余场景不改任何常设配置，不需要复原。

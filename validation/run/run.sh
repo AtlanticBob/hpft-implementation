@@ -211,14 +211,19 @@ meter_set() { # $1 = destination VF index, $2 = kbps
 # at the fence whatever the tenant CC wants. The TCP executor's step is a
 # compile-time constant, so this switch does NOT freeze TCP's trust.
 TSTEP=${HPFT_RDMA_TRUST_STEP:-66}
+# HPFT_RDMA_TRUST_DECAY=0 turns off the lease expiry (mailbox 0xcce <step> 10
+# writes g_trust_decay; 13 fxp16/epoch = T/5 s is the default). That is the
+# pre-lease latch arm: trust once earned only falls through the virtual queue.
+TDECAY=${HPFT_RDMA_TRUST_DECAY:-13}
 cleanup() {
   [ -n "$METER_ROWS" ] && echo "$METER_ROWS" | while read -r _ _ dv _; do meter_set "$dv" 50000000 >/dev/null 2>&1; done
   [ "$TSTEP" = 66 ] || for h in $SENDERS; do ssh -n -o BatchMode=yes "$(dpu_of $h)" "echo '0xcce 66 7' > /tmp/rp_fifo" </dev/null 2>/dev/null; done
+  [ "$TDECAY" = 13 ] || for h in $SENDERS; do ssh -n -o BatchMode=yes "$(dpu_of $h)" "echo '0xcce 13 10' > /tmp/rp_fifo" </dev/null 2>/dev/null; done
   return 0
 }
 trap cleanup EXIT
-for h in $SENDERS; do ssh -n -o BatchMode=yes "$(dpu_of $h)" "echo '0xcce $TSTEP 7' > /tmp/rp_fifo" </dev/null 2>/dev/null || true; done
-echo "rdma trust step = $TSTEP (default 66; 0 = trust frozen at zero)" | tee "$OUT/trust_arm.txt"
+for h in $SENDERS; do ssh -n -o BatchMode=yes "$(dpu_of $h)" "echo '0xcce $TSTEP 7' > /tmp/rp_fifo; echo '0xcce $TDECAY 10' > /tmp/rp_fifo" </dev/null 2>/dev/null || true; done
+echo "rdma trust step = $TSTEP (default 66; 0 = trust frozen at zero); expiry step = $TDECAY (default 13 = 5 s; 0 = latch, no expiry)" | tee "$OUT/trust_arm.txt"
 if [ -n "$METER_ROWS" ]; then
   : > "$OUT/hidden_meter.txt"
   while read -r _ _ dv _ _ st en opt; do

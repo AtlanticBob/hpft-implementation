@@ -527,12 +527,24 @@ static volatile uint32_t g_hpft_cc_algo = HPFT_CC_DCQCN;
  * conservative allowance; without an agent it stays MAX, i.e. the old
  * behaviour. */
 static volatile uint32_t g_hpft_unknown_rate = DOCA_PCC_DEV_MAX_RATE;
-/* fence design trust (executor-owned, design v4 6.2/6.3): per epoch
- * T -= (q/D_r)*T, and T rises at (1-T)/tau_r per epoch only on evidence of
- * a bottleneck the receiver's ledger cannot see. That evidence is LOSS.
- * Our own rate limiter never drops a packet - it only makes a QP wait - so
- * a NACK is the fabric stating that it dropped this pair's packets, a fact
- * belonging to no particular CC.
+/* fence design trust (executor-owned, design v4 6.2/6.3): trust is a
+ * LEASE. It rises at (1-T)/tau_r per epoch only on evidence of a
+ * bottleneck the receiver's ledger cannot see, and on every epoch without
+ * that evidence it decays by T*max(q/D_r, dt/tau_d): the q term is
+ * over-taking, the tau_d term is expiry. Expiry must exist because the
+ * bottleneck's disappearance produces no network fact of its own (its only
+ * trace is that loss stops), and a trusted pair can never over-take (the
+ * clip's upper bound is the fence at every T), so without it trust is a
+ * latch with no exit - measured decay ~278 s from probe-sawtooth crumbs
+ * alone (V8a 2026-09-02), i.e. the floor guarantee stays suspended for
+ * minutes after a transient bottleneck clears.
+ *
+ * The rise evidence is LOSS. Our own rate limiter never drops a packet -
+ * it only makes a QP wait - so a NACK is the fabric stating that it
+ * dropped this pair's packets, a fact belonging to no particular CC. A
+ * live lossy bottleneck renews the lease many times per second; a
+ * persistent bottleneck the CC has settled under is re-probed slowly as
+ * the floor creeps up - the unavoidable price of having an exit.
  *
  * Asking instead whether the CC is what BINDS the flow - the trend test
  * this replaces - cannot separate a CC that yields too early at a
@@ -545,6 +557,10 @@ static volatile uint32_t g_hpft_unknown_rate = DOCA_PCC_DEV_MAX_RATE;
 #define HPFT_TRUST_BELOW_FXP16  (64225u)   /* 1 - 0.02 */
 #define HPFT_LOSS_WIN_US        (100000u)  /* the observation window, in us */
 static volatile uint32_t g_trust_step = 66u;   /* fxp16 per epoch = 1 ms / 1 s */
+static volatile uint32_t g_trust_decay = 13u;  /* fxp16 per epoch = 1 ms / 5 s
+						* (tau_d); 0 = no expiry, the
+						* pre-lease latch, kept only as
+						* an experiment arm */
 static volatile uint32_t g_hpft_rtt_events;   /* RTT events seen, any flowtag */
 /* DIAG 2026-08-27: which event types carry a stable QPN? Per ev_type&7:
  * last qpn seen and how often it differed from the previous one. */
@@ -785,11 +801,14 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		if (ft == 0xcceu) {
-			/* DCQCN tunables: 0xcce <value> <which>, the three knobs
-			 * a firmware DCQCN exposes. which: 0 = AI (rpg_ai_rate),
-			 * 1 = HAI (rpg_hai_rate), 2 = rate timer us
-			 * (rpg_time_reset). Values in the device's fxp20 rate
-			 * units / microseconds. */
+			/* Executor tunables: 0xcce <value> <which>. 0-2 are
+			 * the three knobs a firmware DCQCN exposes: 0 = AI
+			 * (rpg_ai_rate), 1 = HAI (rpg_hai_rate), 2 = rate
+			 * timer us (rpg_time_reset), values in the device's
+			 * fxp20 rate units / microseconds. 7 = trust rise
+			 * step, 10 = trust expiry step (both fxp16/epoch;
+			 * 10 at 0 = the pre-lease latch arm). 8/9 = slow
+			 * restart cut factor fxp16 / throttle us. */
 			uint32_t which = ((volatile uint32_t *)request)[2];
 
 			if (which == 0) g_dq_ai = budget;
@@ -801,6 +820,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 7) g_trust_step = budget;
 			else if (which == 8) g_dq_loss_mdf16 = budget > 65536u ? 65536u : budget;
 			else if (which == 9) g_dq_loss_gap_us = budget;
+			else if (which == 10) g_trust_decay = budget > 65536u ? 65536u : budget;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		if (ft == 0xccfu) {
@@ -1376,16 +1396,27 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 					uint32_t qf = c->qfrac > 65536u ? 65536u : c->qfrac;
 					uint32_t under, lost;
 
-					t -= (uint32_t)(((uint64_t)t * qf) >> 16);
 					under = (qf == 0 &&
 						 (uint64_t)c->cc_rate * 65536u <
 						 (uint64_t)c->level * HPFT_TRUST_BELOW_FXP16);
 					lost = (under && c->n_nack &&
 						(uint32_t)(now - c->loss_ts) < HPFT_LOSS_WIN_US);
 					if (lost) {
+						/* renew the lease */
 						t += (uint32_t)(((uint64_t)(65536u - t)
 							* g_trust_step) >> 16);
 						c->loss_ep++;
+					} else if (t) {
+						/* over-taking or expiry,
+						 * whichever bites harder; at
+						 * least 1, or the fxp16 floor
+						 * parks T at decay/65536
+						 * (measured: stuck at 0.077) */
+						uint32_t d = (uint32_t)(((uint64_t)t
+							* (qf > g_trust_decay
+							   ? qf : g_trust_decay)) >> 16);
+
+						t -= d ? d : (g_trust_decay ? 1u : 0u);
 					}
 					c->trust = t > 65536u ? 65536u : t;
 				}
