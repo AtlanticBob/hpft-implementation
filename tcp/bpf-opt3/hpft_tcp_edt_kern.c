@@ -68,7 +68,16 @@
 #define HPFT_TRUST_FLAG 0x80000000U
 #define HPFT_LINE_BPS 200000000000ULL
 #define HPFT_TRUST_EPOCH_NS 1000000ULL      /* trust updated once per ms */
-#define HPFT_TRUST_STEP 66ULL               /* fxp16 per ms = 1 ms / 1 s */
+#define HPFT_TRUST_STEP 66ULL               /* fxp16 per ms = 1 ms / 1 s (tau_r) */
+#define HPFT_TRUST_DECAY 13ULL              /* fxp16 per ms = 1 ms / 5 s (tau_d):
+                                             * every epoch without loss evidence
+                                             * T decays by max(q/D, this) (6.2) */
+#define HPFT_TRUST_BELOW_FXP16 55706ULL     /* 1 - delta, delta = 0.15: the CC
+                                             * must ask for less than the fence
+                                             * by the fulfilment tolerance (6.3);
+                                             * mirrors registry delta_demand */
+#define HPFT_TRUST_IDLE_NS 5000000000ULL    /* tau_d: a flow-set idle longer
+                                             * restarts from T = 0 (6.4) */
 /* design v4 6.3: how far back a retransmission still counts as "the
  * network is dropping this flow-set right now" - the observation window. */
 #define HPFT_LOSS_WIN_NS 100000000ULL
@@ -442,9 +451,10 @@ int hpft_tcp_edt(struct __sk_buff *skb)
              * rate), capped at line rate. The flags' low 16 bits carry
              * the queue fraction q/D_r.
              *
-             * Trust, once per ms: decayed by the queue fraction, raised
-             * only on evidence of a bottleneck the receiver's ledger
-             * cannot see (6.3). That evidence is loss: our shaper only
+             * Trust, once per ms: raised only on evidence of a bottleneck
+             * the receiver's ledger cannot see (6.3); on every epoch
+             * without that evidence it decays by max(q/D, 1 ms/tau_d) -
+             * over-taking or expiry (6.2), same rule as the RDMA executor. That evidence is loss: our shaper only
              * delays, so a retransmission is the network's own statement
              * that it dropped this flow-set. Asking instead whether the
              * CC is what limits the flow - the old cwnd-limited test -
@@ -474,14 +484,29 @@ int hpft_tcp_edt(struct __sk_buff *skb)
                            now_ms - state->shot_ms < HPFT_SHOT_QUIET_MS;
                 int lost = !ours && state->loss_ns &&
                            now - state->loss_ns < HPFT_LOSS_WIN_NS &&
-                           cc_bps && cc_bps < cfg->rate_bps;
+                           cc_bps &&
+                           cc_bps * 65536ULL < cfg->rate_bps * HPFT_TRUST_BELOW_FXP16;
 
-                state->trust_ns = now;
                 t = state->trust;
-                t -= (t * qf) >> 16;
+                /* 6.4: idle longer than tau_d restarts from zero */
+                if (now - state->trust_ns > HPFT_TRUST_IDLE_NS)
+                    t = 0;
+                state->trust_ns = now;
                 if (qf == 0 && lost) {
-                    t += ((65536ULL - t) * HPFT_TRUST_STEP) >> 16;
+                    /* evidence present: rise, at least one tick so T
+                     * really reaches 1 */
+                    __u64 inc = ((65536ULL - t) * HPFT_TRUST_STEP) >> 16;
+
+                    if (!inc && t < 65536ULL)
+                        inc = 1;
+                    t += inc;
                     state->loss_ep++;
+                } else if (t) {
+                    /* over-taking or expiry, whichever bites harder; at
+                     * least one tick so T really reaches 0 */
+                    __u64 dec = (t * (qf > HPFT_TRUST_DECAY ? qf : HPFT_TRUST_DECAY)) >> 16;
+
+                    t -= dec ? dec : 1;
                 }
                 state->trust = t > 65536ULL ? 65536U : (__u32)t;
             }

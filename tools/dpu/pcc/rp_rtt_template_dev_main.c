@@ -554,7 +554,12 @@ static volatile uint32_t g_hpft_unknown_rate = DOCA_PCC_DEV_MAX_RATE;
  * is the wrong direction. The fence is feasible at the receiver's port by
  * construction, so enforcing it can never overrun that port; deferring to
  * the CC is only ever justified by a bottleneck somewhere else. */
-#define HPFT_TRUST_BELOW_FXP16  (64225u)   /* 1 - 0.02 */
+#define HPFT_TRUST_BELOW_FXP16  (55706u)   /* 1 - delta, delta = 0.15: the
+					    * design's one fulfilment
+					    * tolerance (registry
+					    * delta_demand); keep in step */
+#define HPFT_TRUST_IDLE_US      (5000000u) /* tau_d: a pair idle longer
+					    * restarts from T = 0 (6.4) */
 #define HPFT_LOSS_WIN_US        (100000u)  /* the observation window, in us */
 static volatile uint32_t g_trust_step = 66u;   /* fxp16 per epoch = 1 ms / 1 s */
 static volatile uint32_t g_trust_decay = 13u;  /* fxp16 per epoch = 1 ms / 5 s
@@ -1396,15 +1401,26 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 					uint32_t qf = c->qfrac > 65536u ? 65536u : c->qfrac;
 					uint32_t under, lost;
 
+					/* 6.4: idle longer than tau_d restarts
+					 * from zero (old = this pair's previous
+					 * epoch stamp) */
+					if (g_trust_decay &&
+					    (uint32_t)(now - old) > HPFT_TRUST_IDLE_US)
+						t = 0;
 					under = (qf == 0 &&
 						 (uint64_t)c->cc_rate * 65536u <
 						 (uint64_t)c->level * HPFT_TRUST_BELOW_FXP16);
 					lost = (under && c->n_nack &&
 						(uint32_t)(now - c->loss_ts) < HPFT_LOSS_WIN_US);
 					if (lost) {
-						/* renew the lease */
-						t += (uint32_t)(((uint64_t)(65536u - t)
+						/* evidence present: rise; at least
+						 * one tick so T really reaches 1 */
+						uint32_t inc = (uint32_t)(((uint64_t)(65536u - t)
 							* g_trust_step) >> 16);
+
+						if (!inc && t < 65536u && g_trust_step)
+							inc = 1;
+						t += inc;
 						c->loss_ep++;
 					} else if (t) {
 						/* over-taking or expiry,

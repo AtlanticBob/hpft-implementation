@@ -1,0 +1,7 @@
+row,fsid,start_s,end_s,goodput_gbps
+0,sgpu01/vf0>sgpu02/vf0|rdma,0,150,26.97
+1,sgpu01/vf1>sgpu02/vf1|rdma,0,150,22.76
+2,sgpu01/vf1>sgpu02/vf1|tcp,0,150,22.22
+3,sgpu02/vf0>sgpu02/vf0|meter,30,60,
+4,sgpu03/vf0>sgpu02/vf0|rdma,90,150,15.54
+5,sgpu04/vf0>sgpu02/vf0|rdma,90,150,15.54

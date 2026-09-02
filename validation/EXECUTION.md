@@ -32,6 +32,7 @@ V8 有两条臂，图名要分开（`timeline.py`/`trust.py` 的第二个参数�
 bash validation/run/run.sh V8_hidden_bottleneck V8a_<tag>            # 臂 A：置信度开
 HPFT_RDMA_TRUST_STEP=0 \
   bash validation/run/run.sh V8_hidden_bottleneck V8b_<tag>          # 臂 B：置信度冻结在零
+bash validation/run/run.sh V8_hidden_bottleneck_tcp V8t_<tag>        # TCP 版：vf0 跑 TCP
 python3 validation/plot/timeline.py V8a_<tag> V8a
 python3 validation/plot/trust.py    V8b_<tag> V8b
 ```
