@@ -734,6 +734,17 @@ def main():
     # from a floor at alpha_max (the open-loop regime, an order of magnitude
     # slower over the same distance). The probe ceiling never sits below
     # the start value. No absolute number: h and C are policy/platform.
+    # §5.4: a flow-set starts at the port's headroom h*C - the capacity the
+    # receiver keeps free for transients - so a newcomer can never push the
+    # port past line rate even when everyone else is at their share, and it
+    # starts ABOVE any realistic share, so the ledger brings it down in ~D
+    # periods (the damped closed-loop regime) instead of the fence climbing
+    # from a floor at alpha_max. No absolute number: h and C are
+    # policy/platform. (h x the destination VM's cap was tried on V2,
+    # 2026-09-02: RDMA joins slower by 0.4 s, TCP joins no better - the TCP
+    # delay is upcall loss in the sender DPU's OVS, not the VM meter.)
+    def start_of(fsid):
+        return float(ep["headroom"]) * float(line)
     v4_start = float(ep["headroom"]) * float(line)
     v4_cap_floor = v4_start
     # Absolute floor of the fence: the lowest rate the executor shapes
@@ -775,7 +786,7 @@ def main():
             # demand == tree, the fill would sit at its own fixed point and
             # the tree could never grow again. One delta of headroom keeps
             # the demand above the tree and the growth path open.
-            cap = line if a_s is None else max(v4_cap_mult * st.as_avg, v4_cap_floor)
+            cap = line if a_s is None else max(v4_cap_mult * st.as_avg, start_of(fsid))
             if probe_cap_tree:
                 cap = min(cap, tree_of(fsid) * (1.0 + ep["delta_demand"]))
             if st.mode == "fresh":
@@ -785,7 +796,7 @@ def main():
                 # evidence at all about where its share is, which is the
                 # maximum-uncertainty state and the one case where the
                 # largest step is the right one.
-                st.R = min(v4_start, tree_of(fsid), line)
+                st.R = min(start_of(fsid), tree_of(fsid), line)
                 st.below = int(v4_mmax)
                 st.mode = "v4"
             # The fence has taken hold once the flow-set's OWN measured send

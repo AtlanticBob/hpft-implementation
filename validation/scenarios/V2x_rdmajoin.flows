@@ -1,0 +1,13 @@
+# 拆分实验（2026-09-02）：V2 的在位者不变，只让某一类/某一行加入，用来定位 TCP 新来者晚 0.85 s 起步的条件。临时场景。
+sgpu01 0 0 rdma 4 0 30 -
+sgpu01 0 0 tcp 4 0 30 -
+sgpu01 1 1 rdma 4 0 30 -
+sgpu01 1 1 tcp 4 0 30 -
+sgpu01 2 2 rdma 4 0 30 -
+sgpu01 2 2 tcp 4 0 30 -
+sgpu01 3 3 rdma 4 0 30 -
+sgpu01 3 3 tcp 4 0 30 -
+sgpu03 0 0 rdma 4 10 20 -
+sgpu03 1 1 rdma 4 10 20 -
+sgpu03 2 2 rdma 4 10 20 -
+sgpu03 3 3 rdma 4 10 20 -
