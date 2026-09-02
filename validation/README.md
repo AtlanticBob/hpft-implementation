@@ -30,7 +30,7 @@ V1、V2、V4、V7 是每一版设计必跑的四个；V3、V5、V6 在它们过�
 | HyperFront | 四台都在 `lab_env.sh hpft` 态：UPCC=1，四台 DPU 跑本仓库的 PCC 执行面；`roles.sh set --receiver sgpu02 --senders sgpu01,sgpu03,sgpu04`；TCP 执行面 host fq+EDT，每个 VF 恰好挂一份当前程序 |
 | 被测对象 | `config/lab-registry.json` 的 `e_params`（law 与参数），每次运行原样记入报告 |
 | 政策 | 每个 VM 权重 1、`max_rate_bps` 50 G、类权重 tcp:rdma = 1:1、per-sender 权重全 1；headroom 8% 只作用在根上：根容量 C′ = 200 × 0.92 = 184 G，每 VM 上限就是 50 G（四个 VM 同时满发时根先绑定，各得 46 G） |
-| RDMA 拥塞控制 | PCC 执行面里的一项，只读速率不改 CC。邮箱 `0xccd` 选：**0 = AIMD、1 = ZTR、2 = DCQCN RP 状态机、3 = Swift**；启动路径里没有任何地方写 `0xccd`，所以缺省跑的是设备码的编译期默认值 **2**。**四项里只有 ZTR 和 Swift 对 NACK 降速**（Swift 无条件，ZTR 还要求时延 ≥ 70 µs），AIMD 与 DCQCN 都是 CNP 驱动、把 NACK 记下就算完——这一点决定了 V8 能不能测到东西。V6 换 Swift（`0xccd 3`）。**设备端目前没有这一项的回读，runner 也不记它**，所以报告里这一格是照本文抄的，没有校验 |
+| RDMA 拥塞控制 | PCC 执行面里的一项，只读速率不改 CC。邮箱 `0xccd` 选：**0 = AIMD、1 = ZTR、2 = DCQCN RP 状态机、3 = Swift**；启动路径里没有任何地方写 `0xccd`，所以缺省跑的是设备码的编译期默认值 **2**。**四项都会因丢包降速**：ZTR 和 Swift 在自己的 RTT 事件里处理，AIMD 与 DCQCN 走 slow restart（2026-09-02 加，对应固件 ROCE_ACCL 的 `roce_slow_restart_en`，本 lab 四台读到的都是 1）。V6 换 Swift（`0xccd 3`）。**设备端没有这一项的回读，runner 也不记它**，所以报告里这一格是照本文抄的，没有校验 |
 | RDMA 重传 | **SR，所有 HPFT 实验一律如此**（evaluation 与 validation 都算）。机制是 ROCE_ACCL 寄存器 `selective_repeat_forced_en=1`，`cc_mode.sh sr` 秒切，**易失**——fw reset 或 Arm 重启后归零，要重设。`run.sh` 开跑前逐台读这个寄存器，不是 1 就中止，并把实测值写进 `results/<tag>/retrans_mode.txt`。**不要看状态行里的 `SR current=`**：那读的是 mlxconfig `RDMA_SELECTIVE_REPEAT_EN`，本 lab 永远是 0（那条路要 fw reset，我们不用），它分不出 SR 和 GBN |
 | TCP 拥塞控制 | Cubic，不开 ECN（`tcp_ecn=2`）；V6 换 BBR |
 | MTU | VF 1500，p1 9000；RoCE 路径 MTU 1024（perftest 两端 `-m 1024`） |
@@ -239,7 +239,7 @@ sgpu01 打 sgpu02 的 vf0–vf3 四个租户常驻，四个租户各拿 46 G 把
 
 同一次运行里 sgpu02/vf1 是阴性对照：它没有隐形瓶颈，两类各 25 G，全程不该有任何变化，信任度不该离开零。
 
-**先决条件：CC 项必须对丢包有反应。** 信任度的第二条闸门是「租户 CC 要得比围栏少」，而隐形瓶颈只丢包、不打标记。缺省的 CC 项（`0xccd 2`，DCQCN RP 状态机）与 AIMD（`0xccd 0`）都只对 CNP 反应，NACK 记下就算完，`cc_rate` 因此一直停在线速，闸门永远打不开——2026-09-02 的两条臂就是这样，信任度全程为零、两条臂逐项相同。**跑这个场景要先把执行面切到 Swift（`0xccd 3`）**，它的丢包切窗是无条件的。ZTR（`0xccd 1`）的 NACK 分支挂着 70 µs 的时延门槛，而丢包 meter 不排队，预期也不会降。
+**先决条件：CC 项必须对丢包有反应。** 信任度的第二条闸门是「租户 CC 要得比围栏少」，而隐形瓶颈只丢包、不打标记。两个 CNP 驱动的项（AIMD `0xccd 0`、DCQCN RP 状态机 `0xccd 2`）原本对 NACK 不做任何反应，`cc_rate` 会一直停在线速、闸门永远打不开；2026-09-02 起它们都带 slow restart（丢包时乘性压低 `Rc`、恢复阶梯清零，对应固件 ROCE_ACCL 的 `roce_slow_restart_en`），闸门因此可以成立。切幅与节流由 `0xcce <值> 8`、`0xcce <值> 9` 调，切幅设 65536 就是关掉——那是这个场景的第三个配置，用来说明 CC 不退让时信任度无从谈起。ZTR（`0xccd 1`）的 NACK 分支挂着 70 µs 的时延门槛，而丢包 meter 不排队，预期不会降。
 
 **两条臂。** 臂 A（信任开）是默认，`g_trust_step = 66`（每周期 $(1-T)/1\,\mathrm{s}$）。臂 B（信任冻结）用 `HPFT_RDMA_TRUST_STEP=0` 起跑，runner 通过邮箱 `0xcce 0 7` 把 RDMA 执行面的信任度锁死在零，线上速率于是恒等于围栏。**臂 B 只冻结 RDMA 一侧**：TCP 执行面的步长是编译期常量 `HPFT_TRUST_STEP`，这一版没做开关，所以 vf1 上的 TCP 不参与对照臂，只作阴性对照的一部分。
 

@@ -10,8 +10,9 @@ the device's 2^20-of-line-rate units to Gb/s, trust from fxp16.
 
 usage: rp_probe.py <duration_s> <out_jsonl> [interval_s=1.0] [line_gbps=200]
 record: {"ts", "ft", "level", "paced", "cc", "d", "pace_limited", "trust",
-         "nack", "loss_ep"} - nack is how many NACKs this pair has taken and
-loss_ep how many epochs the loss fast path granted the trust rise.
+         "nack", "loss_ep", "sr_cuts"} - nack is how many NACKs this pair has
+taken, loss_ep how many epochs the loss fast path granted the trust rise, and
+sr_cuts how many slow-restart cuts the CC term applied because of loss.
 """
 import json, os, re, sys, time
 FIFO, LOG = "/tmp/rp_fifo", "/tmp/pcc_rp.log"
@@ -61,7 +62,8 @@ with open(out, "w") as o:
             rec = {"ts": t, "slot": s, "ft": "0x%08x" % ft, "level": round(gbps(int(m.group(2))), 3),
                    "paced": round(gbps(int(m.group(3))), 3), "cc": round(gbps(int(m.group(6))), 3),
                    "d": int(m.group(5)), "pace_limited": int(m.group(8)), "trust": round(int(m.group(11)) / 65536.0, 4),
-                   "loss_ep": int(m.group(4)), "nack": int(m.group(7))}
+                   "loss_ep": int(m.group(4)), "nack": int(m.group(7)),
+                   "sr_cuts": int(m.group(10))}
             o.write(json.dumps(rec) + "\n")
         o.flush()
         if live is None and answered:

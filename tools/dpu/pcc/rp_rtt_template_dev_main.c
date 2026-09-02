@@ -167,6 +167,34 @@ static volatile uint32_t g_dq_ai      = (1u << 20) / 400u;  /* ~0.25% line/step 
 static volatile uint32_t g_dq_hai     = (1u << 20) / 80u;   /* ~1.25% line/step */
 static volatile uint32_t g_dq_time_us = 300u;               /* rate timer, us */
 static volatile uint32_t g_dq_alpha_us = 55u;               /* alpha timer, us */
+/* ---- slow restart: the loss half of what the firmware does --------------
+ * The published DCQCN RP state machine has exactly one input, the CNP, and
+ * so does everything above. That is faithful to DCQCN and NOT faithful to
+ * the NIC: on the firmware path a QP that loses packets is slowed by
+ * SLOW RESTART, a transport-level mechanism sitting BESIDE DCQCN - the
+ * ROCE_ACCL register field roce_slow_restart_en, which is 1 on every host
+ * in this lab. None of the seventeen knobs under ecn/roce_rp/ has anything
+ * to do with loss; they are all CNP-driven. So the loss reaction is added
+ * here the same way the hardware organises it: beside the state machine,
+ * not inside it. In particular alpha is NOT touched - alpha estimates the
+ * marking intensity and a drop is not a mark.
+ *
+ * Measured before this existed (V8, 2026-09-02): with a hidden 20 G
+ * bottleneck under a 50 G fence, the rate written to the QP sat at exactly
+ * 12.50 G/QP for the whole 30 s window while NACKs ran at 18.8 k/s with no
+ * decay whatsoever. Nothing in the software path slowed anything down.
+ *
+ * g_dq_loss_mdf16 == 65536 disables the cut and restores that behaviour. */
+static volatile uint32_t g_dq_loss_mdf16 = 32768u;  /* x0.5 per loss cut, fxp16.
+                                                     * The firmware's own floor
+                                                     * on one decrease is
+                                                     * rpg_min_dec_fac = 50 %. */
+static volatile uint32_t g_dq_loss_gap_us = 300u;   /* min us between loss cuts;
+                                                     * same order as the firmware's
+                                                     * rpg_time_reset = 300. Without
+                                                     * it a 19 k/s NACK storm would
+                                                     * halve the rate 19 k times a
+                                                     * second and pin it at the floor. */
 /* ZTR parameters, values as shipped in rtt_template_algo_params.h */
 #define ZTR_UPDATE_FACTOR (((1u << 16) * 10u) / 100u)   /* fxp16 */
 #define ZTR_AI            (((1u << 20) * 5u) / 100u)    /* fxp20 rate step */
@@ -265,6 +293,8 @@ typedef struct {
 	volatile uint32_t dq_stage;		/* recovery stage counter */
 	volatile uint32_t dq_t_rate;		/* last rate-timer tick, device us */
 	volatile uint32_t dq_t_alpha;		/* last alpha-timer tick */
+	volatile uint32_t dq_t_loss;		/* last slow-restart cut, device us */
+	volatile uint32_t dq_n_loss;		/* slow-restart cuts taken (diag) */
 	volatile uint32_t remote_cap;		/* from NP RTT response payload w2 */
 	volatile uint32_t sw_cwnd;		/* Swift: window, bytes */
 	volatile uint32_t sw_rtt_s;		/* Swift: smoothed RTT, ns (1/4 EWMA) */
@@ -667,11 +697,11 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			/* observer readback: 0xded <pair>. The host prints a fixed
 			 * eleven words, so the slots are reused - in its output
 			 * ft=flowtag bud=level lvl=paced avg16=loss_ep r=d
-			 * s16=cc_rate ep=n_nack evb32=pace_limited.
+			 * s16=cc_rate ep=n_nack evb32=pace_limited, and w9 =
+			 * dq_n_loss, the slow-restart cuts this pair has taken.
 			 * avg16 and ep carried dbg_r_units and cc_prev, which
 			 * belong to the observer coupling and are dead under the
-			 * fence arm; dbg_r_units is still reported by 0xdea, and
-			 * d_cuts (w9) is what shows the observer arm working. */
+			 * fence arm; dbg_r_units is still reported by 0xdea. */
 			hpft_pair_t *c = &g_hpft_pairs[budget % HPFT_PAIRS];
 			volatile uint32_t *rsp = (volatile uint32_t *)response;
 
@@ -684,7 +714,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[6] = c->n_nack;
 			rsp[7] = (uint32_t)hpft_pace_limited(c);
 			rsp[8] = c->dbg_hits;   /* events the DPA processed for this pair */
-			rsp[9] = c->d_cuts;
+			rsp[9] = c->dq_n_loss;   /* slow-restart cuts on this pair */
 			rsp[10] = c->trust;
 			*response_size = 11 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
@@ -702,6 +732,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 				g_hpft_pairs[i].dq_target = DOCA_PCC_DEV_MAX_RATE;
 				g_hpft_pairs[i].dq_alpha = DQ_ALPHA_ONE;
 				g_hpft_pairs[i].dq_stage = 0;
+				g_hpft_pairs[i].dq_t_loss = 0;
+				g_hpft_pairs[i].dq_n_loss = 0;
 				hpft_swift_reset(&g_hpft_pairs[i]);
 			}
 			return DOCA_PCC_DEV_STATUS_OK;
@@ -767,6 +799,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 5) g_d_recover_us = budget ? budget : 1u;
 			else if (which == 6) g_pace_pct = budget;
 			else if (which == 7) g_trust_step = budget;
+			else if (which == 8) g_dq_loss_mdf16 = budget > 65536u ? 65536u : budget;
+			else if (which == 9) g_dq_loss_gap_us = budget;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		if (ft == 0xccfu) {
@@ -1060,8 +1094,29 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			c->loss_ts = now;
 			c->n_nack++;
 			if (g_hpft_cc_algo == HPFT_CC_ZTR ||
-			    g_hpft_cc_algo == HPFT_CC_SWIFT)
+			    g_hpft_cc_algo == HPFT_CC_SWIFT) {
+				/* these two apply their own loss cut when the
+				 * next RTT measurement lands */
 				c->ztr_flags |= 2u;
+			} else if (g_dq_loss_mdf16 < 65536u &&
+				   (uint32_t)(now - c->dq_t_loss) >= g_dq_loss_gap_us) {
+				/* slow restart, for the two CNP-driven terms
+				 * (AIMD and the DCQCN RP state machine): cut the
+				 * rate, put the recovery ladder back to its first
+				 * stage, and let the normal rate timer climb out
+				 * of it. Rt keeps the pre-loss rate so the climb
+				 * has somewhere to aim. alpha is deliberately
+				 * untouched. */
+				uint32_t nr = (uint32_t)(((uint64_t)c->cc_rate
+						* g_dq_loss_mdf16) >> 16);
+
+				c->dq_target = c->cc_rate;
+				c->cc_rate = (nr > HPFT_MIN_LEVEL) ? nr : HPFT_MIN_LEVEL;
+				c->dq_stage = 0;
+				c->dq_t_rate = now;
+				c->dq_t_loss = now;
+				c->dq_n_loss++;
+			}
 		}
 		if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT) {
 			/* The RTT responder is the remote NIC's HW handler; its
