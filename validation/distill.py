@@ -346,6 +346,8 @@ def main(tag):
     # ---- health: application logs ----
     health_fail, gp = [], {}
     for k, r in enumerate(rows):
+        if r["cls"] == "meter":     # not a flow: the hidden bottleneck has no log
+            continue
         p = [x for x in os.listdir(R) if x.startswith(f"flow{k}_")]
         if not p:
             health_fail.append(f"row {k} no log"); continue

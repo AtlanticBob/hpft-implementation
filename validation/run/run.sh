@@ -187,7 +187,24 @@ echo "$T0" > "$OUT/t0.txt"
 # The meter's own band byte counter stays 0 under hw-offload, so do not read
 # drops from meter-stats; read them from NACKs (rp_*.jsonl) or the rate gap.
 METER_ROWS=$(echo "$ROWS" | awk '$4=="meter"')
-meter_set() { ssh -n -o BatchMode=yes "$RDPU" "sudo ovs-ofctl -O OpenFlow13 mod-meter ovsbr-p1 'meter=$((11+$1)),kbps,band=type=drop,rate=$2'" </dev/null; }
+meter_set() { # $1 = destination VF index, $2 = kbps
+  # Changing the band rate alone does NOT reach a datapath flow that is
+  # already installed - the rate binds when the megaflow is created, and
+  # with hw-offload an established flow keeps the old one. Measured
+  # 2026-09-02 on a live 48.9 G flow: mod-meter to 20 G left it at 48.9 G
+  # for the whole ten seconds that followed. Reinstalling the three
+  # OpenFlow rules invalidates the datapath entry and the new rate then
+  # takes hold inside one 100 ms bucket, in both directions.
+  local dip m; dip=$(ip_of "$RECV" "$1"); m=$((11+$1))
+  ssh -n -o BatchMode=yes "$RDPU" "
+    sudo ovs-ofctl -O OpenFlow13 mod-meter ovsbr-p1 'meter=$m,kbps,band=type=drop,rate=$2'
+    sudo ovs-ofctl -O OpenFlow13 del-flows ovsbr-p1 'udp,nw_dst=$dip,tp_dst=4791'
+    sudo ovs-ofctl -O OpenFlow13 del-flows ovsbr-p1 'tcp,nw_dst=$dip'
+    sudo ovs-ofctl -O OpenFlow13 del-flows ovsbr-p1 'ip,nw_dst=$dip'
+    sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=122,udp,nw_dst=$dip,tp_dst=4791,actions=meter:$m,NORMAL'
+    sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=121,tcp,nw_dst=$dip,actions=meter:$m,NORMAL'
+    sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=120,ip,nw_dst=$dip,actions=meter:$m,NORMAL'" </dev/null
+}
 # HPFT_RDMA_TRUST_STEP=0 freezes the RDMA executor's trust at zero (mailbox
 # 0xcce <step> 7 writes g_trust_step; 66 fxp16/epoch = (1-T)/1 s is the
 # default). That is the counterfactual arm: the executor then holds the wire
