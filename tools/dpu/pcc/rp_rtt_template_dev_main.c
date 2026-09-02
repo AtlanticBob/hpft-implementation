@@ -324,6 +324,9 @@ typedef struct {
 				 * upward (12% trust let 24 G through, measured)
 				 * and design v4 rejects it. */
 	volatile uint32_t qfrac;	/* fxp16: q/D_r from the sender agent */
+	volatile uint32_t start_win;	/* 1 while the agent says the flow-set is
+					 * in its start window (design v4 5.4):
+					 * loss is then not trust evidence */
 	volatile uint32_t loss_ts;	/* device us of the last NACK on this pair */
 	volatile uint32_t n_nack;	/* NACKs matched to this pair; 0 = never any,
 					 * which is what makes loss_ts readable */
@@ -663,7 +666,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 									c->last_rrx_used = erx; /* don't integrate on pre-change (stale) R */
 												}
 								c->remote_rx_rate = erx;
-								c->qfrac = etr;
+								c->qfrac = etr & 0xffffu;
+								c->start_win = (etr >> 16) & 1u;
 								c->trust_mode = (w == 4u);
 						}
 						fidx = -2;
@@ -686,7 +690,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 					c->qp_dip = 0;
 					c->qp_nslot = 0;
 					c->remote_rx_rate = erx;
-					c->qfrac = etr;
+					c->qfrac = etr & 0xffffu;
+								c->start_win = (etr >> 16) & 1u;
 					c->trust = 0;
 					c->loss_ts = 0;
 					c->n_nack = 0;
@@ -1410,7 +1415,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 					under = (qf == 0 &&
 						 (uint64_t)c->cc_rate * 65536u <
 						 (uint64_t)c->level * HPFT_TRUST_BELOW_FXP16);
-					lost = (under && c->n_nack &&
+					lost = (under && !c->start_win && c->n_nack &&
 						(uint32_t)(now - c->loss_ts) < HPFT_LOSS_WIN_US);
 					if (lost) {
 						/* evidence present: rise; at least

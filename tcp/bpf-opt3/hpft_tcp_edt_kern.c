@@ -66,6 +66,11 @@
  * bits = trust T in fxp16. The pair is shaped to clip(cc, (1-T)*rate,
  * rate) where cc is the flow-set's aggregate cwnd*mss/rtt_min (6.1). */
 #define HPFT_TRUST_FLAG 0x80000000U
+#define HPFT_START_FLAG 0x40000000U         /* flow-set still in its start
+                                             * window (design v4 5.4): its
+                                             * own first burst is what is
+                                             * being dropped, so loss is
+                                             * not evidence for the trust */
 #define HPFT_LINE_BPS 200000000000ULL
 #define HPFT_TRUST_EPOCH_NS 1000000ULL      /* trust updated once per ms */
 #define HPFT_TRUST_STEP 66ULL               /* fxp16 per ms = 1 ms / 1 s (tau_r) */
@@ -482,7 +487,8 @@ int hpft_tcp_edt(struct __sk_buff *skb)
                 __u32 now_ms = (__u32)(now / 1000000ULL);
                 int ours = state->shot_ms &&
                            now_ms - state->shot_ms < HPFT_SHOT_QUIET_MS;
-                int lost = !ours && state->loss_ns &&
+                int lost = !ours && !(cfg->flags & HPFT_START_FLAG) &&
+                           state->loss_ns &&
                            now - state->loss_ns < HPFT_LOSS_WIN_NS &&
                            cc_bps &&
                            cc_bps * 65536ULL < cfg->rate_bps * HPFT_TRUST_BELOW_FXP16;

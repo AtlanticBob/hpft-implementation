@@ -478,10 +478,12 @@ class PaceShim:
         self.sock.setblocking(False)
         self.sent = self.acked = self.errs = 0
 
-    def set_rate(self, src, dst, rate_bps, trust=None):
+    def set_rate(self, src, dst, rate_bps, trust=None, start=False):
         msg = {"src_vnic": src, "dst_vnic": dst, "rate_bps": int(rate_bps)}
         if trust is not None:
             msg["trust"] = round(float(trust), 4)
+        if start:
+            msg["start"] = 1        # §5.4 start window: loss is not evidence
         try:
             self.sock.sendto(json.dumps(msg).encode(), self.addr)
             self.sent += 1
@@ -724,8 +726,20 @@ def main():
     probe_cap_tree = bool(ep.get("probe_cap_tree", True))
     tree_period_s = float(ep.get("tree_period_ms", 100)) / 1e3
     v4_cap_mult = float(ep.get("r_cap_mult", 2.0))
-    v4_cap_floor = float(ep.get("r_cap_floor_bps", 2e9))
-    v4_floor = max(floor, float(ep.get("r_floor_bps", 1e9)))   # the RDMA executor misbehaves near zero
+    # §5.4: a flow-set starts at the port's headroom h*C - the capacity the
+    # receiver keeps free for transients - so a newcomer can never push the
+    # port past line rate even when everyone else is at their share, and it
+    # starts ABOVE any realistic share, so the ledger brings it down in ~D
+    # periods (the damped closed-loop regime) instead of the fence climbing
+    # from a floor at alpha_max (the open-loop regime, an order of magnitude
+    # slower over the same distance). The probe ceiling never sits below
+    # the start value. No absolute number: h and C are policy/platform.
+    v4_start = float(ep["headroom"]) * float(line)
+    v4_cap_floor = v4_start
+    # Absolute floor of the fence: the lowest rate the executor shapes
+    # correctly (platform quantity, §7) - below it the RDMA executor
+    # miscounts QPs and releases several times the budget when it rises.
+    v4_floor = max(floor, float(ep.get("r_floor_bps", 1e9)))
 
     def step_law(st, rec, now, fsid=""):
         if law == "conf_v3":
@@ -765,19 +779,22 @@ def main():
             if probe_cap_tree:
                 cap = min(cap, tree_of(fsid) * (1.0 + ep["delta_demand"]))
             if st.mode == "fresh":
-                # no rate feedback to start from: begin at the cap floor and
-                # probe. The silence starts at its cap, not at zero: a flow
-                # set that has never seen a queue has no evidence at all about
-                # where its share is, which is the maximum-uncertainty state
-                # and the one case where the largest step is the right one
-                # (§5.4). From zero the ramp would spend its first hundred
-                # feedbacks barely moving, and a cold start cannot then be
-                # done inside a second at any alpha.
-                st.R = min(st.R, v4_cap_floor)
+                # §5.4: start at the port's headroom (bounded by the local
+                # tree), not at a floor. The silence starts at its cap, not
+                # at zero: a flow-set that has never seen a queue has no
+                # evidence at all about where its share is, which is the
+                # maximum-uncertainty state and the one case where the
+                # largest step is the right one.
+                st.R = min(v4_start, tree_of(fsid), line)
                 st.below = int(v4_mmax)
                 st.mode = "v4"
-            if not st.enforced and (a_s is None or float(a_s)
-                                    <= max(st.R, v4_floor) * (1.0 + ep["delta_demand"])):
+            # The fence has taken hold once the flow-set's OWN measured send
+            # rate is within the fence. No measurement is not evidence of
+            # anything: latching on a_s == None (as this once did) declared
+            # the fence in force before the first sample and disabled the
+            # adoption rule below for the flow-set's whole life.
+            if not st.enforced and a_s is not None and float(a_s) \
+                    <= max(st.R, v4_floor) * (1.0 + ep["delta_demand"]):
                 st.enforced = True          # latched: the fence has taken hold
             # An empty ledger is a statement by the receiver that this
             # flow-set did NOT exceed its entitlement, so the rate it is
@@ -835,8 +852,12 @@ def main():
     # deliberately: a joiner that is already on the wire and drawing no
     # queue is a joiner whose fence can adopt that rate at once (5.2), and
     # that is what makes the join fast.
-    unknown_bps = float(ep.get("rdma_unknown_rate_bps") or 0) \
-        or max(floor, float(ep.get("r_floor_bps", 1e9)))
+    # §5.4: before its first budget a flow-set is admitted at the start
+    # value R0 = h*C. The RDMA executor shapes per QP and does not yet know
+    # which flow-set an unknown QP belongs to, so the per-QP allowance is R0
+    # divided by the QPs a flow-set is expected to open (a deployment
+    # quantity from the registry).
+    unknown_bps = v4_start / float(ep.get("rdma_qps_per_flowset", 4))
     _unk_units = mailbox._units(unknown_bps)
     _unk_sent = 0.0
     flowtags = {v["vnic_id"]: int(v["flowtag"], 16)
@@ -954,7 +975,8 @@ def main():
             # budget has not changed); the TCP path did not.
             if abs(pace - st.pace) > 0.005 * max(st.pace, 1.0) or tnow - st.shim_last >= tcp_refresh_s:
                 shim.set_rate(src, dst, pace,
-                              st.T if law in ("conf", "conf_v3") else None)   # T = queue fraction q/D_r
+                              st.T if law in ("conf", "conf_v3") else None,   # T = queue fraction q/D_r
+                              start=(law == "conf" and not st.enforced))
                 st.shim_last = tnow
         elif cls == "rdma":
             ft = pair_ft.get(src_dst, flowtags.get(src))
@@ -967,8 +989,12 @@ def main():
                 # sender tree (measured 2.6x the granted pace). The fix
                 # belongs where the error was - in the receiver's split -
                 # not in refusing to use its output.
+                # 4th word: queue fraction q/D_r in the low 16 bits; bit 16 =
+                # the flow-set is still in its start window (§5.4), during
+                # which the executor takes no loss evidence for the trust.
                 rdma_batch.append((ft, pace, r_bps,
-                                   st.T if law in ("conf", "conf_v3") else None))   # T = queue fraction
+                                   (st.T, law == "conf" and not st.enforced)
+                                   if law in ("conf", "conf_v3") else None))
         st.pace = pace
         # executor-escape tripwire (log-only). Every stress-D1 failure class
         # was a silent one: an unpaced EDT pair, an unmatched flowtag and a
@@ -1266,7 +1292,9 @@ def main():
                            * max(0.03 * rate, 2e5), 2e5)]
                 if tr is not None:
                     trust_mode = True
-                    ent.append(int(round(min(max(tr, 0.0), 1.0) * 65535)))
+                    qf, start = tr
+                    ent.append(int(round(min(max(qf, 0.0), 1.0) * 65535))
+                               | (0x10000 if start else 0))
                 entries.append(tuple(ent))
             mailbox.write_batch(entries, trust=trust_mode)
             last_rdma_push = now
