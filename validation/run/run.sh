@@ -23,7 +23,7 @@ DIR=$(cd "$(dirname "$0")" && pwd); VAL=$(cd "$DIR/.." && pwd); REPO=$(cd "$VAL/
 SCN=${1:?scenario}; TAG=${2:?tag}
 FLOWS="$VAL/scenarios/$SCN.flows"; [ -f "$FLOWS" ] || { echo "no such scenario: $FLOWS"; exit 1; }
 OUT="$VAL/results/$TAG"; mkdir -p "$OUT"
-PT=$HOME/hyperfront/perftest-26015/ib_write_bw
+PT=$HOME/hyperfront/perftest-enhanced/ib_write_bw
 RECV=sgpu02; RDPU=hpft-dpu2; WARM=5; QMTU=1024
 cd "$REPO"
 

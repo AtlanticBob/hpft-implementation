@@ -15,7 +15,7 @@
 9. 接收端 DPU 的 `hpft-vport-meter` 在跑、`vpm_sample.py` 在 hpft-dpu2:/tmp/。
 10. `bash tools/lab-infra/dpu_time_sync.sh apply && sleep 40 && bash tools/lab-infra/dpu_time_sync.sh status`：四台 DPU 的钟对齐到各自 host（偏差应在 ±2 ms 内）。DPU 镜像没有任何时间同步，钟差会让接收端和发送端日志的对比多出几十到几百毫秒的假滞后。
 11. 四台 host 的 iperf3 必须带 `--start-at` 补丁（源码 `~/hyperfront/iperf320`）。**这个选项不在 `--help` 里**，补丁只加了选项与解析、没加帮助文本，所以要这样查：`strings /usr/local/lib/libiperf.so.0 | grep start-at`。`run.sh` 开跑前会自己验一遍，缺了直接中止。
-12. V4 之前确认 perftest-26015 的 `--rate_limit 10` 在 1 个 QP 上确实压到 10 G；V6 之前确认四台 DPU 执行面能切 `0xccd 3`、三台发送端 BBR 模块可用。
+12. V4 之前确认 perftest-enhanced 的 `--rate_limit 10` 在 1 个 QP 上确实压到 10 G（RoCE 上硬件限速一定被拒，要在 stderr 上看到 "providing SW rate limit" 那行才算数）；V6 之前确认四台 DPU 执行面能切 `0xccd 3`、三台发送端 BBR 模块可用。
 
 ## 跑法
 

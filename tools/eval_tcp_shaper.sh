@@ -7,7 +7,7 @@
 # Assumes EDT already applied on dpu1vf0 (8G cap vf0->vf0) and RR server on 5353.
 set -u
 export PATH=/usr/sbin:$PATH
-PT=/home/zhaoxiang/hyperfront/perftest-26015/ib_write_bw   # unused
+PT=/home/zhaoxiang/hyperfront/perftest-enhanced/ib_write_bw   # unused
 RR=/home/zhaoxiang/hyperfront/hpft-implementation/tools/tcp_rr_client.py
 LABEL="${1:-variant}"
 DST=10.1.0.2

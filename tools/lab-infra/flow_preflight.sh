@@ -19,7 +19,7 @@
 #        four-node run probes each sender in turn.
 set -u
 REPO=/home/zhaoxiang/hyperfront/hpft-implementation
-PT=${PT:-$HOME/hyperfront/perftest-26015/ib_write_bw}
+PT=${PT:-$HOME/hyperfront/perftest-enhanced/ib_write_bw}
 PAIRS=$1
 SND=${2:-$(python3 -c "import json;print(json.load(open('$REPO/config/lab-registry.json'))['sender_host'])")}
 RCV=${3:-$(python3 -c "import json;print(json.load(open('$REPO/config/lab-registry.json'))['receiver_host'])")}

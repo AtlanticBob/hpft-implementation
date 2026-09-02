@@ -36,7 +36,7 @@ V1、V2、V4、V7 是每一版设计必跑的四个；V3、V5、V6 在它们过�
 | 交换机 ECN | `swp37s0` 绑 `motiv_default_ecn`（TC0/TC3 Kmin 400 KB / Kmax 1.6 MB / Pmax 20%）；预期 V1–V5 几乎不产生标记，标记数记入报告作旁证 |
 | 交换机流量类 | 不用：RDMA 与 TCP 同在 TC0，`swp37s0` 无 egress-scheduler |
 | 交换机 PFC 与 pause | lossy：四个 host 口绑 `motiv-nopfc`，pause 关 |
-| 打流器 | RDMA `~/hyperfront/perftest-26015/ib_write_bw`（带 `--start_at`，四台同一份），`-q 4 -m 1024 --report_gbits -D`；TCP 系统 iperf3（3.20 + 本地 `--start-at` 补丁，源码在 `~/hyperfront/iperf320`，四台已装），`-P 4 --start-at <绝对时刻> -J -B <ip>%dpu1vfN` |
+| 打流器 | RDMA `~/hyperfront/perftest-enhanced/ib_write_bw`（带 `--start_at`，四台同一份二进制；它还有 `--report-per-qp` 的每 QP 带宽时序，runner 目前没开），`-q 4 -m 1024 --report_gbits -D`；TCP 系统 iperf3（3.20 + 本地 `--start-at` 补丁，源码在 `~/hyperfront/iperf320`，四台已装），`-P 4 --start-at <绝对时刻> -J -B <ip>%dpu1vfN` |
 | 限速的 RDMA 行 | 两端都加 `-s 8192`。硬件限速被 QP 拒绝（PCC 执行面占着 QP 的速率），packet pacing 只支持 Raw Ethernet，所以只能用软件限速，而它按 `burst_size`（默认等于 tx_depth 128）条消息成批发送再忙等。默认的 64 KB 消息下一批 8.4 MB、每 6.71 ms 一次，20 ms 的遥测采样窗里只装得下三批，量化出 ±33% 的假抖动，任何事件都不可能在 ±10% 的带里待满一秒；8 KB 消息把批间隔压到 0.84 ms，实测归因速率的标准差从 17% 降到 2%。**不要改用调小 `burst_size` 的办法**：在途消息数掉到 8 时，新流填不满还在地板上的围栏，围栏的上限（自身用量的两倍）因此升不上去，整段只发出 0.26 G（r23）|
 | 起步纪律 | RDMA 不加 `--rate_limit`（V4 的需求限制除外）：HyperFront 执行面的未知流上限（每 QP 5 G）就是起步纪律，QP 被打死算一次失败 |
 | 时长与计时 | V1 20 s、V2 三段各 10 s；其余场景仍是 90 s（V5 为 60 s），未改。t=0 的流先预热 5 s 再开始计时；晚加入的流两类都按绝对时刻准点加入——RDMA 用 perftest `--start_at`，TCP 用 iperf3 `--start-at`。**这个选项不在 `--help` 里**——补丁只加了选项与解析，没加帮助文本，所以别用 `--help` 判断它在不在，查 `strings /usr/local/lib/libiperf.so.0 | grep start-at`。没有它 TCP 的首字节会比名义时刻晚 0.5–1.1 s（建链加参数交换），那段时间接收端一个字节都收不到。图和表只取计时后的部分 |

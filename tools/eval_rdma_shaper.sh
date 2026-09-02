@@ -7,7 +7,7 @@
 # Cap enforced via DOCA PCC on DPA; cap set through the receiver caps file the
 # rx_agent hot-reads (units = rate_bps/200e9 * 2^20). vf0 = mlx5_6 -> 10.1.0.2.
 set -u
-PT=/home/zhaoxiang/hyperfront/perftest-26015
+PT=/home/zhaoxiang/hyperfront/perftest-enhanced
 LDEV=mlx5_6; RDEV=mlx5_6; PEER=10.1.0.2; DSTIP=10.1.0.2
 CAP_G=${1:-8}
 LABEL="${2:-rdma}"

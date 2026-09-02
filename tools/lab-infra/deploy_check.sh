@@ -255,13 +255,13 @@ fi
 # asked for. Same for the perftest fork: absent on a host, that sender simply
 # contributes nothing.
 gen_sig() { # gen_sig <host> -> "<iperf3 version> <perftest present>"
-  local c='echo "$(iperf3 --version 2>/dev/null | head -1) | $(test -x '"$HOME"'/hyperfront/perftest-26015/ib_write_bw && echo perftest-ok || echo perftest-MISSING)"'
+  local c='echo "$(iperf3 --version 2>/dev/null | head -1) | $(test -x '"$HOME"'/hyperfront/perftest-enhanced/ib_write_bw && echo perftest-ok || echo perftest-MISSING)"'
   if [ "$1" = "$(hostname)" ]; then bash -c "$c"; else ssh -o BatchMode=yes "$1" "$c" 2>/dev/null; fi
 }
 ref=""
 for h in $HOSTS; do
   sig=$(gen_sig "$h")
-  case "$sig" in *MISSING*) echo "  MISSING  $h: perftest-26015 not installed"; bad=1 ;; esac
+  case "$sig" in *MISSING*) echo "  MISSING  $h: perftest-enhanced not installed"; bad=1 ;; esac
   if [ -z "$ref" ]; then ref=$sig; refh=$h
   elif [ "$sig" != "$ref" ]; then
     echo "  DIFFERS  $h traffic generators: $sig"

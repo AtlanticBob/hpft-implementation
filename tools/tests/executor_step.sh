@@ -10,7 +10,7 @@
 set -u
 DIR=$(cd "$(dirname "$0")" && pwd); REPO=$(cd "$DIR/../.." && pwd); cd "$REPO"
 OUT="$REPO/results/regression"; TAG=$1
-PT=$HOME/hyperfront/perftest-26015/ib_write_bw
+PT=$HOME/hyperfront/perftest-enhanced/ib_write_bw
 SND=sgpu01; SDPU=hpft-dpu; RCV=sgpu02; RDPU=hpft-dpu2
 FT=$(python3 -c "
 import json;r=json.load(open('config/lab-registry.json'))

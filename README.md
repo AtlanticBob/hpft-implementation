@@ -24,7 +24,7 @@ HPFT 在 BlueField-3 DPU 的边缘上用虚拟队列的差分标记，实现云�
 
 三个仓库是同一份 git 历史用 `git filter-repo` 切出来的，**必须放在同一个父
 目录下作兄弟目录**（`~/hyperfront/{hpft-implementation,hpft-design,hpft-paper}`）——
-大量脚本按绝对路径引用同级的 `~/hyperfront/perftest-26015`、`~/hyperfront/bfb`。
+大量脚本按绝对路径引用同级的 `~/hyperfront/perftest-enhanced`、`~/hyperfront/bfb`。
 
 | 仓库 | 内容 |
 |---|---|
