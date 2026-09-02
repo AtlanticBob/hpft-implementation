@@ -72,7 +72,7 @@ sender→receiver 都是直达隧道，spoke 之间经 hub 的 eswitch 硬件转
   （DOCA PCC device 码，跑在 DPA 上）：`cc_rate` 是 PCC 里自实现的 DCQCN 风格
   状态机（可切 ZTR / Swift），原样运行；执行面下发的是**限幅**
   $r=\operatorname{clip}(cc,\ (1-T)\cdot level,\ level)$——上界恒等于 level，
-  与信任度无关，所以租户拿不到超过份额的速率；下界随执行面自有的信任度 $T$ 放开，
+  与置信度无关，所以租户拿不到超过份额的速率；下界随执行面自有的置信度 $T$ 放开，
   而 $T$ 只在有丢包证据时上升。落在区间内时 $cc$ 一字不改。TCP 侧同一形态：
   `tcp/bpf-opt3/hpft_tcp_edt_kern.c` 读内核 CC 的 `snd_cwnd/minRTT`，同一限幅，
   落到 EDT 时间戳。两条对照臂仍在设备码里：`0xcca 1` 是旧的观测耦合
