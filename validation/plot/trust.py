@@ -13,7 +13,9 @@ import time
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-tag = sys.argv[1]; R = os.path.join(BASE, "results", tag)
+tag = sys.argv[1]
+base = sys.argv[2] if len(sys.argv) > 2 else tag.split("_")[0]  # 图名前缀；双臂场景用它区分臂
+R = os.path.join(BASE, "results", tag)
 t0 = float(open(os.path.join(R, "t0.txt")).read()); warm = float(open(os.path.join(R, "warm.txt")).read()); z = t0 + warm
 rows = [l.split() for l in open(os.path.join(R, "flows.txt")) if l.strip() and not l.startswith("#")]
 end = max(float(r[6]) for r in rows); events = sorted({float(r[5]) for r in rows} | {float(r[6]) for r in rows})
@@ -47,4 +49,4 @@ for e in events:
     if 0 < e < end:
         for a in ax: a.axvline(e, color="gray", lw=0.6, ls="--")
 ax[0].set_xlim(0, end); fig.suptitle(f"{tag}: executor trust and the CC next to the fence    drawn {time.strftime('%Y-%m-%d %H:%M:%S')}"); fig.tight_layout()
-fig.savefig(os.path.join(BASE, "fig", f"{tag.split('_')[0]}_trust.png"), dpi=130); print("ok")
+fig.savefig(os.path.join(BASE, "fig", f"{base}_trust.png"), dpi=130); print("ok")

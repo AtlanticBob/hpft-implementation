@@ -101,9 +101,28 @@ def external_at(rows, t):
 
 
 
+def meter_at(rows, t):
+    """{dst vf: bps} for every hidden bottleneck in force at t (class=meter).
+
+    A meter row lowers the receiver-side OVS drop meter on one VF while the
+    registry keeps saying 50 G, so the ledger never learns the path got
+    narrower - it only sees the arrivals that survived. The policy share is
+    therefore still computed the usual way and then CAPPED here: what a
+    flow-set can be expected to deliver is the smaller of its share and what
+    the path can carry."""
+    out = {}
+    for r in rows:
+        if r["cls"] == "meter" and r["start"] <= t < r["end"]:
+            m = re.match(r"gbps=(\d+(?:\.\d+)?)", r["opt"])
+            if m:
+                out[r["dv"]] = float(m.group(1)) * 1e9
+    return out
+
+
 def expected_at(rows, t):
     """{fsid: expected Gb/s} at experiment time t: root -> VM -> class -> flow-set,
-    equal weights, VM cap, demand caps from rate_limit options (per QP)."""
+    equal weights, VM cap, demand caps from rate_limit options (per QP), and
+    the hidden per-VF caps of any class=meter row in force."""
     act = [r for r in rows if r["start"] <= t < r["end"] and r["cls"] in ("rdma", "tcp")]
     if not act:
         return {}
@@ -126,6 +145,10 @@ def expected_at(rows, t):
         vms.setdefault(r["dv"], {}).setdefault(r["cls"], []).append(r["fsid"])
     cls_dem = {(v, c): sum(dem[f] for f in fs) for v, cs in vms.items() for c, fs in cs.items()}
     vm_dem = {v: min(VM_CAP, sum(cls_dem[(v, c)] for c in cs)) for v, cs in vms.items()}
+    hidden = meter_at(rows, t)          # vms is keyed by the destination VF index
+    for v, cap in hidden.items():
+        if v in vm_dem:
+            vm_dem[v] = min(vm_dem[v], cap)
     vm_alloc = waterfill(root, vm_dem)
     out = {}
     for v, cs in vms.items():

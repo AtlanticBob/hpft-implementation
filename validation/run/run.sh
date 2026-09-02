@@ -49,7 +49,9 @@ rl_size() { case "$1" in rate_limit=*) echo "-s 8192" ;; esac; }
 
 # ---- the flow table -------------------------------------------------------
 ROWS=$(grep -vE '^\s*(#|$)' "$FLOWS")
-SENDERS=$(echo "$ROWS" | awk '{print $1}' | sort -u | tr '\n' ' ')
+# class=meter is not a flow: it is the hidden bottleneck (README V8), applied
+# on the RECEIVER's DPU, so it must not turn its host column into a sender.
+SENDERS=$(echo "$ROWS" | awk '$4!="meter"{print $1}' | sort -u | tr '\n' ' ')
 END=$(echo "$ROWS" | awk 'BEGIN{m=0}{if($7>m)m=$7}END{print m}')
 cp "$FLOWS" "$OUT/flows.txt"; echo "$WARM" > "$OUT/warm.txt"
 
@@ -175,6 +177,40 @@ if echo "$ROWS" | awk '{print $4}' | grep -q '^udp$'; then
 fi
 T0=$(python3 -c "import time;print(int(time.time())+20)")
 echo "$T0" > "$OUT/t0.txt"
+
+# ---- the hidden bottleneck and the trust arm (README V8) ------------------
+# A class=meter row lowers the receiver-side OVS drop meter on one VF for a
+# window while the registry keeps saying 50 G. The ledger never learns the
+# path got narrower - it only sees the arrivals that survived - which is
+# exactly the "bottleneck the receiver cannot model" that the trust rule of
+# design v4 6.3 exists for. Excess is dropped, so the tenant CC sees loss.
+# The meter's own band byte counter stays 0 under hw-offload, so do not read
+# drops from meter-stats; read them from NACKs (rp_*.jsonl) or the rate gap.
+METER_ROWS=$(echo "$ROWS" | awk '$4=="meter"')
+meter_set() { ssh -n -o BatchMode=yes "$RDPU" "sudo ovs-ofctl -O OpenFlow13 mod-meter ovsbr-p1 'meter=$((11+$1)),kbps,band=type=drop,rate=$2'" </dev/null; }
+# HPFT_RDMA_TRUST_STEP=0 freezes the RDMA executor's trust at zero (mailbox
+# 0xcce <step> 7 writes g_trust_step; 66 fxp16/epoch = (1-T)/1 s is the
+# default). That is the counterfactual arm: the executor then holds the wire
+# at the fence whatever the tenant CC wants. The TCP executor's step is a
+# compile-time constant, so this switch does NOT freeze TCP's trust.
+TSTEP=${HPFT_RDMA_TRUST_STEP:-66}
+cleanup() {
+  [ -n "$METER_ROWS" ] && echo "$METER_ROWS" | while read -r _ _ dv _; do meter_set "$dv" 50000000 >/dev/null 2>&1; done
+  [ "$TSTEP" = 66 ] || for h in $SENDERS; do ssh -n -o BatchMode=yes "$(dpu_of $h)" "echo '0xcce 66 7' > /tmp/rp_fifo" </dev/null 2>/dev/null; done
+  return 0
+}
+trap cleanup EXIT
+for h in $SENDERS; do ssh -n -o BatchMode=yes "$(dpu_of $h)" "echo '0xcce $TSTEP 7' > /tmp/rp_fifo" </dev/null 2>/dev/null || true; done
+echo "rdma trust step = $TSTEP (default 66; 0 = trust frozen at zero)" | tee "$OUT/trust_arm.txt"
+if [ -n "$METER_ROWS" ]; then
+  : > "$OUT/hidden_meter.txt"
+  while read -r _ _ dv _ _ st en opt; do
+    g=${opt#gbps=}; at=$((T0+WARM+st))
+    echo "vf$dv -> $g G from ${st}s to ${en}s (registry unchanged at 50 G)" | tee -a "$OUT/hidden_meter.txt"
+    ( d=$((at - $(date +%s))); [ "$d" -gt 0 ] && sleep "$d"
+      meter_set "$dv" $((g*1000000)); sleep $((en-st)); meter_set "$dv" 50000000 ) 9>&- >/dev/null 2>&1 &
+  done <<<"$METER_ROWS"
+fi
 # executor-state samplers for the whole run: TCP trust from the BPF map on
 # every sender host (100 ms), RDMA pair state from the device on every
 # sender DPU (1 s, one mailbox query per active pair)
@@ -194,6 +230,7 @@ for h in $SENDERS; do
 done
 k=0; SRV=""
 while read -r sh sv dv cls n st en opt; do
+  [ "$cls" = meter ] && { k=$((k+1)); continue; }
   dur=$((en-st)); off=$((WARM+st)); [ "$st" -eq 0 ] && { dur=$((en+WARM)); off=0; }
   if [ "$cls" = rdma ]; then
     SRV+="setsid nohup $PT -d $(dev_of $RECV $dv) -q $n -m $QMTU $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) >/tmp/val_s$k.log 2>&1 </dev/null & "
@@ -210,6 +247,7 @@ timeout 15 ssh -n -o BatchMode=yes "$RDPU" "rm -f /tmp/vpm_series.csv; nohup pyt
 declare -A CLI
 k=0
 while read -r sh sv dv cls n st en opt; do
+  [ "$cls" = meter ] && { k=$((k+1)); continue; }
   dur=$((en-st)); off=$((WARM+st)); [ "$st" -eq 0 ] && { dur=$((en+WARM)); off=0; }
   dip=$(ip_of $RECV $dv); sip=$(ip_of $sh $sv)
   extra=""
@@ -255,6 +293,7 @@ scp -q "$RDPU:/tmp/hpft_rxagent_e.jsonl" "$OUT/rx.jsonl"
 for h in $SENDERS; do scp -q "$(dpu_of $h):/tmp/hpft_txagent_e.jsonl" "$OUT/tx_$h.jsonl" 2>/dev/null || true; done
 k=0
 while read -r sh sv dv cls n st en opt; do
+  [ "$cls" = meter ] && { k=$((k+1)); continue; }
   if [ "$sh" = "$(hostname)" ]; then cp /tmp/val_c$k.log "$OUT/flow${k}_${sh}vf${sv}_to_vf${dv}_${cls}.log"; else scp -q "$sh:/tmp/val_c$k.log" "$OUT/flow${k}_${sh}vf${sv}_to_vf${dv}_${cls}.log"; fi
   k=$((k+1))
 done <<<"$ROWS"

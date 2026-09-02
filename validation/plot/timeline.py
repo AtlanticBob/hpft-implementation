@@ -18,6 +18,7 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
 from distill import load_flows, expected_at, C_ROOT, bin_mean
 tag = sys.argv[1]
+base = sys.argv[2] if len(sys.argv) > 2 else tag.split("_")[0]  # 图名前缀；双臂场景用它区分臂
 R = os.path.join(BASE, "results", tag); D = os.path.join(BASE, "data")
 rows = load_flows(os.path.join(R, "flows.txt"))
 t0 = float(open(os.path.join(R, "t0.txt")).read()); warm = float(open(os.path.join(R, "warm.txt")).read())
@@ -74,4 +75,4 @@ ax[0].set_xlim(0, end)
 fig.suptitle(f"{tag}: {len(rows)} flow-sets    drawn {time.strftime('%Y-%m-%d %H:%M:%S')}")
 fig.tight_layout()
 os.makedirs(os.path.join(BASE, "fig"), exist_ok=True)
-fig.savefig(os.path.join(BASE, "fig", f"{tag.split('_')[0]}_timeline.png"), dpi=130); print("ok")
+fig.savefig(os.path.join(BASE, "fig", f"{base}_timeline.png"), dpi=130); print("ok")

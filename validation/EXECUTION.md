@@ -15,7 +15,8 @@
 9. 接收端 DPU 的 `hpft-vport-meter` 在跑、`vpm_sample.py` 在 hpft-dpu2:/tmp/。
 10. `bash tools/lab-infra/dpu_time_sync.sh apply && sleep 40 && bash tools/lab-infra/dpu_time_sync.sh status`：四台 DPU 的钟对齐到各自 host（偏差应在 ±2 ms 内）。DPU 镜像没有任何时间同步，钟差会让接收端和发送端日志的对比多出几十到几百毫秒的假滞后。
 11. 四台 host 的 iperf3 必须带 `--start-at` 补丁（源码 `~/hyperfront/iperf320`）。**这个选项不在 `--help` 里**，补丁只加了选项与解析、没加帮助文本，所以要这样查：`strings /usr/local/lib/libiperf.so.0 | grep start-at`。`run.sh` 开跑前会自己验一遍，缺了直接中止。
-12. V4 之前确认 perftest-enhanced 的 `--rate_limit 10` 在 1 个 QP 上确实压到 10 G（RoCE 上硬件限速一定被拒，要在 stderr 上看到 "providing SW rate limit" 那行才算数）；V6 之前确认四台 DPU 执行面能切 `0xccd 3`、三台发送端 BBR 模块可用。
+12. V8 之前确认接收端 sgpu02 的 vf0/vf1 两个 meter 是 50 G（`vf_caps.sh status`），并且 `sgpu01` 的 vf0、vf1 这两对在场景里跑得熟——**不要拿没接好的 VF 做这个实验**：在 vf5 上试过，接收端算出了入场额 25 G，而发送端 agent 的 Ehat = 0、围栏停在 2 G 地板、RDMA 执行面里根本没有这个 pair 的条目，四条 QP 走"未知流"兜底额度跑到 19.36 G，是围栏的 9 倍，围栏完全没生效。
+13. V4 之前确认 perftest-enhanced 的 `--rate_limit 10` 在 1 个 QP 上确实压到 10 G（RoCE 上硬件限速一定被拒，要在 stderr 上看到 "providing SW rate limit" 那行才算数）；V6 之前确认四台 DPU 执行面能切 `0xccd 3`、三台发送端 BBR 模块可用。
 
 ## 跑法
 
@@ -25,8 +26,20 @@ python3 validation/distill.py V2_conf_20260901_rep1
 python3 validation/plot/timeline.py V2_conf_20260901_rep1
 ```
 
+V8 有两条臂，图名要分开（`timeline.py`/`trust.py` 的第二个参数就是图名前缀）：
+
+```
+bash validation/run/run.sh V8_hidden_bottleneck V8a_<tag>            # 臂 A：信任开
+HPFT_RDMA_TRUST_STEP=0 \
+  bash validation/run/run.sh V8_hidden_bottleneck V8b_<tag>          # 臂 B：信任冻结在零
+python3 validation/plot/timeline.py V8a_<tag> V8a
+python3 validation/plot/trust.py    V8b_<tag> V8b
+```
+
+runner 自己在窗口起止时改接收端的 meter、跑完恢复 50 G，EXIT 陷阱保证异常中止也会恢复；臂 B 结束时把 `g_trust_step` 写回 66。跑完核对 `results/<tag>/hidden_meter.txt` 与 `trust_arm.txt` 是不是这次要的值。
+
 每跑完一个场景停下汇报，再跑下一个。
 
 ## 复原
 
-V6 之后把执行面切回 `0xccd 0`、iperf3 不再带 `-C bbr`。其余场景不改任何常设配置，不需要复原。
+V6 之后把执行面切回 `0xccd 0`、iperf3 不再带 `-C bbr`。V8 的两样东西 runner 自己收尾（接收端 meter 回 50 G、`g_trust_step` 回 66），但跑完还是核一眼 `bash tools/lab-infra/vf_caps.sh status`，四台的八个 meter 都该是 50000000 kbps。其余场景不改任何常设配置，不需要复原。
