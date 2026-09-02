@@ -1,0 +1,6 @@
+criterion,pass,detail
+1 稳态贴合,PASS,ok
+2 队列消得掉,PASS,ok
+3 收敛 ≤ 1 s,FAIL,30s tcp x12 1610 ms
+4 不塌,PASS,ok
+5 平台健康,PASS,ok

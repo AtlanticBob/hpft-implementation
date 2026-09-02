@@ -6,7 +6,7 @@
 
 1. `bash tools/lab-infra/deploy_check.sh --deploy`：四台 DPU 与 host 上的代码和仓库一致，agent 健康。
 2. `bash tools/lab_env.sh status` 应显示 environment: HPFT（四台 UPCC=1、doca_pcc 在跑、overlay 在）；不是就 `bash tools/lab_env.sh hpft`。
-3. `bash tools/cc_mode.sh sr`：四台 host 的 ROCE_ACCL selective_repeat_forced_en=1（易失，fw reset 后归零）。**这一步至今没有被真正执行过**——到 2026-09-01 为止每一次验证运行的 `env_status.txt` 都是 `SR current=0`，也就是 GBN，而 README 的环境表写的是 SR。两者必须对齐：要么开跑前真的切 SR，要么把环境表改成 GBN。在定下来之前，每次运行的实际重传模式记在 `results/<tag>/retrans_mode.txt`，报告里的环境表不要直接采信。
+3. `bash tools/cc_mode.sh sr`：四台 host 的 ROCE_ACCL `selective_repeat_forced_en=1`。**所有 HPFT 实验一律跑 SR**，这一步不是可选项。寄存器易失，fw reset / Arm 重启后归零。`run.sh` 会逐台复核并在不满足时中止，所以漏做只会让运行失败，不会静默跑成 GBN。查看用 `mlxreg --reg_name ROCE_ACCL --get`，**不要看 `lab_env.sh status` 的 `SR current=`**（那是 mlxconfig 的另一个开关，本 lab 永远为 0）。
 4. `bash tools/lab-infra/vf_caps.sh sync`：32 个 VF 的 50 G 双端限速。
 5. `bash tools/lab-infra/roles.sh set --receiver sgpu02 --senders sgpu01,sgpu03,sgpu04`。
 6. 四台 host 每个 VF 的 TCP 执行面恰好一份当前程序：`tc filter show dev dpu1vfN egress` 只有一个 handle，tag 与仓库一致（`tools/host/edt_ensure.sh` 会自动纠正）。

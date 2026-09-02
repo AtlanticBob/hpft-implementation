@@ -110,9 +110,23 @@ done
 # specify SR. Read the retransmission line below before trusting a report's
 # environment table.
 bash tools/lab_env.sh status > "$OUT/env_status.txt" 2>&1
-sr=$(grep -o "SR current=[01]" "$OUT/env_status.txt" | head -1 | tr -d ' ')
-echo "retransmission: $([ "$sr" = "SRcurrent=1" ] && echo SR || echo GBN)  ($sr)" \
-  | tee "$OUT/retrans_mode.txt"
+# The SR column in that status line is mlxconfig RDMA_SELECTIVE_REPEAT_EN, and
+# it is permanently 0 here because that knob needs a fw reset and the lab uses
+# the other mechanism: the volatile ROCE_ACCL register selective_repeat_forced_en,
+# which cc_mode.sh sets in a second. Reading the mlxconfig field to decide "is
+# this run SR" is a category error - it cannot distinguish SR from GBN at all.
+# Every HPFT experiment is specified to run on SR, so read the register that
+# actually decides it, record it, and refuse to run without it.
+for h in $RECV $SENDERS; do
+  bdf=$(python3 -c "
+import json
+tcp=json.load(open('config/lab-tcp-registry.json'))
+print({v['host']: v['pf_bdf'] for v in tcp['vnics']}.get('$h','0000:38:00.1').replace('0000:',''))")
+  v=$(on_host "$h" "sudo mlxreg -y -d $bdf --reg_name ROCE_ACCL --get 2>/dev/null | awk '/selective_repeat_forced_en/{print \$NF}'" | head -1)
+  echo "$h $bdf $v" >> "$OUT/retrans_mode.txt"
+  [ "$v" = "0x00000001" ] || { echo "ABORT: $h is not on selective repeat (ROCE_ACCL=$v). Run: bash tools/cc_mode.sh sr"; exit 1; }
+done
+echo "retransmission: SR (ROCE_ACCL selective_repeat_forced_en=1 on $RECV $SENDERS)" | tee -a "$OUT/retrans_mode.txt"
 bash tools/lab-infra/roles.sh set --receiver "$RECV" --senders "$(echo $SENDERS | tr ' ' ',')" >/dev/null
 sleep 4
 for h in $RECV $SENDERS; do on_host "$h" 'pkill -f "ib_write_b[w]" 2>/dev/null; pkill -x iperf3 2>/dev/null; true'; done
