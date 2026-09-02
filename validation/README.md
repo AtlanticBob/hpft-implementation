@@ -30,7 +30,7 @@ V1、V2、V4、V7 是每一版设计必跑的四个；V3、V5、V6 在它们过�
 | HyperFront | 四台都在 `lab_env.sh hpft` 态：UPCC=1，四台 DPU 跑本仓库的 PCC 执行面；`roles.sh set --receiver sgpu02 --senders sgpu01,sgpu03,sgpu04`；TCP 执行面 host fq+EDT，每个 VF 恰好挂一份当前程序 |
 | 被测对象 | `config/lab-registry.json` 的 `e_params`（law 与参数），每次运行原样记入报告 |
 | 政策 | 每个 VM 权重 1、`max_rate_bps` 50 G、类权重 tcp:rdma = 1:1、per-sender 权重全 1；headroom 8% 只作用在根上：根容量 C′ = 200 × 0.92 = 184 G，每 VM 上限就是 50 G（四个 VM 同时满发时根先绑定，各得 46 G） |
-| RDMA 拥塞控制 | PCC 执行面里的 DCQCN 风味项（`0xccd 0`），只读速率不改 CC；V6 换 Swift 项（`0xccd 3`） |
+| RDMA 拥塞控制 | PCC 执行面里的一项，只读速率不改 CC。邮箱 `0xccd` 选：**0 = AIMD、1 = ZTR、2 = DCQCN RP 状态机、3 = Swift**；启动路径里没有任何地方写 `0xccd`，所以缺省跑的是设备码的编译期默认值 **2**。**四项里只有 ZTR 和 Swift 对 NACK 降速**（Swift 无条件，ZTR 还要求时延 ≥ 70 µs），AIMD 与 DCQCN 都是 CNP 驱动、把 NACK 记下就算完——这一点决定了 V8 能不能测到东西。V6 换 Swift（`0xccd 3`）。**设备端目前没有这一项的回读，runner 也不记它**，所以报告里这一格是照本文抄的，没有校验 |
 | RDMA 重传 | **SR，所有 HPFT 实验一律如此**（evaluation 与 validation 都算）。机制是 ROCE_ACCL 寄存器 `selective_repeat_forced_en=1`，`cc_mode.sh sr` 秒切，**易失**——fw reset 或 Arm 重启后归零，要重设。`run.sh` 开跑前逐台读这个寄存器，不是 1 就中止，并把实测值写进 `results/<tag>/retrans_mode.txt`。**不要看状态行里的 `SR current=`**：那读的是 mlxconfig `RDMA_SELECTIVE_REPEAT_EN`，本 lab 永远是 0（那条路要 fw reset，我们不用），它分不出 SR 和 GBN |
 | TCP 拥塞控制 | Cubic，不开 ECN（`tcp_ecn=2`）；V6 换 BBR |
 | MTU | VF 1500，p1 9000；RoCE 路径 MTU 1024（perftest 两端 `-m 1024`） |
