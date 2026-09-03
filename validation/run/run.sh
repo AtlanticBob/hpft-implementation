@@ -289,11 +289,31 @@ while read -r sh sv dv cls n st en opt; do
     gbps=*)       extra="${opt#gbps=}" ;;
   esac
   if [ "$cls" = rdma ]; then
-    cmd="setsid nohup $PT -d $(dev_of $sh $sv) -q $n -m $QMTU $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) $extra $dip >/tmp/val_c$k.log 2>&1 </dev/null & "
+    # A late RDMA row is launched 5 s before its start (perftest's setup -
+    # connect, get_cpu_mhz - takes well under a second), for the same
+    # reason as the TCP rows below: its idle control connection would
+    # otherwise count as a live TCP flow-set at the receiver for the whole
+    # wait (V9, 2026-09-02).
+    if [ "$st" -gt 0 ]; then
+      cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-5-time.time()))\"; $PT -d $(dev_of $sh $sv) -q $n -m $QMTU $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) $extra $dip' >/tmp/val_c$k.log 2>&1 </dev/null & "
+    else
+      cmd="setsid nohup $PT -d $(dev_of $sh $sv) -q $n -m $QMTU $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) $extra $dip >/tmp/val_c$k.log 2>&1 </dev/null & "
+    fi
   elif [ "$cls" = udp ]; then
     cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-time.time()))\"; /tmp/udp_blast -c $dip -p $((5900+k)) -B $sip -G $extra -t $dur' >/tmp/val_c$k.log 2>&1 </dev/null & "
   else
-    cmd="setsid nohup iperf3 -B $sip%dpu1vf$sv -c $dip -p $((5600+k)) -P $n -t $dur --start-at $((T0+off)) -J $extra >/tmp/val_c$k.log 2>&1 </dev/null & "
+    # A late TCP row is launched 3 s before its start, not at T0: iperf3
+    # opens its control connection at launch, and a control connection that
+    # then idles for tens of seconds was closed by the far end a few seconds
+    # into the data phase (V2 one-class, 2026-09-03: "control socket has
+    # closed unexpectedly" at +4.5 s after a 45 s idle). The receiver also
+    # sees that idle connection as a live TCP flow-set and halves the VM's
+    # class split around it (V9, 2026-09-02). 3 s covers iperf3's setup.
+    if [ "$st" -gt 0 ]; then
+      cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-3-time.time()))\"; iperf3 -B $sip%dpu1vf$sv -c $dip -p $((5600+k)) -P $n -t $dur --start-at $((T0+off)) -J $extra' >/tmp/val_c$k.log 2>&1 </dev/null & "
+    else
+      cmd="setsid nohup iperf3 -B $sip%dpu1vf$sv -c $dip -p $((5600+k)) -P $n -t $dur --start-at $((T0+off)) -J $extra >/tmp/val_c$k.log 2>&1 </dev/null & "
+    fi
   fi
   CLI[$sh]+="$cmd"
   k=$((k+1))

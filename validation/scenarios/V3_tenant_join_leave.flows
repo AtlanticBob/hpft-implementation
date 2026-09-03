@@ -1,4 +1,5 @@
 # src_host src_vf dst_vf class count start_s end_s options   (dst host = sgpu02; times on the experiment clock, after the 5 s warm-up)
+# 一次事件只动一类流（2026-09-02 起）：新租户 sgpu02/vf4–7 的 RDMA 20 s 加入，TCP 40 s 加入；TCP 60 s 退出，RDMA 80 s 退出。
 sgpu01 0 0 rdma 4 0 90 -
 sgpu01 0 0 tcp 4 0 90 -
 sgpu01 1 1 rdma 4 0 90 -
@@ -7,11 +8,11 @@ sgpu01 2 2 rdma 4 0 90 -
 sgpu01 2 2 tcp 4 0 90 -
 sgpu01 3 3 rdma 4 0 90 -
 sgpu01 3 3 tcp 4 0 90 -
-sgpu03 4 4 rdma 4 30 60 -
-sgpu03 4 4 tcp 4 30 60 -
-sgpu03 5 5 rdma 4 30 60 -
-sgpu03 5 5 tcp 4 30 60 -
-sgpu03 6 6 rdma 4 30 60 -
-sgpu03 6 6 tcp 4 30 60 -
-sgpu03 7 7 rdma 4 30 60 -
-sgpu03 7 7 tcp 4 30 60 -
+sgpu03 4 4 rdma 4 20 80 -
+sgpu03 5 5 rdma 4 20 80 -
+sgpu03 6 6 rdma 4 20 80 -
+sgpu03 7 7 rdma 4 20 80 -
+sgpu03 4 4 tcp 4 40 60 -
+sgpu03 5 5 tcp 4 40 60 -
+sgpu03 6 6 tcp 4 40 60 -
+sgpu03 7 7 tcp 4 40 60 -
