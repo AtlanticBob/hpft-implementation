@@ -42,7 +42,7 @@ V1、V2、V4、V7 是每一版设计必跑的四个；V3、V5、V6 在它们过�
 | 限速的 RDMA 行 | 两端都加 `-s 8192`。硬件限速被 QP 拒绝（PCC 执行面占着 QP 的速率），packet pacing 只支持 Raw Ethernet，所以只能用软件限速，而它按 `burst_size`（默认等于 tx_depth 128）条消息成批发送再忙等。默认的 64 KB 消息下一批 8.4 MB、每 6.71 ms 一次，20 ms 的遥测采样窗里只装得下三批，量化出 ±33% 的假抖动，任何事件都不可能在 ±10% 的带里待满一秒；8 KB 消息把批间隔压到 0.84 ms，实测归因速率的标准差从 17% 降到 2%。**不要改用调小 `burst_size` 的办法**：在途消息数掉到 8 时，新流填不满还在地板上的围栏，围栏的上限（自身用量的两倍）因此升不上去，整段只发出 0.26 G（r23）|
 | 起步纪律 | RDMA 不加 `--rate_limit`（V4 的需求限制除外）：HyperFront 执行面在第一个预算前的放行额度（design v4 §5.4，$R_0/$每流集合预期 QP 数 = 每 QP 4 G）就是起步纪律，QP 被打死算一次失败。**晚加入的行在起点前几秒才启动打流器**（TCP 3 s、RDMA 5 s，runner 自动做）：早启动的打流器会先建好控制连接空等几十秒，iperf3 的控制连接会在数据开始后被对端关掉，perftest/iperf3 的空闲控制连接还会被接收端算作在场的 TCP 流集合 |
 | 时长与计时 | V1 20 s、V2 与 V6 五段各 10 s（RDMA 加入退出、TCP 加入退出各占一段）；其余场景仍是 90 s（V5 为 60 s）。**一次事件只动一类流**：任何加入/退出事件只改变 RDMA 或 TCP 中的一类，两类分开成前后两个事件。t=0 的流先预热 5 s 再开始计时；晚加入的流两类都按绝对时刻准点加入——RDMA 用 perftest `--start_at`，TCP 用 iperf3 `--start-at`。**这个选项不在 `--help` 里**——补丁只加了选项与解析，没加帮助文本，所以别用 `--help` 判断它在不在，查 `strings /usr/local/lib/libiperf.so.0 | grep start-at`。没有它 TCP 的首字节会比名义时刻晚 0.5–1.1 s（建链加参数交换），那段时间接收端一个字节都收不到。图和表只取计时后的部分 |
-| 重复 | 每个场景每版设计跑 1 遍出结论；作为定版依据的场景跑 3 遍，收敛时间报 min/median/max |
+| 重复 | 每个场景每版设计跑 1 遍出结论；作为定版依据的场景跑 3 遍，收敛时间报 min/median/max，图取三遍的逐点平均画成一张 |
 
 ## 三、测量与判据
 
@@ -309,7 +309,7 @@ validation/
   scenarios/           每个场景一个 .flows 打流表（runner 与本文表格的同一来源，render_table.py 把它渲染成表）
   run/                 run.sh <场景> <tag>：准备、准点打流、采集三路数据、跑后快照
   distill.py           results/<tag>/ → data/<tag>_*.csv（每 VM 每类 100 ms 速率、每流集合 goodput、遥测抽样、判据结果）
-  plot/                只读 data/、只写 fig/
+  plot/                只读 data/、只写 fig/；跑三遍的场景把三个 tag 用逗号连起来传给 timeline.py / trust.py，按时间对齐取平均，只出一张图（标题列出参与的 tag），不留三张
   data/  fig/          蒸馏数据与图（入 git）
   results/<tag>/       原始数据（不入 git）：vpm 序列、每流日志、agent jsonl、置信度快照、交换机/CNP 计数、当次 registry 副本
   reports/<tag>.md     每次运行的报告：环境表实际取值、被测 e_params、预期 vs 实测、五条判据逐条判定
