@@ -17,6 +17,8 @@ HPFT 在 BlueField-3 DPU 的边缘上用虚拟队列的差分标记，实现云�
 | lab 长什么样、怎么跑一场实验 | **本文**的"现在的系统"与"怎么跑实验" |
 | 动 lab 之前不能不知道的坑 | 本文"硬性规则" + `hpft-design/docs/ops_notes.md` |
 | 参数为什么取这个值、换规模怎么重新定 | `hpft-design/docs/design_theory_v4.md` |
+| 设计的每一条落在哪个文件、实现与设计的已知差异、开关 | `docs/IMPLEMENTATION.md`（随实现更新） |
+| 本平台量出来的数字与环境事实 | `hpft-design/docs/platform_notes.md` |
 | 论文评估要跑哪些实验 | `hpft-paper/paper/evaluation_plan.md` |
 
 改代码之前**不需要**通读设计文档：`config/lab-registry.json` 是唯一真值配置，

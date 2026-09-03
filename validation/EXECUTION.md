@@ -26,28 +26,28 @@ python3 validation/distill.py V2_conf_20260901_rep1
 python3 validation/plot/timeline.py V2_conf_20260901_rep1
 ```
 
-V8 有两条臂，图名要分开（`timeline.py`/`trust.py` 的第二个参数就是图名前缀）：
+V8 有两个配置，图名要分开（`timeline.py`/`trust.py` 的第二个参数就是图名前缀）：
 
 ```
-bash validation/run/run.sh V8_hidden_bottleneck V8a_<tag>            # 臂 A：置信度开
+bash validation/run/run.sh V8_hidden_bottleneck V8a_<tag>            # 配置 A：置信度开
 HPFT_RDMA_TRUST_STEP=0 \
-  bash validation/run/run.sh V8_hidden_bottleneck V8b_<tag>          # 臂 B：置信度冻结在零
+  bash validation/run/run.sh V8_hidden_bottleneck V8b_<tag>          # 配置 B：置信度冻结在零
 bash validation/run/run.sh V8_hidden_bottleneck_tcp V8t_<tag>        # TCP 版：vf0 跑 TCP
 python3 validation/plot/timeline.py V8a_<tag> V8a
 python3 validation/plot/trust.py    V8b_<tag> V8b
 ```
 
-V9 同样两条臂，对照的开关换成到期步长（README §四 V9）：
+V9 同样两个配置，对照的开关换成到期步长（README §四 V9）：
 
 ```
-bash validation/run/run.sh V9_trust_exit V9a_<tag>                   # 臂 A：过期项开（默认）
+bash validation/run/run.sh V9_trust_exit V9a_<tag>                   # 配置 A：过期项开（默认）
 HPFT_RDMA_TRUST_DECAY=0 \
-  bash validation/run/run.sh V9_trust_exit V9b_<tag>                 # 臂 B：过期项关（旧规则对照）
+  bash validation/run/run.sh V9_trust_exit V9b_<tag>                 # 配置 B：过期项关（旧规则对照）
 python3 validation/plot/timeline.py V9a_<tag> V9a
 python3 validation/plot/trust.py    V9a_<tag> V9a
 ```
 
-runner 自己在窗口起止时改接收端的 meter、跑完恢复 50 G，EXIT 陷阱保证异常中止也会恢复；对照臂结束时把 `g_trust_step` 写回 66、`g_trust_decay` 写回 13。跑完核对 `results/<tag>/hidden_meter.txt` 与 `trust_arm.txt` 是不是这次要的值。
+runner 自己在窗口起止时改接收端的 meter、跑完恢复 50 G，EXIT 陷阱保证异常中止也会恢复；对照配置结束时把 `g_trust_step` 写回 66、`g_trust_decay` 写回 13。跑完核对 `results/<tag>/hidden_meter.txt` 与 `trust_arm.txt` 是不是这次要的值。
 
 每跑完一个场景停下汇报，再跑下一个。
 
