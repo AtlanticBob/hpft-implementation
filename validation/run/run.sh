@@ -163,6 +163,8 @@ for e in d:
   done
 }
 snap_cnp > "$OUT/cnp_pre.txt"; snap_switch > "$OUT/switch_pre.txt"
+# the core link (tools/lab-infra/switch/): what, if anything, it is shaped to
+bash tools/lab-infra/switch/split_core_shape.sh status > "$OUT/core_shaper.txt" 2>/dev/null || true
 
 # ---- T0, listeners, sampler, launches -------------------------------------
 # TCP rows use iperf3's --start-at, the local patch built from

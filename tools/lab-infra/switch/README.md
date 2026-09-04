@@ -35,3 +35,10 @@
 6. 出问题 `split_rollback.sh`：主机口回 VLAN 100、回环口 down。
 
 配置备份在 `sn5600_config_20260904.cmds`（改线前的完整命令式配置）。
+
+## 让核心成为瓶颈：出口整形，不拆口
+
+以太网没有 200G 到 400G 之间的链路速率（只有 100/200/400/800G 这些档，拆口也只能落在这些档上）。要一个任意的核心速率，用交换机的出口整形：`split_core_shape.sh 300` 把 swp21（A→B 出口）和 swp25（B→A 出口）都限到 300G，`split_core_shape.sh off` 撤掉，`status` 看现状。链路仍是 800G，不拆口、不重载 switchd、主机口不闪断，数值随时改。整形器是真实的队列，给这两个口再绑 ECN 配置（`nv set interface swp21,swp25 qos congestion-control profile motiv_default_ecn`）就是标记型的核心拥塞。每次验证运行把当时的整形值记在 `results/<tag>/core_shaper.txt`。
+
+哪个值绑得住：核心上只有 A 侧到 B 侧的流量。单接收端（只有 sgpu02 收）时 A→B 最多 200G，被接收端口先限住，核心要低于 200G 才绑；B 侧两台都收时 A→B 的需求是 400G，核心在 200–400G 之间就绑，而单接收端的流量不受影响——这是 300G 这类值的用法，但需要验证套件支持第二个接收端。
+
