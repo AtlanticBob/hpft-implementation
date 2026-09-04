@@ -429,7 +429,9 @@ class RpMailbox:
     def write_batch(self, entries, trust=False):
         """entries: [(flowtag_int, budget_bps, rate_bps[, trust_fxp16])].
         trust=True selects the 0xb47d format (four words per entry): the
-        device blends rate = T*cc + (1-T)*level per QP."""
+        fourth word carries the queue fraction q/D (low 16 bits, fxp16) and
+        the start-window bit (bit 16); the device clips the CC rate to
+        [(1-T) level, level] with its own trust T (design v4 §6)."""
         if not entries:
             return
         parts = ["0x%x" % ((0xb47d0000 if trust else 0xb47c0000) | len(entries))]
@@ -972,7 +974,8 @@ def main():
              ctl["pace_shim"][local_host], args.log), flush=True)
 
     def actuate(fsid, st, r_bps, rdma_batch):
-        pace = max(min(st.R, tree_of(fsid)), floor)
+        # design v4 §5.5: min(R, U), never below the platform minimum rate
+        pace = max(min(st.R, tree_of(fsid)), v4_floor)
         src_dst, cls = fsid.rsplit("|", 1)
         src, dst = src_dst.split(">")
         tnow = time.monotonic()

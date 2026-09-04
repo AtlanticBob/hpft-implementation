@@ -116,10 +116,11 @@ def main():
                 dst_vnic=emap[msg["dst_vnic"]],
                 rate_bps=int(msg["rate_bps"]),
                 burst_bytes=BURST_BYTES,
-                # trust in the tenant CC (fence design): flags bit31 set
-                # selects the blend r = T*cc + (1-T)*rate in the BPF program
-                # bit30 = start window (design v4 §5.4): the BPF program
-                # takes no loss evidence for the trust while it is set
+                # design v4 §6: bit31 selects the clip arm r = clip(cc,
+                # (1-T) rate, rate) in the BPF program; the low 16 bits carry
+                # the queue fraction q/D (fxp16) that drives the trust decay;
+                # bit30 = start window (§5.4): the BPF program takes no loss
+                # evidence for the trust while it is set
                 flags=((0x80000000 | (0x40000000 if msg.get("start") else 0)
                         | int(round(min(max(float(msg["trust"]), 0.0), 1.0) * 65535)))
                        if "trust" in msg else 0),

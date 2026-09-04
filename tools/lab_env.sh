@@ -139,7 +139,7 @@ jakiro_start() {
 # VF IPs untouched, telemetry on p1, tos=inherit, p1 stays 100G. Idempotent:
 # full build only when vxlan100 is missing; the volatile parts (p1 IPs, MTU,
 # ARP, representor membership, tos option) are re-asserted on every call.
-ensure_overlay() { bash "$REPO/tools/lab-infra/overlay.sh" --hub "$RECEIVER"; }
+ensure_overlay() { bash "$REPO/tools/lab-infra/overlay.sh"; }   # static mesh; the receiver no longer shapes the data plane
 teardown_overlay() {
   bash "$REPO/tools/lab-infra/overlay.sh" --teardown
   # restore direct VF IPs on every host

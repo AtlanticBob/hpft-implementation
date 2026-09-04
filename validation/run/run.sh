@@ -30,6 +30,7 @@ cd "$REPO"
 reg() { python3 -c "import json,sys;r=json.load(open('config/lab-registry.json'));print($1)"; }
 dev_of() { reg "next(v['rdma_dev'] for v in r['vnics'] if v['host']=='$1' and v['netdev']=='dpu1vf$2')"; }
 ip_of()  { reg "next(v['ip'] for v in r['vnics'] if v['host']=='$1' and v['netdev']=='dpu1vf$2')"; }
+rep_of() { reg "next(v['representor'] for v in r['vnics'] if v['host']=='$1' and v['netdev']=='dpu1vf$2')"; }
 dpu_of() { reg "{n['host']:n['dpu'] for n in r['nodes']}['$1']"; }
 on_host() { if [ "$1" = "$(hostname)" ]; then shift; bash -c "$*"; else h=$1; shift; ssh -n -o BatchMode=yes "$h" "$*" </dev/null; fi; }
 # Message size for a rate-limited RDMA row, on BOTH ends (perftest refuses to
@@ -199,16 +200,18 @@ meter_set() { # $1 = destination VF index, $2 = kbps
   # 2026-09-02 on a live 48.9 G flow: mod-meter to 20 G left it at 48.9 G
   # for the whole ten seconds that followed. Reinstalling the three
   # OpenFlow rules invalidates the datapath entry and the new rate then
-  # takes hold inside one 100 ms bucket, in both directions.
-  local dip m; dip=$(ip_of "$RECV" "$1"); m=$((11+$1))
+  # takes hold inside one 100 ms bucket, in both directions. The output is
+  # explicit (the VF's representor), as in vf_caps.sh: the mesh overlay
+  # never lets the bridge learn a local VF's MAC.
+  local dip m rep; dip=$(ip_of "$RECV" "$1"); rep=$(rep_of "$RECV" "$1"); m=$((11+$1))
   ssh -n -o BatchMode=yes "$RDPU" "
     sudo ovs-ofctl -O OpenFlow13 mod-meter ovsbr-p1 'meter=$m,kbps,band=type=drop,rate=$2'
     sudo ovs-ofctl -O OpenFlow13 del-flows ovsbr-p1 'udp,nw_dst=$dip,tp_dst=4791'
     sudo ovs-ofctl -O OpenFlow13 del-flows ovsbr-p1 'tcp,nw_dst=$dip'
     sudo ovs-ofctl -O OpenFlow13 del-flows ovsbr-p1 'ip,nw_dst=$dip'
-    sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=122,udp,nw_dst=$dip,tp_dst=4791,actions=meter:$m,NORMAL'
-    sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=121,tcp,nw_dst=$dip,actions=meter:$m,NORMAL'
-    sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=120,ip,nw_dst=$dip,actions=meter:$m,NORMAL'" </dev/null
+    sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=122,udp,nw_dst=$dip,tp_dst=4791,actions=meter:$m,output:$rep'
+    sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=121,tcp,nw_dst=$dip,actions=meter:$m,output:$rep'
+    sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=120,ip,nw_dst=$dip,actions=meter:$m,output:$rep'" </dev/null
 }
 # HPFT_RDMA_TRUST_STEP=0 freezes the RDMA executor's trust at zero (mailbox
 # 0xcce <step> 7 writes g_trust_step; 66 fxp16/epoch = (1-T)/1 s is the

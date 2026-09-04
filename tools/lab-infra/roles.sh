@@ -135,12 +135,10 @@ case "${1:-status}" in
     # shrink the lab back to the pair it used to be.
     [ -n "$SENDERS" ] || SENDERS=$(for h in $(all_hosts); do [ "$h" = "$RECV" ] || echo -n "$h "; done)
     echo "== roles: receiver=$RECV senders=$SENDERS =="
-    # Re-hub the overlay onto whoever receives. The star's hub carries every
-    # spoke-to-spoke frame, so a hub that is not the receiver turns the hub's
-    # uplink into the experiment's real bottleneck while the receiver's link
-    # sits idle - the measurement would be of the wrong link. Idempotent, so
-    # this is a no-op when the receiver has not changed.
-    bash "$REPO/tools/lab-infra/overlay.sh" --hub "$RECV" >/dev/null
+    # The overlay is a static mesh (overlay.sh): every node has a direct
+    # tunnel to every other, so the receiver's identity no longer changes the
+    # data plane. Idempotent; this only makes sure the mesh is in place.
+    bash "$REPO/tools/lab-infra/overlay.sh" >/dev/null
     stop_all
     RECEIVER=$RECV
     start_receiver "$RECV"

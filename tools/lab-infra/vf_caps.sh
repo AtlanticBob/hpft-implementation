@@ -18,6 +18,14 @@
 # renames. The meter id is 11 + VF index (11..18), below any id an experiment
 # might add by hand.
 #
+# The action after the meter is an explicit output to the VF's representor,
+# not NORMAL. The overlay is a static mesh (overlay.sh): a VF's outbound
+# traffic leaves by explicit rules and never passes NORMAL, so the bridge
+# never learns the local VF's MAC, and a NORMAL delivery would flood every
+# inbound packet to all ports (measured 2026-09-04: the flooding megaflow is
+# not offloadable, 0.8 G instead of 47 G). The representor of every VF is a
+# registry fact, so nothing is learned on the inbound path either.
+#
 # THREE rules per VF, one per class, all pointing at the same meter, and that
 # is not cosmetic. A single nw_dst-only rule at a priority above the receiver
 # agent's classification rules (50 RoCE / 45 TCP / 40 ip) resolves the lookup
@@ -58,20 +66,20 @@ for v in r['vnics']:
     if v['host']!='$1': continue
     m=r['policy']['vms'].get(v['vnic_id'],{}).get('max_rate_bps')
     if not m: continue
-    print(int(re.search(r'vf(\d+)$', v['netdev']).group(1)), v['ip'], int(m)//1000)"; }
+    print(int(re.search(r'vf(\d+)$', v['netdev']).group(1)), v['ip'], int(m)//1000, v['representor'])"; }
 
 meter_on() { # $1 host $2 dpu
   local rows; rows=$(vf_rows "$1")
-  ssh -o BatchMode=yes "$2" "while read -r i ip kbps; do
+  ssh -o BatchMode=yes "$2" "while read -r i ip kbps rep; do
       [ -n \"\$i\" ] || continue
       sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"udp,nw_dst=\$ip,tp_dst=4791\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"tcp,nw_dst=\$ip\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"ip,nw_dst=\$ip\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 del-meter $BR \"meter=\$((11+i))\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 add-meter $BR \"meter=\$((11+i)),kbps,band=type=drop,rate=\$kbps\"
-      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=122,udp,nw_dst=\$ip,tp_dst=4791,actions=meter:\$((11+i)),NORMAL\"
-      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=121,tcp,nw_dst=\$ip,actions=meter:\$((11+i)),NORMAL\"
-      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=120,ip,nw_dst=\$ip,actions=meter:\$((11+i)),NORMAL\"
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=122,udp,nw_dst=\$ip,tp_dst=4791,actions=meter:\$((11+i)),output:\$rep\"
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=121,tcp,nw_dst=\$ip,actions=meter:\$((11+i)),output:\$rep\"
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=120,ip,nw_dst=\$ip,actions=meter:\$((11+i)),output:\$rep\"
     done <<'EOF'
 $rows
 EOF
