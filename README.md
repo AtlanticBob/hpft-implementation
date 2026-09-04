@@ -88,7 +88,7 @@ sender→receiver 都是直达隧道，spoke 之间经 hub 的 eswitch 硬件转
 
 $$R\leftarrow R\cdot e^{\alpha\hat m}\cdot e^{-\kappa\Delta q}\cdot e^{-(\kappa/D)\min(q,D)}$$
 
-三个因子各做一件事——账本空着时按沉默长度探涨、账本在涨时刹车、账本有存量时还账。
+三个因子各做一件事——账本空着时按沉默长度上探、账本在涨时刹车、账本有存量时还账。
 $\Delta q$ 由发送端自己从相邻两条反馈相减得到，所以一个标量同时带了误差和它的积分。
 遥测**rx/tx 是双端同步的二进制格式，必须一起下发**。控制周期 10 ms，现行
 `kappa=0.1`、`D=30`、`alpha=3e-4`、`m_max=100`。
@@ -99,14 +99,14 @@ $T_p$ 与环路滞后 $\tau$，其余是代数。推导、三条性质与调参�
 
 ### 离线检查（不需要 lab，直接跑）
 
-`tools/tests/` 下六组：`conf_check.py`（现行围栏律 law=conf 的离线闭环：生产的
+`tools/tests/` 下六组：`conf_check.py`（现行许可速率律 law=conf 的离线闭环：生产的
 接收端分配加生产的发送端步进，两种 CC 模型）、`couple_check.py`（执行面与 CC 的
 合成）、`rx_check.py`（接收端判定逻辑）、`loop_dryrun.py`（tx_agent 对合成遥测跑
 整环，含真 FIFO 与本地 UDP 假接收端）、`fastfill_test.py`（C 与 Python 分配器
 对拍）、`hw_maxrate_test.py`（硬件层单位——devlink 入参 bit/s、读回 byte/s）。
 
 另有两个要 lab 的：`executor_step.sh`（绕过控制环，直接往 RP FIFO 写预算，单测
-执行面能有多快）和 `analyze_conf.py`（law=conf 运行的稳态统计与围栏状态）。
+执行面能有多快）和 `analyze_conf.py`（law=conf 运行的稳态统计与许可速率状态）。
 
 ## 怎么跑实验
 
