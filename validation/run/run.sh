@@ -140,7 +140,10 @@ snap_cnp() {
   done
   on_host "$RECV" 'for c in np_cnp_sent np_ecn_marked_roce_packets; do printf "sgpu02.mlx5_3.%s=%s\n" $c "$(cat /sys/class/infiniband/mlx5_3/ports/1/hw_counters/$c 2>/dev/null)"; done'
 }
-snap_switch() { timeout 60 ssh -o BatchMode=yes sn5600 "nv show interface swp37s0 counters qos 2>/dev/null" 2>/dev/null | grep -v Welcome | sed -n '/Egress Queue/,/PFC/p' | grep -E "^\s+[0-9]"; }
+# swp37s0 is the receiver's port; swp21/swp25 are the two ends of the loopback
+# cable that splits the switch in two (tools/lab-infra/switch/README.md) - the
+# core link the receiver's ledger cannot see. Unplugged, they just read zero.
+snap_switch() { for p in swp37s0 swp21 swp25; do echo "## $p"; timeout 60 ssh -o BatchMode=yes sn5600 "nv show interface $p counters qos 2>/dev/null" 2>/dev/null | grep -v Welcome | sed -n '/Egress Queue/,/PFC/p' | grep -E "^\s+[0-9]"; done; }
 snap_trust() { # TCP executor trust per pair on every sender host
   for h in $SENDERS; do
     on_host "$h" 'B=$(ls -1 /usr/lib/linux-tools-*/bpftool | sort -V | tail -1); sudo $B map dump pinned /sys/fs/bpf/hpft_tcp_edt/maps/hpft_pair_state -j 2>/dev/null' \
