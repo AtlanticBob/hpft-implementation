@@ -22,11 +22,12 @@ V1、V2、V4、V7 是每一版设计必跑的四个；V3、V5、V6 在它们过�
 
 ## 二、共同环境（除非某个场景明确覆盖）
 
-三台发送端 sgpu01/03/04 经 sn5600 打接收端 sgpu02，四台的 p1 都是 200 G，接收端口 `swp37s0` 是 3:1 超订的瓶颈。数据面是常驻 VxLAN overlay 星型（中心 sgpu02，`tos=inherit`）。租户 = sgpu02 的一个 VF；流集合 = (源 VM, 目的 VM, 类)。
+三台发送端 sgpu01/03/04 经 sn5600 打接收端 sgpu02，四台的 p1 都是 200 G，接收端口 `swp37s0` 是 3:1 超订的瓶颈。**2026-09-04 起 sn5600 用一根回环线分成两台逻辑交换机**：交换机 A（VLAN 101）接 sgpu01（`swp37s1`）和 sgpu03（`swp3s1`），交换机 B（VLAN 102）接 sgpu02（`swp37s0`）和 sgpu04（`swp4s1`），两台之间只有 `swp21`↔`swp25` 这一根 OSFP 线（现在 800 G，不是瓶颈；没有 ECN、没有 PFC）。sgpu01、sgpu03 打 sgpu02 的流量都过这根线，sgpu04 的不过。它是接收端账本管不到的核心链路（design v4 §8.1）；端口表、配置脚本与备份在 `tools/lab-infra/switch/`。数据面是常驻 VxLAN overlay 星型（中心 sgpu02，`tos=inherit`），底层是 DPU 的 p1（172.16.1.x，MTU 9000）。租户 = sgpu02 的一个 VF；流集合 = (源 VM, 目的 VM, 类)。
 
 | 项 | 取值 |
 |---|---|
-| 主机与 DPU | sgpu01/hpft-dpu、sgpu02/hpft-dpu2（接收）、sgpu03/hpft-dpu3、sgpu04/hpft-dpu4 |
+| 主机与 DPU | sgpu01/hpft-dpu（A 侧）、sgpu02/hpft-dpu2（接收，B 侧）、sgpu03/hpft-dpu3（A 侧）、sgpu04/hpft-dpu4（B 侧） |
+| 核心链路 | sn5600 内部 `swp21`↔`swp25` 回环，800 G，无 ECN、无 PFC；A 侧到 B 侧的流量都经它 |
 | 每 VF 带宽上限 | 每台 8 个 VF、每个 VF 50 G（发送端 devlink tx_max + 接收端 OVS drop meter，`vf_caps.sh sync`），全部保持 |
 | HyperFront | 四台都在 `lab_env.sh hpft` 态：UPCC=1，四台 DPU 跑本仓库的 PCC 执行面；`roles.sh set --receiver sgpu02 --senders sgpu01,sgpu03,sgpu04`；TCP 执行面 host fq+EDT，每个 VF 恰好挂一份当前程序 |
 | 被测对象 | `config/lab-registry.json` 的 `e_params`（law 与参数），每次运行原样记入报告 |

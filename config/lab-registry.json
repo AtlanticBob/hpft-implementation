@@ -740,5 +740,34 @@
       "dpu_ctl_ip": "192.168.101.2"
     }
   ],
-  "nodes_comment": "Every node carries BOTH planes (rx_agent + tx_agent + PCC executor); which one runs is a per-experiment role, not a per-node property. tools/lab-infra/deploy_check.sh reads this list, so adding a node here is the only edit needed to bring it into the sync loop."
+  "nodes_comment": "Every node carries BOTH planes (rx_agent + tx_agent + PCC executor); which one runs is a per-experiment role, not a per-node property. tools/lab-infra/deploy_check.sh reads this list, so adding a node here is the only edit needed to bring it into the sync loop.",
+  "topology": {
+    "comment": "sn5600 split in two by a loopback cable (2026-09-04): side A = VLAN 101, side B = VLAN 102, joined only by swp21<->swp25 (OSFP 800G, no ECN, no PFC). Traffic between sides crosses that link; it is the core link the receiver's ledger cannot see (design v4 s8.1). Scripts and backup: tools/lab-infra/switch/.",
+    "switch": "sn5600",
+    "core_link": {
+      "ports": [
+        "swp21",
+        "swp25"
+      ],
+      "speed_gbps": 800,
+      "ecn": false,
+      "pfc": false
+    },
+    "sides": {
+      "A": {
+        "vlan": 101,
+        "hosts": {
+          "sgpu01": "swp37s1",
+          "sgpu03": "swp3s1"
+        }
+      },
+      "B": {
+        "vlan": 102,
+        "hosts": {
+          "sgpu02": "swp37s0",
+          "sgpu04": "swp4s1"
+        }
+      }
+    }
+  }
 }
