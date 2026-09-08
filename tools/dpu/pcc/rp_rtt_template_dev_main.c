@@ -128,7 +128,17 @@ static volatile uint32_t g_active_us = 1000u;
  *    up to R; 2 holds the sum but costs steady-state fit (one flow set 8 %
  *    under its share) since a QP whose quota just fell keeps its old share
  *    for up to an epoch. The join time is 1.55-2.07 s in all three, so the
- *    denominator is not what makes a join slow. */
+ *    denominator is not what makes a join slow.
+ * 3: arm 2 plus the share its own members could not use. Under arm 2 a QP
+ *    is paced at min(its live rate, its share from the snapshot); the two
+ *    move independently, so the minimum is biased low and the set paces
+ *    under R even though the shares add up to exactly R. What one member
+ *    leaves is nobody's until the next epoch, so the epoch measures what
+ *    the set actually programmed and carries the shortfall into the next
+ *    epoch's denominator (r_eff), capped at 1.10 x R (criterion 6's own
+ *    limit on the 95th percentile) so a set can exceed its budget by no
+ *    more than that for one epoch if every idle member wakes at once. Only while the bucket binds: if the CCs are not
+ *    asking for R there is nothing to redistribute. */
 static volatile uint32_t g_sum_live;
 /* 0xcce <0|1> 25: Swift's per-QP state lives in the framework's algo_ctxt
  * (cx[3..7]: cwnd, rtt_s, last_dec, flags, rtt_last), which travels with
@@ -494,7 +504,12 @@ typedef struct {
 	volatile uint32_t qslot[HPFT_SET_QPS];
 	volatile uint32_t epoch_ts;
 	volatile uint32_t nlive;     /* QPs counted in sum_cc */
+	volatile uint32_t r_eff;     /* arm 3: R plus what the members left unused */
 } hpft_set_t;
+
+/* arm 3 may hand out at most this multiple of R in one epoch */
+#define HPFT_REFF_MAX_NUM (11u)
+#define HPFT_REFF_MAX_DEN (10u)
 
 static hpft_set_t g_set[HPFT_SETS];
 
@@ -738,7 +753,7 @@ static inline void hpft_q_epoch(volatile hpft_q_t *q, uint32_t now)
  * membership once per millisecond (hpft_q_epoch). */
 static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t sidx)
 {
-	uint32_t sum = 0, live = 0, n = s->nq;
+	uint32_t sum = 0, live = 0, paced = 0, n = s->nq;
 
 	if ((uint32_t)(now - s->epoch_ts) < HPFT_EPOCH_US)
 		return;
@@ -765,10 +780,27 @@ static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t
 		}
 		q->c_epoch = hpft_cc_rate(q);
 		sum += q->c_epoch;
+		paced += q->paced;
 		live++;
 	}
 	s->sum_cc = sum;
 	s->nlive = live;
+	if (g_sum_live == 3u) {
+		uint32_t R = s->budget, hi;
+
+		if (!R || sum <= R || !paced) {
+			s->r_eff = R;          /* the bucket is not binding */
+		} else {
+			uint64_t v = (uint64_t)(s->r_eff ? s->r_eff : R) * R / paced;
+
+			hi = (uint32_t)(((uint64_t)R * HPFT_REFF_MAX_NUM) / HPFT_REFF_MAX_DEN);
+			if (v < R)
+				v = R;
+			if (v > hi)
+				v = hi;
+			s->r_eff = (uint32_t)v;
+		}
+	}
 }
 
 static inline void hpft_set_add(volatile hpft_set_t *s, uint32_t slot)
@@ -1127,6 +1159,18 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 				S = s->sum_cc;
 				n = s->nlive ? s->nlive : (s->nq ? s->nq : 1u);
 			}
+			if (g_sum_live == 3u && g_law == HPFT_LAW_BUCKET && q->c_epoch && S > R) {
+				/* the snapshot's proportion, of the budget plus
+				 * what last epoch's members left unused */
+				uint32_t Re = s->r_eff ? s->r_eff : R;
+				uint64_t v = ((uint64_t)q->c_epoch * Re) / S;
+
+				if (v > Re)
+					v = Re;
+				if ((uint32_t)v < r)
+					r = (uint32_t)v;
+				goto shaped;
+			}
 			if (g_sum_live == 2u && g_law == HPFT_LAW_BUCKET && q->c_epoch && S > R) {
 				/* the share from the epoch's snapshot, capped by the
 				 * QP's live quota */
@@ -1299,7 +1343,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 20) g_law = budget ? HPFT_LAW_CAP : HPFT_LAW_BUCKET;   /* legacy NOFLOOR */
 			else if (which == 21) g_unknown_rate = budget ? budget : DOCA_PCC_DEV_MAX_RATE;
 			else if (which == 22) g_law = budget > 2u ? HPFT_LAW_BUCKET : budget;
-			else if (which == 23) g_sum_live = budget > 2u ? 2u : budget;
+			else if (which == 23) g_sum_live = budget > 3u ? 3u : budget;
 			else if (which == 24) g_active_us = budget ? budget : 1000u;
 			else if (which == 25) g_sw_ctx = budget ? 1u : 0u;
 			return DOCA_PCC_DEV_STATUS_OK;
@@ -1342,7 +1386,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[5] = s->nlive;
 			rsp[6] = s->nq;
 			rsp[7] = g_ev_slot;
-			*response_size = 8 * sizeof(uint32_t);
+			rsp[8] = s->r_eff;     /* arm 3: the budget plus the unused share */
+			*response_size = 9 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		/* 0xdee <slot>: per-QP read-back (qpn, set, cc rate, the set's
