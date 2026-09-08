@@ -74,3 +74,6 @@ results/step_arms_20260825/results/
 # queueing experiment: the raw switch histogram snapshots (one JSON per second
 # per arm); the distilled data/ and fig/ are tracked
 results/queueing_20260908/results/*/histogram_raw.jsonl
+# queueing experiment: ib_write_lat -H dumps every sample (~700k lines a run);
+# the distilled CDF is in data/queueing.csv
+results/queueing_20260908/results/*/probe.txt
