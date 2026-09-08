@@ -135,4 +135,16 @@ echo "$A" > "$OUT/sw_pre.txt"; echo "$B" > "$OUT/sw_post.txt"
 echo "t0=$T0 start=$T_START end=$T_END sw_a=$SW_A sw_b=$SW_B arm=$ARM range=$RANGE iters=$ITERS" > "$OUT/window.txt"
 cp /tmp/quick_$NAME/result.txt "$OUT/goodput.txt" 2>/dev/null
 cp /tmp/quick_$NAME/arm.txt "$OUT/arm.txt" 2>/dev/null
-echo "== $ARM/$RANGE done -> $OUT"
+# Restore what this run changed: the cc arm leaves the executor ignoring its
+# budgets and the sender agents stopped (quick.sh does that), and the switch is
+# left sampling.  Nothing here is self-restoring, so a run that ends without
+# this leaves the lab in the CC-only arm - which is how it was found once.
+for h in $(awk '{print $2}' validation/scenarios/q_v1.spec | sort -u); do
+  d=$(dpu_of "$h")
+  ssh -n -o BatchMode=yes "$d" "timeout 5 bash -c 'echo \"0xccd 2\" > /tmp/rp_fifo'
+    timeout 5 bash -c 'echo \"0xcce 0 22\" > /tmp/rp_fifo'
+    timeout 5 bash -c 'echo \"0xcce 0 12\" > /tmp/rp_fifo'" </dev/null >/dev/null 2>&1
+done
+[ "$ARM" = cc ] && bash tools/lab-infra/roles.sh all >/dev/null 2>&1
+ssh -o BatchMode=yes sn5600 "nv set system telemetry enable off; nv config apply -y" >/dev/null 2>&1
+echo "== $ARM/$RANGE done -> $OUT  (executor arm and switch telemetry restored)"

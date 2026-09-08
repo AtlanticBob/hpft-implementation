@@ -67,10 +67,16 @@
 
 ## 复原
 
-跑完把交换机的遥测关掉，它是常驻采样：
+`run.sh` 每跑完一遍自己收尾：把四台发送端的执行面写回缺省臂（`0xccd 2`、`0xcce 0 22`、`0xcce 0 12`），只有拥塞控制那一臂另外重新拉起发送端代理（`quick.sh` 为了这一臂把它们停掉了），并关掉交换机的遥测。**这些都不是自恢复的**：漏掉收尾，lab 就停在"只有拥塞控制"的臂上，而每一层服务照常报健康。
+
+手工复原：
 
 ```
-nv set system telemetry enable off
-nv unset interface swp37s0 telemetry histogram
-nv config apply -y
+for d in hpft-dpu hpft-dpu2 hpft-dpu3 hpft-dpu4; do
+  ssh $d 'for m in "0xccd 2" "0xcce 0 22" "0xcce 0 12"; do echo "$m" > /tmp/rp_fifo; done'
+done
+bash tools/lab-infra/roles.sh all
+ssh sn5600 'nv set system telemetry enable off; nv unset interface swp37s0 telemetry histogram; nv config apply -y'
 ```
+
+核对：`0xdef 0` 回读的第八个字应当是 0（低字节 cc_only、次字节 law、第三字节分母模式）。
