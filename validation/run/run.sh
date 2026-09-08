@@ -76,38 +76,6 @@ bad = [v for v, p in r["policy"]["vms"].items()
 if bad or r["policy"].get("per_sender_weights"):
     print("non-standard policy:", bad, r["policy"].get("per_sender_weights")); sys.exit(1)
 EOF
-# The RP mailbox costs either ~13.3 ms or ~21.9 ms per send, switching
-# between the two on a ~40 min cycle that we have not traced to anything on
-# the DPU (load, interrupts, context switches and temperature are all flat
-# across a transition) and that survives a doca_pcc restart. The call is
-# blocking, so the slow mode cuts how often a fence can be pushed to the
-# RDMA executor from 74/s to 46/s. It is NOT a delay in the control path -
-# the wire responds 6 ms after the command, well before the call returns.
-#
-# Runs are no longer pinned to the fast mode (2026-08-31). Each DPU spends
-# only a third of its time fast and the DPUs are on different periods, so a
-# window with two senders fast at once lasts 4-7 min and comes round every
-# ~35 min - a cost worth paying only if the mode changes results, which has
-# not been shown and became much less likely once the QP-count miscount was
-# fixed. So measure it, record it per run, and let the runs proceed: with
-# the mode in results/<tag>/mailbox_mode.txt any two runs of one scenario
-# can be compared across modes after the fact.
-for h in $SENDERS; do
-  d=$(dpu_of $h)
-  # An idle lab has no budgets to push, so there may be nothing recent to
-  # read. Ask directly then: 0xded is a pure readback and costs one mailbox
-  # slot each, which is exactly what we want to time.
-  mbcost="tail -400 /tmp/pcc_rp.log 2>/dev/null | grep -a HPFT_SET | sed -n 's/.*send_ns=\\([0-9]*\\).*/\\1/p' | sort -n | awk '{a[NR]=\$1} END{if(NR>20) printf \"%.1f\", a[int(NR/2)+1]/1e6}'"
-  mbms=$(ssh -n -o BatchMode=yes "$d" "$mbcost" 2>/dev/null)
-  if [ -z "$mbms" ]; then
-    ssh -n -o BatchMode=yes "$d" "exec 3>/tmp/rp_fifo; for i in \$(seq 1 30); do echo '0xded 0' >&3; sleep 0.02; done; sleep 1" 2>/dev/null
-    mbms=$(ssh -n -o BatchMode=yes "$d" "$mbcost" 2>/dev/null)
-  fi
-  [ -n "$mbms" ] || { echo "$d mailbox unknown" >> "$OUT/mailbox_mode.txt"; echo "WARN: $d mailbox mode could not be measured"; continue; }
-  mode=fast; awk -v v="$mbms" 'BEGIN{exit !(v>17)}' && mode=slow
-  echo "$d $mbms $mode" >> "$OUT/mailbox_mode.txt"
-  echo "$d mailbox ${mbms} ms/send ($mode)"
-done
 cp config/lab-registry.json "$OUT/registry.json"
 for h in $HOSTS; do
   d=$(dpu_of $h); cur=$(ssh -o BatchMode=yes "$d" 'cat /sys/class/net/p1/speed' 2>/dev/null)
@@ -296,8 +264,8 @@ fi
 # executor sampler for the whole run: every sender DPU's RDMA executor is
 # read once a second per flow set (0xded: R, the sum of the paced rates, the
 # sum of the CC rates, the live sum, the QP counts). Each query holds the
-# mailbox 13-22 ms, so it is a small perturbation of the budget push, not a
-# passive tap; HPFT_NO_RP_SAMPLE=1 runs without it.
+# mailbox for one round (about 16 ms), so it is a small perturbation of the
+# budget push, not a passive tap; HPFT_NO_RP_SAMPLE=1 runs without it.
 SAMP=$((END+WARM+30))
 if [ -z "${HPFT_NO_RP_SAMPLE:-}" ]; then
   for h in $SENDERS; do

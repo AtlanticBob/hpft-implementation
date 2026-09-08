@@ -3,9 +3,13 @@
 
 Writes "0xded <slot>" queries into the RP FIFO and reads the HPFT_RSP lines
 the RP host process prints to /tmp/pcc_rp.log. Each query costs one mailbox
-send (13-22 ms), so only the slots that hold a flow set are queried after the
-first full scan; every RESCAN_S seconds all slots are scanned again so a flow
-set that appears later (a join) is picked up.
+round (about 16 ms) plus the wait for its answer, and it shares the FIFO with
+the sender agent's budget pushes, so the slots known to hold a flow set are
+queried every pass and the rest are swept a few at a time, round robin: a flow
+set that appears later (a join) is picked up within RESCAN_S without any
+single pass overrunning the sampling period. Sweeping all 32 slots in one pass
+cost 1.55 s on one sender per run, which skipped a whole second of samples
+every five seconds and broke the executor figure's lines.
 
 The readback (rp_rtt_template_dev_main.c, 0xded) is, per flow set: id, R
 (the ledger's budget), the sum of the paced rates of its QPs, the sum of the
@@ -58,29 +62,29 @@ def query(slots):
 
 
 t_end = time.time() + dur
-live = None
-t_scan = 0.0
+live = set()                 # slots that answered with a flow set
+sweep = 0                    # next slot of the round-robin sweep
+# how many idle slots to sweep per pass so the whole table is covered within
+# RESCAN_S; the sweep is what finds a flow set that joins mid-run
+per_pass = max(1, int(NSLOT * itv / RESCAN_S + 0.999))
 with open(out, "w") as o:
     while time.time() < t_end:
         t = time.time()
-        full = live is None or t - t_scan >= RESCAN_S
-        slots = list(range(NSLOT)) if full else live
-        if full:
-            t_scan = t
-        answered = []
-        for s, m in query(slots):
-            if not m:
-                continue
-            sid = int(m.group(1), 16)
+        extra = []
+        for _ in range(per_pass):
+            if sweep not in live:
+                extra.append(sweep)
+            sweep = (sweep + 1) % NSLOT
+        for s, m in query(sorted(live) + extra):
+            sid = int(m.group(1), 16) if m else 0
             if not sid:
+                live.discard(s)
                 continue
-            answered.append(s)
+            live.add(s)
             rec = {"ts": round(t, 3), "slot": s, "id": "0x%08x" % sid,
                    "R": round(gbps(int(m.group(2))), 3), "paced": round(gbps(int(m.group(3))), 3),
                    "cc": round(gbps(int(m.group(4))), 3), "cc_live": round(gbps(int(m.group(5))), 3),
                    "nlive": int(m.group(6)), "nq": int(m.group(7))}
             o.write(json.dumps(rec) + "\n")
         o.flush()
-        if full and answered:
-            live = answered
         time.sleep(max(0.0, itv - (time.time() - t)))

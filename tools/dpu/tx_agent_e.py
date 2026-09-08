@@ -1437,7 +1437,7 @@ def main():
             mailbox.ensure_open()
             # One 0xb47f line per push carrying every flow set's R; the
             # host-side forwarder keeps only the newest of these when the
-            # mailbox (13-22 ms per round) falls behind the push period.
+            # mailbox (about 16 ms per round) falls behind the push period.
             # Bindings are incremental and rare, and go out as their own
             # line only when there is something new.
             mailbox.write_sets(sorted(latest_rdma.items()))
