@@ -180,12 +180,13 @@ def pack_rate_cfg(rate_bps: int, generation: int, burst_bytes: int, flags: int =
 
 
 def pack_pair_state(next_ns: int = 0, generation: int = 0) -> bytes:
-    """struct hpft_pair_state: lock, shot_ms, next_ns, generation, the
-    observer's cc_sum, cc_prev, d_ts, d, cuts, then the executor's trust,
-    loss_ep, trust_ns, loss_ns. The datapath initialises d itself when it
-    reads zero, so seeding zeros stays correct, and every other field
-    means "nothing seen yet" at zero."""
-    return struct.pack("<IIQQQQQIIIIQQ", 0, 0, next_ns, generation, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    """struct hpft_pair_state (per-connection executor, 2026-09-07): lock,
+    epoch, epoch_ns, sum_cur, sum_prev, n_cur, n_prev, generation, shots,
+    nosock, reserved. Every field means "nothing seen yet" at zero; the
+    clocks now live per connection, so next_ns is accepted for the old
+    callers and ignored."""
+    del next_ns
+    return struct.pack("<IIQQQIIQIIQ", 0, 0, 0, 0, 0, 0, 0, generation, 0, 0, 0)
 
 
 def normalize_positive_int(value: Any, field: str) -> int:

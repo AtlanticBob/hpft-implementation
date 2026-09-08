@@ -33,6 +33,7 @@ Actuation: pace_f = max(min(R_f, Tree_f), floor); tcp -> host pace shim
 """
 import argparse
 import json
+import zlib
 import math
 import os
 import re
@@ -402,6 +403,11 @@ class RpMailbox:
         self.fd = -1
         self.ino = -1
         self.writes = self.errs = 0
+        # set whenever the FIFO is found recreated, i.e. rp_service.sh has
+        # restarted the executor and its device memory is empty again: the
+        # caller must re-send everything the executor can only learn from
+        # us (the QP bindings, the unknown-flow allowance)
+        self.restarted = False
 
     def _units(self, bps):
         return max(1, round(bps / self.line * (1 << 20)))
@@ -422,12 +428,17 @@ class RpMailbox:
                 self.fd = -1
             try:
                 self.fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
+                if self.ino != -1:
+                    self.restarted = True
                 self.ino = ino
             except OSError:
                 pass
 
     def write_batch(self, entries, trust=False):
-        """entries: [(flowtag_int, budget_bps, rate_bps[, trust_fxp16])].
+        """LEGACY (pre-2026-09 executor, keyed by hardware flow tag). The
+        per-QP executor does not handle 0xb47c/0xb47d at all; the line is
+        kept only for rp_probe.py-style tooling against an old build.
+        entries: [(flowtag_int, budget_bps, rate_bps[, trust_fxp16])].
         trust=True selects the 0xb47d format (four words per entry): the
         fourth word carries the queue fraction q/D (low 16 bits, fxp16) and
         the start-window bit (bit 16); the device clips the CC rate to
@@ -446,6 +457,40 @@ class RpMailbox:
         else:
             self.errs += 1
 
+    def write_sets(self, entries):
+        """entries: [(set_id, budget_bps)] -> 0xb47f batch.
+
+        The per-QP executor (2026-09-06) budgets a FLOW SET, not a hardware
+        flow tag: with ROCE_CC_SHAPER_COALESCE=SOURCE_QP the tag is per QP,
+        so the old 0xb47c format, whose key was the tag, no longer names
+        anything the policy plane knows. The set id is the pair's registry
+        flowtag reused as an opaque name, so both sides keep one vocabulary."""
+        if not entries:
+            return
+        parts = ["0x%x" % (0xb47f0000 | len(entries))]
+        for sid, bud in entries:
+            parts.append("0x%x %d" % (sid, self._units(bud)))
+        if self._fifo_write(" ".join(parts) + "\n"):
+            self.writes += 1
+        else:
+            self.errs += 1
+
+    def write_qpmap(self, entries):
+        """entries: [(key, set_id)] -> 0xb48e batch, so the executor can tell
+        which flow set a QP's events belong to. key = vhca_id << 24 | qpn
+        (the bare qpn when no vhca table is available): QP numbers are
+        unique per function only, and the executor sees the function as
+        the event's vhca_id."""
+        if not entries:
+            return
+        parts = ["0x%x" % (0xb48e0000 | len(entries))]
+        for qpn, sid in entries:
+            parts.append("%d 0x%x" % (qpn, sid))
+        if self._fifo_write(" ".join(parts) + "\n"):
+            self.writes += 1
+        else:
+            self.errs += 1
+
     def _fifo_write(self, line):
         # reopen on inode change: rp_service.sh recreates the FIFO
         try:
@@ -458,6 +503,8 @@ class RpMailbox:
                 self.fd = -1
             try:
                 self.fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
+                if self.ino != -1:
+                    self.restarted = True
                 self.ino = ino
             except OSError:
                 return False
@@ -480,12 +527,11 @@ class PaceShim:
         self.sock.setblocking(False)
         self.sent = self.acked = self.errs = 0
 
-    def set_rate(self, src, dst, rate_bps, trust=None, start=False):
+    def set_rate(self, src, dst, rate_bps):
+        """The flow-set's rate R and nothing else: the executor splits it
+        over the flow-set's connections by their own CC windows (design
+        v4 section 6), so no trust and no start window travel here."""
         msg = {"src_vnic": src, "dst_vnic": dst, "rate_bps": int(rate_bps)}
-        if trust is not None:
-            msg["trust"] = round(float(trust), 4)
-        if start:
-            msg["start"] = 1        # §5.4 start window: loss is not evidence
         try:
             self.sock.sendto(json.dumps(msg).encode(), self.addr)
             self.sent += 1
@@ -505,7 +551,7 @@ class PaceShim:
 
 
 class SenderLiveness:
-    """Fresh per-(src vnic, class) TX rates, published to the receiver.
+    """Fresh per-(src vnic, class) TX rates, published to every other node.
 
     Why: the receiver splits a dst's exactly-measured pool among its
     senders using megaflow byte ratios, and those counters are ~1 s
@@ -526,9 +572,11 @@ class SenderLiveness:
     HDR = struct.Struct("<8sII8H")
     STALE_S = 0.1
 
-    def __init__(self, path, vport_of_vnic, dst_ip, port, host):
+    def __init__(self, path, vport_of_vnic, dst_ips, port, host):
         self.path, self.vport_of_vnic = path, vport_of_vnic
-        self.addr, self.host = (dst_ip, port), host
+        # every other node may be a receiver (2026-09-04), so the feed goes
+        # to all of them; a node that is not receiving just ignores it
+        self.addrs, self.host = [(ip, port) for ip in dst_ips], host
         self.mm = None
         self.slot = {}
         self.prev = {}          # vnic -> (t_s, tx_ib, tx_eth)
@@ -588,10 +636,12 @@ class SenderLiveness:
         if self.rate:
             msg = {"h": self.host, "t": time.monotonic_ns(),
                    "r": {k: int(v) for k, v in self.rate.items()}}
-            try:
-                self.sock.sendto(json.dumps(msg).encode(), self.addr)
-            except OSError:
-                pass
+            data = json.dumps(msg).encode()
+            for addr in self.addrs:
+                try:
+                    self.sock.sendto(data, addr)
+                except OSError:
+                    pass
 
 
 def main():
@@ -718,10 +768,6 @@ def main():
     v4_mmax = float(ep.get("m_max", 100))
     v4_kappa = float(ep.get("kappa", k * period))
     v4_D = float(ep.get("D", vq_repay / period))
-    # Budget hysteresis toward the RDMA executor: how far the fence has to
-    # move before a new budget is written instead of re-sending the last one.
-    # 0 = always write the current value.
-    rdma_hyst = float(ep.get("rdma_budget_hyst", 0.03))
     tree_theta = float(ep.get("tree_backlog_theta", 0.85))
     # 5.3 third term; togglable so the tree's contribution to the probe
     # ceiling can be isolated against a control run
@@ -835,9 +881,9 @@ def main():
     # attribution does not have to wait out the ~1 s megaflow cache when a
     # sender stops. Absent/stale feed => receiver keeps its old chain.
     live = None
-    _rx_host = reg.get("receiver_host")
-    _live_ip = ctl.get("telemetry_ip", {}).get(_rx_host)
-    if _live_ip:
+    _live_ips = [ip for h, ip in ctl.get("telemetry_ip", {}).items()
+                 if h != local_host]
+    if _live_ips:
         _vport_of_vnic = {}
         for v in reg["vnics"]:
             if v["host"] == local_host and v.get("representor"):
@@ -846,7 +892,7 @@ def main():
                     _vport_of_vnic[v["vnic_id"]] = int(_m.group(1)) + 1
         if _vport_of_vnic:
             live = SenderLiveness("/dev/shm/hpft_vpm", _vport_of_vnic,
-                                  _live_ip, int(ep.get("liveness_port", 9713)),
+                                  _live_ips, int(ep.get("liveness_port", 9713)),
                                   local_host)
     mailbox = RpMailbox(line)
     # What an RDMA flow the executor has no budget for yet may send
@@ -873,6 +919,10 @@ def main():
     unknown_bps = v4_start / float(ep.get("rdma_qps_per_flowset", 4))
     _unk_units = mailbox._units(unknown_bps)
     _unk_sent = 0.0
+
+    def push_unknown_rate():
+        # 0xcce <units> 21 on the per-QP executor (0xccf was the old one)
+        mailbox._fifo_write("0xcce %d 21\n" % _unk_units)
     flowtags = {v["vnic_id"]: int(v["flowtag"], 16)
                 for v in reg["vnics"] if "flowtag" in v}
     # per-(src,dst) flowtags for cross-pair RDMA: the tag is a stable hash of
@@ -883,6 +933,115 @@ def main():
     pair_ft = {key: int(v, 16)
                for key, v in reg.get("rdma_flowtags", {}).items()
                if ">" in key}
+    # The tag does not depend on the SOURCE card (registry rdma_flowtags
+    # comment: sgpu03/sgpu04 return sgpu01's tags for every pair to sgpu02,
+    # checked 2026-08-23) but it DOES depend on the destination: vf0>vf0 is
+    # 0x74249a41 towards sgpu02 and 0x1e3dac89 towards sgpu04 (probed via
+    # 0xdea, 2026-09-04). So a pair with no row of its own takes the row of
+    # any other source with the same source VF index and the same
+    # destination vnic; tools/lab-infra/flowtag_probe.sh measures the rows.
+    def _vf_idx(vnic):
+        m = re.search(r"vf(\d+)$", vnic)
+        return int(m.group(1)) if m else None
+    idx_ft = {}
+    for key, ft in pair_ft.items():
+        s_, d_ = key.split(">")
+        idx_ft.setdefault((_vf_idx(s_), d_), ft)
+
+    def flowtag_of(src_dst, src):
+        ft = pair_ft.get(src_dst)
+        if ft is None:
+            s_, d_ = src_dst.split(">")
+            ft = idx_ft.get((_vf_idx(s_), d_))
+        if ft is None:
+            ft = flowtags.get(src)
+        if ft is None:
+            # A pair the registry has no tag for (vf4..vf7 on the hosts
+            # other than sgpu01, 2026-09-08: V3's new tenants ran unbound
+            # for the whole run because this returned None and no budget
+            # or binding was ever pushed). The id is only a name shared
+            # by the budget push and the binding push, so any stable
+            # non-zero 32-bit value of the pair string will do.
+            ft = (zlib.crc32(src_dst.encode()) & 0xffffffff) | 1
+        return ft
+    # ---- {qpn -> flow set} from the host-side qpn resolver ----------
+    # The resolver sends "<src_ip> <lqpn> <dst_ip>" lines to this agent's
+    # telemetry socket. Telemetry itself is binary, so the two are told
+    # apart by looking at the bytes.
+    ip2vnic = {v["ip"]: v["vnic_id"] for v in reg["vnics"] if v.get("ip")}
+    # vnic -> vhca_id, asked of the firmware once at startup (vhca_of, the
+    # DPU is the eswitch manager; a host VF cannot answer this about
+    # itself). Host pf<P>vf<N> is eswitch vport N+1 on this platform.
+    vf_vhca = {}
+    _vh_dev = ep.get("dpu_rdma_dev", "mlx5_1")
+    _vh_vport = {}
+    for v in reg["vnics"]:
+        if v["host"] == local_host and v.get("representor"):
+            _m = re.search(r"vf(\d+)$", v["representor"])
+            if _m:
+                _vh_vport[v["vnic_id"]] = int(_m.group(1)) + 1
+    if _vh_vport:
+        try:
+            _out = __import__("subprocess").run(
+                ["/opt/hpft/vhca_of", _vh_dev,
+                 ",".join(str(p) for p in sorted(set(_vh_vport.values())))],
+                capture_output=True, text=True, timeout=10).stdout
+            _vp_vh = {}
+            for _ln in _out.split("\n"):
+                _f = _ln.split()
+                if len(_f) == 2 and _f[1].isdigit():
+                    _vp_vh[int(_f[0])] = int(_f[1])
+            vf_vhca = {vn: _vp_vh[vp] for vn, vp in _vh_vport.items()
+                       if vp in _vp_vh}
+        except Exception as e:  # noqa: BLE001
+            print("tx_agent_e: vhca_of failed (%s)" % e, flush=True)
+    if len(vf_vhca) == len(_vh_vport):
+        print("tx_agent_e: vhca %s" % " ".join(
+            "%s=%d" % (k.split("/")[-1], v) for k, v in sorted(vf_vhca.items())),
+            flush=True)
+    else:
+        print("tx_agent_e: NO vhca table (%d/%d) - QP bindings keyed by bare "
+              "qpn, two VFs holding the same QP number will be confused"
+              % (len(vf_vhca), len(_vh_vport)), flush=True)
+    qp_set = {}      # binding key -> set id
+    qp_sent = {}     # binding key -> set id already pushed to the executor
+
+    def _is_qpmap(buf):
+        if not buf or len(buf) > 60000:
+            return False
+        return all(c in b"0123456789. \n" for c in buf[:64])
+
+    def _take_qpmap(buf, _flowtag_of=None):
+        # Each resolver datagram is the COMPLETE current table (every
+        # local RC QP with a known peer), so the binding table is rebuilt
+        # from it: a QP that is gone leaves the table, instead of every
+        # QP ever seen staying in it for the life of the agent.
+        try:
+            text = buf.decode("ascii", "ignore")
+        except Exception:
+            return
+        seen = {}
+        for ln in text.split("\n"):
+            f = ln.split()
+            if len(f) != 3:
+                continue
+            sv, dv = ip2vnic.get(f[0]), ip2vnic.get(f[2])
+            if not sv or not dv:
+                continue
+            try:
+                qpn = int(f[1])
+            except ValueError:
+                continue
+            ft = _flowtag_of("%s>%s" % (sv, dv), sv)
+            if ft is not None:
+                vh = vf_vhca.get(sv)
+                key = ((vh & 0xff) << 24) | (qpn & 0xffffff) if vh is not None else qpn
+                seen[key] = ft
+        qp_set.clear()
+        qp_set.update(seen)
+        for k_ in [k_ for k_ in qp_sent if k_ not in seen]:
+            del qp_sent[k_]
+
     stree = SenderTree(reg["policy"], line, ep["headroom"],
                        ep["delta_demand"], floor, tree_theta)
     trees = {}   # fsid -> Tree_f, recomputed on tree_period_s (5.6)
@@ -988,27 +1147,15 @@ def main():
             # this property (it reflushes every rdma_push_ms even when the
             # budget has not changed); the TCP path did not.
             if abs(pace - st.pace) > 0.005 * max(st.pace, 1.0) or tnow - st.shim_last >= tcp_refresh_s:
-                shim.set_rate(src, dst, pace,
-                              st.T if law in ("conf", "conf_v3") else None,   # T = queue fraction q/D_r
-                              start=(law == "conf" and not st.enforced))
+                shim.set_rate(src, dst, pace)
                 st.shim_last = tnow
         elif cls == "rdma":
-            ft = pair_ft.get(src_dst, flowtags.get(src))
+            ft = flowtag_of(src_dst, src)
             if ft is not None:
-                # r_bps is the receiver's rate for this flow-set and it
-                # drives the RP's water level. Withholding it when a dst
-                # has several senders was tried and is WORSE: the device
-                # falls back to its own TX-event estimate, which undercounts,
-                # so it reads under budget and lets the wire run to the
-                # sender tree (measured 2.6x the granted pace). The fix
-                # belongs where the error was - in the receiver's split -
-                # not in refusing to use its output.
-                # 4th word: queue fraction q/D_r in the low 16 bits; bit 16 =
-                # the flow-set is still in its start window (§5.4), during
-                # which the executor takes no loss evidence for the trust.
-                rdma_batch.append((ft, pace, r_bps,
-                                   (st.T, law == "conf" and not st.enforced)
-                                   if law in ("conf", "conf_v3") else None))
+                # the flow set's rate R, keyed by the pair's registry
+                # flowtag reused as the set id; the executor splits it over
+                # the set's QPs by their own CC allowances (section 6)
+                rdma_batch.append((ft, pace))
         st.pace = pace
         # executor-escape tripwire (log-only). Every stress-D1 failure class
         # was a silent one: an unpaced EDT pair, an unmatched flowtag and a
@@ -1050,13 +1197,12 @@ def main():
     # budgets. Instead keep the latest budget per flowtag and flush the
     # freshest snapshot at the mailbox rate. The RDMA congestion response
     # stays event-speed on the DPA; only the policy target is rate-limited.
-    latest_rdma = {}    # flowtag -> (budget_bps, rx_rate_bps)
+    latest_rdma = {}    # set id -> R (bps)
     # dsts whose RDMA rate the receiver can only split by estimate, i.e.
     # those carrying more than one RDMA sender. Recomputed per datagram
     # from the FULL record set (not the local filter): a remote sender we
     # do not pace still makes our own dst's split an estimate.
     ambiguous_dsts = set()
-    rdma_sent_budget = {}   # flowtag -> last budget written (hysteresis)
     rdma_push_s = ep.get("rdma_push_ms", 13) / 1e3
     last_rdma_push = time.monotonic()
     # The RP device code takes a control step only when the FED rate
@@ -1066,7 +1212,6 @@ def main():
     # the fed rate never moved). Alternate the fed rate by +-max(3%, one
     # 2^20-unit) every push so the RP always sees a change and keeps
     # converging its level toward the budget.
-    rp_dither_flip = False
     # Per-datagram cost histogram, the sender's counterpart to the
     # receiver's. It matters MORE here: tx was measured to be the tighter
     # of the two agents, rebuilding its whole sender tree on every
@@ -1080,6 +1225,9 @@ def main():
         # --- telemetry-driven law ---
         try:
             data, _ = sock.recvfrom(65536)
+            if _is_qpmap(data):
+                _take_qpmap(data, flowtag_of)
+                data = None
             # LATEST WINS: the receiver sends one datagram per period and
             # this loop costs more than a period under load (24 flow-sets:
             # tree rebuild, 8 law steps, shim writes, log lines), so the
@@ -1091,13 +1239,17 @@ def main():
             try:
                 while True:
                     more, _ = sock.recvfrom(65536)
+                    if _is_qpmap(more):
+                        _take_qpmap(more, flowtag_of)
+                        continue
+                    if data is not None:
+                        tele_skipped += 1
                     data = more
-                    tele_skipped += 1
             except (BlockingIOError, socket.timeout, OSError):
                 pass
             finally:
                 sock.settimeout(sock_timeout)
-            seq, recs_all = parse_telemetry(data)
+            seq, recs_all = parse_telemetry(data) if data is not None else (None, {})
         except socket.timeout:
             seq, recs_all = None, {}
         except OSError as e:
@@ -1208,11 +1360,22 @@ def main():
             last_ticker = now
             maybe_reload(now)
             mailbox.ensure_open()
-            # re-assert the unknown-flow cap every 5 s (an RP restart
+            # re-assert the unknown-flow allowance every 5 s (an RP restart
             # clears it; the write is one short line)
             if now - _unk_sent >= 5.0:
                 _unk_sent = now
-                mailbox._fifo_write("0xccf %d\n" % _unk_units)
+                push_unknown_rate()
+            # An executor restart (rp_service.sh start, done before every
+            # experiment) empties the device: every QP binding we ever
+            # pushed is gone, and the diff below would never push them
+            # again for a QP number that comes back. So forget what was
+            # sent and let the next push carry the whole table.
+            if mailbox.restarted:
+                mailbox.restarted = False
+                qp_sent.clear()
+                push_unknown_rate()
+                print("tx_agent_e: executor restarted - re-sending %d QP "
+                      "bindings" % len(qp_set), flush=True)
             # Eviction, and why it is gated on telemetry being alive: a
             # flow-set going quiet and the telemetry channel dying look
             # identical from one flow-set's record stream. They are told
@@ -1266,51 +1429,23 @@ def main():
                     logf.write(json.dumps(
                         {"ts": round(time.time(), 4), "fs": fsid,
                          "R": int(st.R), "mode": st.mode}) + "\n")
-        # coalesce RDMA budgets: keep the latest per flowtag, flush the
-        # freshest snapshot to the FIFO only at the mailbox rate.
-        # Budget hysteresis (rdma_budget_hyst). It was added when the RP
-        # searched for its water level with an integral: any budget change
-        # re-armed a settle-hold, so a budget that kept moving stopped the
-        # search from ever stepping. That executor is gone - the device now
-        # ASSIGNS level = budget/N every epoch, statelessly, and explicitly
-        # discards the freshness gate ((void)do_ctrl) - so the hysteresis
-        # now only makes the device pace on a stale budget. It costs
-        # nothing to drop: the push happens on its own timer and carries
-        # every pair in one message either way, so this only decides which
-        # number that message contains.
-        #
-        # There is deliberately NO rate limit on descending budget writes.
-        # One would only be needed if the budget could swing violently at
-        # the RP's own inner-loop timescale, and it cannot: equilibrium
-        # here is signal-free so there is no sawtooth, and the target moves
-        # with a 1/k time constant under a bounded 25%
-        # discount - and a descent limit here would only make the executor
-        # (1.05 s^-1) the convergence bottleneck instead of the law
-        # (k*ln2 = 13.9 s^-1). Descent is one step, and the RP's
-        # proportional feed-forward scales its level by the budget ratio
-        # (design_v4.md §6).
-        for ft, bud, rate, tr in rdma_batch:
-            latest_rdma[ft] = (bud, rate, tr)
+        # coalesce the RDMA rates: keep the latest per flow set and flush
+        # the freshest snapshot to the FIFO at the mailbox rate
+        for ft, bud in rdma_batch:
+            latest_rdma[ft] = bud
         if latest_rdma and now - last_rdma_push >= rdma_push_s:
             mailbox.ensure_open()
-            rp_dither_flip = not rp_dither_flip
-            entries = []
-            trust_mode = False
-            for ft, (bud, rate, tr) in latest_rdma.items():
-                sent = rdma_sent_budget.get(ft)
-                if sent is None or bud == 0 or abs(bud - sent) > rdma_hyst * sent:
-                    sent = bud
-                rdma_sent_budget[ft] = sent
-                ent = [ft, sent,
-                       max(rate + (1 if rp_dither_flip else -1)
-                           * max(0.03 * rate, 2e5), 2e5)]
-                if tr is not None:
-                    trust_mode = True
-                    qf, start = tr
-                    ent.append(int(round(min(max(qf, 0.0), 1.0) * 65535))
-                               | (0x10000 if start else 0))
-                entries.append(tuple(ent))
-            mailbox.write_batch(entries, trust=trust_mode)
+            # One 0xb47f line per push carrying every flow set's R; the
+            # host-side forwarder keeps only the newest of these when the
+            # mailbox (13-22 ms per round) falls behind the push period.
+            # Bindings are incremental and rare, and go out as their own
+            # line only when there is something new.
+            mailbox.write_sets(sorted(latest_rdma.items()))
+            newmap = [(q, sid) for q, sid in qp_set.items() if qp_sent.get(q) != sid]
+            if newmap:
+                mailbox.write_qpmap(newmap[:60])
+                for q, sid in newmap[:60]:
+                    qp_sent[q] = sid
             last_rdma_push = now
         shim.drain_acks()
         if recs_all:

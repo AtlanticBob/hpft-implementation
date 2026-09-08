@@ -14,12 +14,18 @@
 # node holds is readable at any time from `roles.sh status`.
 #
 #   roles.sh status
-#   roles.sh set --receiver sgpu02 --senders sgpu01,sgpu03,sgpu04
+#   roles.sh all                                       every node sends and receives
+#   roles.sh set --receiver sgpu02 --senders sgpu01,sgpu03,sgpu04   one receiver (legacy)
 #   roles.sh stop
 #
-# The receiver additionally runs the vport meter (its class-split counter
-# source); senders additionally run the host-side pace shim for the TCP
-# executor. Nothing here touches CC mode - that is still cc_mode.sh.
+# Since 2026-09-04 the lab's standing shape is `all`: every DPU runs the
+# receiver agent, the sender agent, the vport meter and the RP; every host
+# runs the pace shim and the qpn resolver (against every other host). Which
+# node receives in an experiment is then decided by the flow table alone.
+# Both agents on one DPU is fine: the vport meter is shared, the receiver
+# agent listens on the liveness and rate-export ports, the sender agent on
+# the telemetry port, and an idle receiver agent costs a few percent of one
+# core. Nothing here touches CC mode - that is still cc_mode.sh.
 set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd); cd "$REPO"
 REG=config/lab-registry.json
@@ -92,8 +98,14 @@ start_sender() { # $1 = host
   #                 with the ledger, the law and the mailbox all reading
   #                 correct. Starting it is not optional for a sender.
   local shim='sudo systemctl reset-failed hpft-pace-shim 2>/dev/null; systemctl is-active hpft-pace-shim >/dev/null 2>&1 || sudo systemd-run --unit hpft-pace-shim --property=Restart=always /usr/bin/python3 REPOPATH/tools/host/hpft_pace_shim.py'
-  local qpn='sudo systemctl reset-failed hpft-qpn-resolver 2>/dev/null; systemctl is-active hpft-qpn-resolver >/dev/null 2>&1 || sudo systemd-run --unit hpft-qpn-resolver --property=Restart=always /usr/bin/python3 REPOPATH/tools/host/qpn_resolver.py --local-host HOSTNAME --peer PEERHOST'
-  qpn=${qpn/HOSTNAME/$h}; qpn=${qpn/PEERHOST/$RECEIVER}
+  # As the LOGIN USER, not root: the resolver ssh's to every peer to join
+  # its QP table, and root has no keys between these hosts (checked
+  # 2026-09-06: root@peer is "Permission denied (publickey)"), so the root
+  # unit ran for months and never emitted a single line.
+  local qpn='sudo systemctl reset-failed hpft-qpn-resolver 2>/dev/null; systemctl is-active hpft-qpn-resolver >/dev/null 2>&1 || sudo systemd-run --unit hpft-qpn-resolver --property=Restart=always --uid=$(id -u) --gid=$(id -g) --setenv=HOME=$HOME /usr/bin/python3 REPOPATH/tools/host/qpn_resolver.py --local-host HOSTNAME --peer PEERHOST'
+  # PEERS: every other host in `all` mode, the one receiver in `set` mode
+  local peers=${PEERS:-$RECEIVER}
+  qpn=${qpn/HOSTNAME/$h}; qpn=${qpn/PEERHOST/$peers}
   if [ "$h" = "$(hostname)" ]; then
     eval "${shim/REPOPATH/$REPO}" >/dev/null 2>&1
     eval "${qpn/REPOPATH/$REPO}" >/dev/null 2>&1
@@ -119,6 +131,17 @@ status() {
 
 case "${1:-status}" in
   status) status ;;
+  all)
+    echo "== roles: every node sends and receives =="
+    bash "$REPO/tools/lab-infra/overlay.sh" >/dev/null
+    stop_all
+    RECEIVER=""
+    for h in $(all_hosts); do
+      PEERS=$(for o in $(all_hosts); do [ "$o" = "$h" ] || echo -n "$o,"; done); PEERS=${PEERS%,}
+      start_receiver "$h"
+      start_sender "$h"
+    done
+    sleep 2; status ;;
   stop)   stop_all; echo "roles: all planes stopped"; status ;;
   set)
     shift; RECV=""; SENDERS=""
@@ -144,5 +167,5 @@ case "${1:-status}" in
     start_receiver "$RECV"
     for s in $SENDERS; do start_sender "$s"; done
     sleep 2; status ;;
-  *) echo "usage: roles.sh status | stop | set --receiver <host> [--senders h1,h2]"; exit 1 ;;
+  *) echo "usage: roles.sh status | all | stop | set --receiver <host> [--senders h1,h2]"; exit 1 ;;
 esac

@@ -30,216 +30,330 @@
 #include "rtt_template.h"
 
 #define DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK (1 << DOCA_PCC_DEV_EVNT_ROCE_ACK)
-/*
- * Main entry point to user CC algorithm (Reference code)
- * This function starts the algorithm code of a single event
- * It receives the flow context data, the event info and outputs the new rate parameters
- * The function can support multiple algorithms and can call the per algorithm handler based on
- * the algo type. If a single algorithm is required this code can be simplified
- * The function can not be renamed as it is called by the handler infrastructure
- *
- * @algo_ctxt [in]: A pointer to a flow context data retrieved by libpcc.
- * @event [in]: A pointer to an event data structure to be passed to extractor functions
- * @attr [in]: A pointer to additional parameters (algo type).
- * @results [out]: A pointer to result struct to update rate in HW.
- */
-/* HPFT v2 (Phase 2 step 1): per-pair shared budget, water-level controller.
- *
- * Pair key: flowtag (source vNIC; dst dimension arrives with receiver-driven
- * caps). Mailbox message {flowtag, budget}: budget in 2^20-of-linerate units,
- * budget=0 deletes. Every flow of a pair is assigned rate = min(cc_rate,
- * level). The level adapts once per epoch (1 ms) from the measured aggregate
- * R of the pair (accumulated from ROCE_TX byte counters):
- *   R > B          -> level *= B/R   (proportional shrink: N greedy flows
- *                                     land on B/N in one step)
- *   R < B - B/16   -> level += level/4 + B/64 (grow into unused budget)
- * This is max-min water-filling without counting flows: O(1) state per pair,
- * works for any QP count. cc_rate is a placeholder (MAX) until DCQCN
- * reintegration. Flows without a pair entry fail open. */
-#define HPFT_PAIRS (16)
-#define HPFT_EPOCH_US (1000u)
-#define HPFT_MIN_LEVEL (2u)
 
-/* ---- reading a CC instead of editing it -------------------------------
- * The executor holds two numbers per flow pair: `level`, the policy share
- * the receiver computed (budget/N), and whatever rate the tenant's
- * congestion control has arrived at. HyperFront's whole involvement with
- * the CC is three steps - read its rate, combine that with the share, and
- * shape the wire to the result. It never writes into the CC, and the CC
- * runs exactly as its author wrote it.
+/* ======================================================================
+ * HyperFront RDMA executor -- per-QP era (2026-09-06)
  *
- * That constraint decides the combiner, it does not leave it open.
+ * The card is configured with ROCE_CC_SHAPER_COALESCE=SOURCE_QP on the port
+ * that carries tenant traffic, so ONE PCC FLOW IS ONE QP: the event's flow
+ * tag is unique per QP, and the 12-dword algo_ctxt the framework restores on
+ * every event of that flow is that QP's own private memory. Measured
+ * 2026-09-06 on this lab: 8 QPs on one VF pair produce 8 flow tags, 8
+ * first-touch contexts, and 10.7 M TX events with zero cross-QP context
+ * mixups. Before the change the same probe read one tag and one context per
+ * VF pair, which is why the previous executor had to rebuild per-QP state
+ * from a learned {qpn -> slot} map and charge CNPs and NACKs to "whichever
+ * QP transmitted last".
  *
- *   min(cc, level) - HPFT_COUPLE_MIN, kept as the comparison arm - gives
- *   the CC an unconditional veto over the share, and a CC whose recovery
- *   target is its own pre-congestion rate will use it: every cut moves the
- *   target down with the rate, so a run of cuts walks the pair towards
- *   zero and holds it there for as long as anything keeps the queue
- *   marked. Measured 2026-08-16 on incast8: 4 of 8 runs, 7-22 s with RDMA
- *   at zero while TCP ran at twice its share, and the READ arm lost its
- *   QPs outright to requester timeouts.
+ * What that buys, and what this file therefore does:
+ *   - every congestion control runs PER QP with exact signal attribution;
+ *   - the tenant CC state lives in a slot addressed by the context, so no
+ *     map, no epochs, no N counting;
+ *   - HyperFront keeps its own granularity, the FLOW SET, and distributes a
+ *     flow-set's rate over that set's QPs by the tenant CC's own opinion.
  *
- * The lesson is not about DCQCN. A CC's rate is calibrated against the
- * LINK, not against a share the CC has never been told about, and it is
- * free to ratchet. So its absolute value carries nothing the executor can
- * use, and any combiner that reads that value inherits the ratchet. What
- * a CC's rate does carry is its DECREASES: each one is that CC's own
- * judgement, in its own units, that the network asked it to yield.
+ * The law (design v4 section 6): HyperFront at the sender is ONE TOKEN
+ * BUCKET PER FLOW SET, filled at the rate R the receiver's ledger set. The
+ * QPs of the set draw tokens at the rate their own congestion control
+ * asks for, c_i. While the bucket is not empty every QP sends at c_i;
+ * when the set asks for more than R, the bucket is shared in proportion
+ * to how fast each QP draws:
  *
- * So the executor accumulates the decreases and owns the return:
+ *      r_i = c_i * min(1, R / sum_j c_j)      (j over the QPs that draw)
  *
- *      rate = d * level,   d in [f, 1]
- *      d <- d * (cc / cc_prev)   when the CC lowered its rate
- *      d <- (1 + d) / 2          otherwise, once per recovery period
- *
- * Reading only ratios also means the reading need not be calibrated: any
- * constant factor between "what we sample" and "what the CC would have
- * paced at" cancels. That is what lets the same combiner sit on a
- * DCQCN-style rate in fixed point here and on cwnd/srtt in the TCP
- * shaper.
- *
- * ATTRIBUTION. Letting the CC free-run introduces a loop the edited
- * version did not have: our own shaping makes a queue, the CC reads that
- * queue as congestion and cuts, and if we counted that cut we would shape
- * harder still. The test that breaks it is local - is this flow held back
- * by us, or by the network?
- *
- *   pace-limited (achieved ~= what we programmed): the queue the CC is
- *   reacting to is one we made by holding the flow at its share, and the
- *   share is already the answer to it. The cut is not counted.
- *   below its pace: something other than us is limiting the flow, and
- *   that is exactly the case the executor cannot see or divide. The cut
- *   is counted in full.
- *
- * The rule is self-limiting - as d falls the flow becomes pace-limited
- * again, its cuts stop counting, and d recovers - so the floor f is a
- * backstop rather than the mechanism. It also needs nothing from the
- * receiver: it is per flow and entirely local to the sender.
- *
- * Safety rests where the executor has authority: d <= 1 bounds a flow by
- * its own share, and the shares sum to the root capacity by construction,
- * so no d can put more on that bottleneck than the policy already allows.
- * Where the capacity is not what the allocator thinks, flows cannot reach
- * their pace, stop being pace-limited, and the CC gets its say back.
- */
-#define HPFT_D_ONE       (DOCA_PCC_DEV_MAX_RATE)  /* 1.0 in the rates' own fxp20 */
-#define HPFT_COUPLE_MIN  (0u)   /* rate = min(cc, level) */
-#define HPFT_COUPLE_D    (1u)   /* rate = d * level */
-static volatile uint32_t g_hpft_couple = HPFT_COUPLE_D;
-static volatile uint32_t g_d_floor = HPFT_D_ONE >> 6;   /* backstop only */
-static volatile uint32_t g_d_recover_us = 300u;         /* one half-gap step */
-static volatile uint32_t g_pace_pct = 90u;              /* achieved/programmed */
+ * The hardware has no bucket shared across QPs, so the DPA emulates it:
+ * once per millisecond the set sums c_j over its QPs that sent in the last
+ * millisecond, and every event of a QP programs its own shaper to r_i. A
+ * QP that sends nothing draws nothing and is not in the sum. Nothing here
+ * ever raises a QP above its own c_i: HyperFront only caps the set at R,
+ * and the tenant CC keeps the whole job of reacting to the network below
+ * that cap - which is what keeps the receiver port's queue short
+ * (measured 2026-09-07: a law that normalised the CC's retreat away and
+ * held the set at R marked 60x more frames at the switch for the same
+ * throughput and fairness).
+ * ====================================================================== */
 
-/* ---- congestion-control term selection -------------------------------
- * HyperFront's rate limiting (level = budget/N) is independent of WHICH
- * congestion control runs underneath it: the executor always applies
- * rate = min(cc_rate, level). cc_rate is that underneath-CC. Two are
- * implemented and picked at run time by the host (mailbox 0xccd):
- *   0 = DCQCN-flavoured (CNP -> multiplicative decrease normalised by QP
- *       count, additive recovery per epoch)
- *   1 = ZTR-RTTCC (the vendor's RTT-based algorithm: decrease on NACK /
- *       CNP / rtt above base, additive increase otherwise), ported from
- *       the DOCA rtt_template reference with its shipped parameters.
- *   2 = software DCQCN (the published RP state machine)
- *   3 = Swift (delay-only, window converted to rate; see SW_* below)
- * Everything else in the datapath is identical, so a comparison across
- * this switch isolates the CC choice. */
-#define HPFT_CC_AIMD  (0u)   /* CNP -> fixed-fraction MD, fixed-step AI */
-#define HPFT_CC_DCQCN (2u)   /* the real RP state machine, see below */
-#define HPFT_CC_ZTR   (1u)   /* vendor RTT-based algorithm */
+#define HPFT_MIN_RATE    (2u)        /* fxp20 floor the wire can still carry */
+#define HPFT_EPOCH_US    (1000u)     /* per-QP and per-set housekeeping tick */
+#define HPFT_QSLOTS      (1024)      /* per-QP records */
+#define HPFT_SETS        (32)        /* flow sets this sender serves */
+#define HPFT_SET_QPS     (128)       /* QPs listed per flow set */
+#define HPFT_CTX_MAGIC   (0x48505131u)  /* "HP11" in the QP's own context */
+#define HPFT_QP_STALE_US (2000000u)  /* a QP silent this long leaves its set */
+#define HPFT_SET_EMPTY   (0xffffffffu) /* a retired entry in a set's member list */
 
-/* ---- software DCQCN (RP side) ------------------------------------------
- * Faithful to the published state machine, in rate (not window) form:
- *   on CNP:      Rt = Rc;  Rc = Rc(1 - alpha/2);  alpha += g(1 - alpha)
- *   alpha timer: alpha += g(0 - alpha)          (decay when no CNP)
- *   rate timer / byte counter, both must fire to advance a stage:
- *      stage < F   : fast recovery  Rc = (Rt + Rc)/2
- *      stage >= F  : additive       Rt += AI ; Rc = (Rt + Rc)/2
- *      stage >= 2F : hyper additive Rt += HAI; Rc = (Rt + Rc)/2
- * alpha is fxp16, rates are the device's fxp20 units. The three knobs the
- * firmware exposes as rpg_time_reset / rpg_ai_rate / rpg_hai_rate are the
- * ones below, settable at run time by mailbox 0xcce so the algorithm can
- * be swept the way a firmware DCQCN would be. */
-#define DQ_G_FXP16      (1024u)          /* g = 1/64 in fxp16 */
-#define DQ_ALPHA_ONE    (65536u)         /* 1.0 in fxp16 */
-#define DQ_F_STAGES     (5u)             /* F: fast-recovery steps */
-static volatile uint32_t g_dq_ai      = (1u << 20) / 400u;  /* ~0.25% line/step */
-static volatile uint32_t g_dq_hai     = (1u << 20) / 80u;   /* ~1.25% line/step */
-static volatile uint32_t g_dq_time_us = 300u;               /* rate timer, us */
-static volatile uint32_t g_dq_alpha_us = 55u;               /* alpha timer, us */
-/* ---- slow restart: the loss half of what the firmware does --------------
- * The published DCQCN RP state machine has exactly one input, the CNP, and
- * so does everything above. That is faithful to DCQCN and NOT faithful to
- * the NIC: on the firmware path a QP that loses packets is slowed by
- * SLOW RESTART, a transport-level mechanism sitting BESIDE DCQCN - the
- * ROCE_ACCL register field roce_slow_restart_en, which is 1 on every host
- * in this lab. None of the seventeen knobs under ecn/roce_rp/ has anything
- * to do with loss; they are all CNP-driven. So the loss reaction is added
- * here the same way the hardware organises it: beside the state machine,
- * not inside it. In particular alpha is NOT touched - alpha estimates the
- * marking intensity and a drop is not a mark.
- *
- * Measured before this existed (V8, 2026-09-02): with a hidden 20 G
- * bottleneck under a 50 G fence, the rate written to the QP sat at exactly
- * 12.50 G/QP for the whole 30 s window while NACKs ran at 18.8 k/s with no
- * decay whatsoever. Nothing in the software path slowed anything down.
- *
- * g_dq_loss_mdf16 == 65536 disables the cut and restores that behaviour. */
-static volatile uint32_t g_dq_loss_mdf16 = 32768u;  /* x0.5 per loss cut, fxp16.
-                                                     * The firmware's own floor
-                                                     * on one decrease is
-                                                     * rpg_min_dec_fac = 50 %. */
-static volatile uint32_t g_dq_loss_gap_us = 300u;   /* min us between loss cuts;
-                                                     * same order as the firmware's
-                                                     * rpg_time_reset = 300. Without
-                                                     * it a 19 k/s NACK storm would
-                                                     * halve the rate 19 k times a
-                                                     * second and pin it at the floor. */
-/* ZTR parameters, values as shipped in rtt_template_algo_params.h */
-#define ZTR_UPDATE_FACTOR (((1u << 16) * 10u) / 100u)   /* fxp16 */
-#define ZTR_AI            (((1u << 20) * 5u) / 100u)    /* fxp20 rate step */
-/* Both thresholds measured on THIS fabric (2026-08-03, device clock, ns):
- * probe rtt_min = 3006, loaded-but-uncongested band 3.3-5.7 us at 26G.
- * BASE_RTT sits above that band so only real queueing triggers decrease;
- * MAX_DELAY = 10x base, the order of the switch's Kmin=400KB queue. */
-#define ZTR_BASE_RTT      (7000u)                       /* ns */
-#define ZTR_MAX_DELAY     (70000u)                      /* ns */
-#define ZTR_MIN_RATE      (1u << (20 - 14))
-#define ZTR_DEC_FACTOR      ((1u << 16) - ZTR_UPDATE_FACTOR)
-#define ZTR_CNP_DEC_FACTOR  ((1u << 16) - 2u * ZTR_UPDATE_FACTOR)
-#define ZTR_NACK_DEC_FACTOR ((1u << 16) - 5u * ZTR_UPDATE_FACTOR)
-/* ---- Swift (SIGCOMM'20) as a third RTT-based term: 0xccd 3 ------------
- * Window-based in the paper, rate-based here: the pair keeps a cwnd in
- * bytes and programs rate = cwnd / rtt_s (per QP: / N, so the PAIR is one
- * Swift flow however many QPs carry it). One RTT probe in flight per pair
- * (re-armed on every RTT event, the stock template's cadence), so every
- * update below runs once per RTT:
- *   target = base_target + clamp(alpha/sqrt(cwnd_pkts) - beta, 0, fs_range)
- *   rtt <  target            : cwnd += ai                    (per RTT)
- *   rtt >= target, >=1 RTT since last cut:
- *                              cwnd *= 1 - min(b*(rtt-target)/rtt, max_mdf)
- *   NACK (loss), same gate  : cwnd *= 1 - max_mdf
- * CNPs are ignored: Swift is delay-only. Only the fabric-delay half of the
- * paper applies (RDMA has no host-side endpoint delay to subtract).
- * Every threshold is in device-clock ns, measured on THIS fabric (see the
- * calibration record in results/swift_<date>/); the paper's 25/50 us are
- * a different fabric's numbers. All tunable at run time via 0xcd1. */
+/* which tenant CC the executor runs for every QP (mailbox 0xccd) */
+#define HPFT_CC_AIMD  (0u)
+#define HPFT_CC_ZTR   (1u)
+#define HPFT_CC_DCQCN (2u)
 #define HPFT_CC_SWIFT (3u)
-#define SW_PKT        (1024u)          /* RoCE path MTU: 1 packet = 1024 B */
-#define SW_LINE_BPNS  (25u)            /* 200 Gb/s = 25 bytes per ns */
-#define SW_MIN_CWND   (SW_PKT)
-#define SW_MAX_CWND   ((1u << 20) - SW_PKT) /* ~1 MB = line x 40 us; must stay
-					      * below 2^20 or (cwnd << 12) wraps */
-#define SW_INIT_CWND  (64u << 10)
-static volatile uint32_t g_sw_base_target = 6000u;   /* ns, ~2x base RTT */
-static volatile uint32_t g_sw_fs_range    = 20000u;  /* ns, flow-scaling span */
-static volatile uint32_t g_sw_alpha_ns    = 50000u;  /* fs_range/(1/sqrt(fs_min)-1/sqrt(fs_max)), fs_min=4, fs_max=100 pkts */
-static volatile uint32_t g_sw_beta_ns     = 5000u;   /* alpha/sqrt(fs_max) */
-static volatile uint32_t g_sw_ai          = SW_PKT;  /* bytes added per RTT */
-static volatile uint32_t g_sw_beta16      = 52429u;  /* b = 0.8 (fxp16) */
-static volatile uint32_t g_sw_max_mdf16   = 32768u;  /* max_mdf = 0.5 (fxp16) */
-static volatile uint32_t g_sw_use_srtt    = 1u;      /* decide on the 1/4-EWMA RTT, not the raw probe */
-static volatile uint32_t g_hpft_autoreg;             /* 0xcd0: unknown flow -> pair at MAX */
+/* 4: the vendor template's handlers with the stock Swift core (the
+ * pcc_swift_stock build's algo/rtt_template.c compiled into this tree),
+ * driven straight from the framework's context; none of this file's
+ * per-QP machinery runs. A reference arm, only meaningful with cc_only. */
+#define HPFT_CC_STOCK (4u)
+static volatile uint32_t g_algo = HPFT_CC_DCQCN;
+
+/* 0xcce <0|1> 12: run the tenant CC alone, HyperFront ignored. This is the
+ * control arm and also how the CC models are validated on their own. */
+static volatile uint32_t g_cc_only;
+/* 0xcce <units> 21: what a QP whose flow set is not known yet may send. */
+static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE >> 6);
+/* 2^20/64 = 3.1 G per QP: design v4 5.4 starts a new flow set at the port's
+ * headroom R0 = h*C (16 G here) split over its expected QPs. The old 1/16 of
+ * line let four unbound QPs offer 50 G before the agent had bound them. */
+/* 0xcce <n> 22: the law. 0 = the bucket (default); 1 = equal cap,
+ * r_i = min(c_i, R/N), no sharing inside the set; 2 = equal split ignoring
+ * the CC, r_i = R/N. 1 and 2 are the ablation arms. */
+#define HPFT_LAW_BUCKET (0u)
+#define HPFT_LAW_CAP    (1u)
+#define HPFT_LAW_EQUAL  (2u)
+static volatile uint32_t g_law = HPFT_LAW_BUCKET;
+/* a QP that sent within this long is drawing tokens */
+#define HPFT_ACTIVE_US  (1000u)
+/* 0xcce <0|1> 25: Swift's per-QP state lives in the framework's algo_ctxt
+ * (cx[3..7]: cwnd, rtt_s, last_dec, flags, rtt_last), which travels with
+ * the event, instead of in the global slot. Diagnostic: whether the DPA's
+ * execution units see each other's writes to global memory promptly. */
+static volatile uint32_t g_sw_ctx = 1u;
+/* probe abort: a request unanswered this long (device ns) is re-issued */
+#define HPFT_PROBE_ABORT_NS (300000u)
+
+/* ======================= DCQCN, one state per QP =======================
+ * The firmware's reaction point, parameters read from this host's
+ * ecn/roce_rp defaults (rpg_time_reset 300 us, rpg_byte_reset 32767 B,
+ * rpg_threshold 1, ai 5 Mb/s, hai 50 Mb/s, min_dec_fac 50 %, monitor 4 us,
+ * g = 5/1024, alpha timer 55 us, initial alpha 1). alpha is fxp16; rates are
+ * the device's fxp20 units, 2^20 = line rate. Every parameter is a mailbox
+ * knob (0xcce <value> <which>): 0 AI, 1 HAI, 2 rate timer, 3 F, 8 loss cut,
+ * 9 loss gap, 16 g, 17 alpha timer, 18 byte counter, 19 monitor period.
+ * The state machine itself is unchanged from the version validated on
+ * 2026-09-05; what changed is that it is now driven by exactly the events
+ * of its own QP. */
+#define DQ_ALPHA_ONE (65536u)
+static volatile uint32_t g_dq_ai         = 26u;
+static volatile uint32_t g_dq_hai        = 262u;
+static volatile uint32_t g_dq_time_us    = 300u;
+static volatile uint32_t g_dq_f          = 1u;
+static volatile uint32_t g_dq_g16        = 320u;
+static volatile uint32_t g_dq_alpha_us   = 55u;
+static volatile uint32_t g_dq_bytes      = 32767u;
+static volatile uint32_t g_dq_monitor_us = 4u;
+static volatile uint32_t g_dq_loss_mdf16 = 32768u;
+static volatile uint32_t g_dq_loss_gap_us = 300u;
+/* 0xcce <0|1> 10: after a loss the target rate Rt is reset to the cut rate
+ * too (a "slow restart": recovery climbs additively from where the cut
+ * left the QP), instead of staying at the pre-loss rate so that the fast
+ * recovery stages jump straight back to it. */
+static volatile uint32_t g_dq_loss_rt_reset = 1u;
+/* 0xcce <0|1> 11: the firmware's clamp_tgt_rate / clamp_tgt_rate_after_time_inc
+ * pair. 0 = clamp the target rate Rt to Rc on every CNP (the paper's
+ * "clamp target rate"); 1 = clamp it only when the last increase was a
+ * timer increase (the host PF here reads clamp_tgt_rate=0 and
+ * clamp_tgt_rate_after_time_inc=1), otherwise Rt keeps its value and
+ * the recovery stages aim back at it. */
+static volatile uint32_t g_dq_clamp_mode;
+/* Default 1, matched against the firmware DCQCN (UPCC=0) on 2026-09-07:
+ * three senders into one 50 G drop-metered VF give 47.05 G on firmware
+ * and 46.8 G here with the reset (15.4-15.8 per flow set, wire 50.7 G);
+ * without it the QPs jump back to the pre-loss rate within a few stages,
+ * keep overrunning the meter and read 31.6 G with ~40 % retransmissions.
+ * The card's own roce_slow_restart_en is 1. */
+
+static volatile uint32_t g_dq_gpow[12];
+static inline void hpft_dq_gpow_init(void)
+{
+	uint32_t f = 65536u - g_dq_g16;
+
+	for (int i = 0; i < 12; i++) {
+		g_dq_gpow[i] = f;
+		f = (uint32_t)(((uint64_t)f * f) >> 16);
+	}
+}
+
+typedef struct {
+	volatile uint32_t rc;      /* current rate Rc, fxp20 */
+	volatile uint32_t rt;      /* target rate Rt */
+	volatile uint32_t alpha;   /* fxp16 */
+	volatile uint32_t st_t;    /* timer stage */
+	volatile uint32_t st_b;    /* byte stage */
+	volatile uint32_t t_rate;
+	volatile uint32_t t_alpha;
+	volatile uint32_t t_cut;
+	volatile uint32_t t_loss;
+	volatile uint32_t bytes;
+	volatile uint32_t cnp_f;
+	volatile uint32_t inc_timer;   /* 1: the last increase was a timer increase */
+} hpft_dq_t;
+
+static inline void hpft_dq_reset(volatile hpft_dq_t *q, uint32_t now)
+{
+	q->rc = DOCA_PCC_DEV_MAX_RATE;
+	q->rt = DOCA_PCC_DEV_MAX_RATE;
+	q->alpha = DQ_ALPHA_ONE;
+	q->st_t = 0;
+	q->st_b = 0;
+	q->t_rate = now;
+	q->t_alpha = now;
+	q->t_cut = now - g_dq_monitor_us;
+	q->t_loss = now - g_dq_loss_gap_us;
+	q->bytes = 0;
+	q->cnp_f = 0;
+	q->inc_timer = 0;
+}
+
+static inline void hpft_dq_step(volatile hpft_dq_t *q)
+{
+	uint32_t rt = q->rt, rc = q->rc, f = g_dq_f;
+
+	if (rt < rc)
+		rt = rc;
+	if (q->st_t > f && q->st_b > f)
+		rt += g_dq_hai;
+	else if (q->st_t > f || q->st_b > f)
+		rt += g_dq_ai;
+	if (rt > DOCA_PCC_DEV_MAX_RATE)
+		rt = DOCA_PCC_DEV_MAX_RATE;
+	rc = (rt >> 1) + (rc >> 1);
+	q->rt = rt;
+	q->rc = rc > DOCA_PCC_DEV_MAX_RATE ? DOCA_PCC_DEV_MAX_RATE : rc;
+}
+
+static inline void hpft_dq_advance(volatile hpft_dq_t *q, uint32_t now)
+{
+	uint32_t per = g_dq_alpha_us ? g_dq_alpha_us : 1u;
+	uint32_t el = now - q->t_alpha;
+
+	if (el >= per) {
+		uint32_t k = el / per, a = q->alpha;
+
+		if (!g_dq_gpow[0])
+			hpft_dq_gpow_init();
+		if (q->cnp_f) {
+			a += (uint32_t)(((uint64_t)(DQ_ALPHA_ONE - a) * g_dq_g16) >> 16);
+			if (a > DQ_ALPHA_ONE)
+				a = DQ_ALPHA_ONE;
+			q->cnp_f = 0;
+			k--;
+		}
+		if (k >= 4096u) {
+			a = 0;
+		} else {
+			for (int i = 0; k && i < 12; i++, k >>= 1)
+				if (k & 1u)
+					a = (uint32_t)(((uint64_t)a * g_dq_gpow[i]) >> 16);
+		}
+		q->alpha = a;
+		q->t_alpha = now - (el % per);
+	}
+	per = g_dq_time_us ? g_dq_time_us : 1u;
+	el = now - q->t_rate;
+	if (el >= per) {
+		uint32_t k = el / per;
+
+		if (k > 64u)
+			k = 64u;
+		while (k--) {
+			q->st_t++;
+			hpft_dq_step(q);
+		}
+		q->inc_timer = 1;
+		q->t_rate = now - (el % per);
+	}
+}
+
+static inline void hpft_dq_bytes(volatile hpft_dq_t *q, uint32_t nbytes, uint32_t now)
+{
+	uint32_t br = g_dq_bytes ? g_dq_bytes : 1u;
+	uint32_t nb = q->bytes + nbytes;
+	uint32_t k = nb / br;
+
+	hpft_dq_advance(q, now);
+	if (k > 64u)
+		k = 64u;
+	while (k--) {
+		q->st_b++;
+		hpft_dq_step(q);
+		q->inc_timer = 0;
+	}
+	q->bytes = nb % br;
+}
+
+static inline void hpft_dq_cnp(volatile hpft_dq_t *q, uint32_t now)
+{
+	hpft_dq_advance(q, now);
+	q->cnp_f = 1;
+	if ((uint32_t)(now - q->t_cut) >= g_dq_monitor_us) {
+		uint32_t rc = q->rc;
+		uint32_t cut = (uint32_t)(((uint64_t)rc * q->alpha) >> 17);
+		uint32_t max = (uint32_t)(((uint64_t)rc * (65536u - g_dq_loss_mdf16)) >> 16);
+
+		if (cut > max)
+			cut = max;
+		if (!g_dq_clamp_mode || q->inc_timer)
+			q->rt = rc;
+		q->rc = (rc > cut + HPFT_MIN_RATE) ? rc - cut : HPFT_MIN_RATE;
+		q->st_t = 0;
+		q->st_b = 0;
+		q->bytes = 0;
+		q->t_rate = now;
+		q->t_cut = now;
+	}
+}
+
+static inline int hpft_dq_loss(volatile hpft_dq_t *q, uint32_t now)
+{
+	uint32_t rc, nr;
+
+	if (g_dq_loss_mdf16 >= 65536u ||
+	    (uint32_t)(now - q->t_loss) < g_dq_loss_gap_us)
+		return 0;
+	hpft_dq_advance(q, now);
+	rc = q->rc;
+	nr = (uint32_t)(((uint64_t)rc * g_dq_loss_mdf16) >> 16);
+	q->rc = nr > HPFT_MIN_RATE ? nr : HPFT_MIN_RATE;
+	q->rt = g_dq_loss_rt_reset ? q->rc : rc;
+	q->st_t = 0;
+	q->st_b = 0;
+	q->bytes = 0;
+	q->t_rate = now;
+	q->t_loss = now;
+	return 1;
+}
+
+/* ===================== Swift, one window per QP =====================
+ * Kumar et al., SIGCOMM'20, fabric-delay half only (RDMA has no host-side
+ * endpoint delay to subtract) and delay-only (CNPs ignored). The window is
+ * this QP's own; before the SOURCE_QP change a whole VF pair shared one
+ * window and the port sat at 88 %, while the vendor's per-QP build reached
+ * 98 %. Thresholds are device-clock ns measured on THIS fabric. */
+#define SW_PKT       (1024u)
+#define SW_MIN_CWND  (SW_PKT)
+#define SW_MAX_CWND  ((1u << 20) - SW_PKT)
+#define SW_INIT_CWND (64u << 10)
+/* Tuned on this fabric 2026-09-07 following the paper's own procedure
+ * (section 3.5 and 5.1: pick the base target at the throughput knee, use
+ * flow scaling for fairness). The base RTT here is ~3 us and the BDP per
+ * QP with 32 QPs on a 200 G port is ~3 packets, so the paper's increment
+ * of one packet per RTT is a third of a window and overshoots; 256 B per
+ * RTT with a 40 us flow-scaling range gives 173.4 G of the 177.2 G
+ * ceiling, Jain 1.000 across eight flow sets and ~2e5 marked frames per
+ * 12 s (the paper's 1 packet / 20 us: 169 G, Jain 0.993, 5e6 marks).
+ * Base target 25 us, beta 0.8 and max_mdf 0.5 stay as in the paper. */
+static volatile uint32_t g_sw_base_target = 25000u;
+static volatile uint32_t g_sw_fs_range    = 40000u;
+static volatile uint32_t g_sw_alpha_ns    = 50000u;
+static volatile uint32_t g_sw_beta_ns     = 5000u;
+static volatile uint32_t g_sw_ai          = (SW_PKT / 4);
+static volatile uint32_t g_sw_beta16      = 52429u;   /* b = 0.8 */
+static volatile uint32_t g_sw_max_mdf16   = 32768u;   /* max_mdf = 0.5 */
+static volatile uint32_t g_sw_use_srtt    = 1u;
+/* 0xcd1 <0|1> 8: which RTT turns the window into the pacing rate. 1 = the
+ * smoothed RTT (lags the queue both ways: pacing runs ahead of the window
+ * while the queue builds and behind it while the queue drains, which
+ * deepens the trough where the link idles); 0 = the latest sample, the
+ * closest thing to a window's own self-clocking. */
+static volatile uint32_t g_sw_rate_srtt   = 2u;
 
 static inline uint32_t hpft_isqrt(uint32_t x)
 {
@@ -258,120 +372,248 @@ static inline uint32_t hpft_isqrt(uint32_t x)
 	}
 	return r;
 }
-#define HPFT_MAX_THREADS (256)
-#define HPFT_PAIR_QPS (64)          /* QPs tracked per pair for N */
-#define HPFT_QP_ACTIVE_EPOCHS (8u)  /* seen within this many epochs = active */
-#define HPFT_QP_FORGET_EPOCHS (2000u)
-/* How long a lower reading of N must stand before it is believed. See
- * the epoch block: N is one-sided on purpose. */
-#define HPFT_QP_HOLD_EPOCHS (64u)
 
-/* byte accumulation is sharded per DPA thread (each thread owns its slot),
- * so no atomics are needed on the hot path; the epoch winner sums the shards */
+/* ZTR-RTTCC, the vendor reference rate rule, one rate per QP */
+#define ZTR_UPDATE_FACTOR (((1u << 16) * 10u) / 100u)
+#define ZTR_AI            (((1u << 20) * 5u) / 100u)
+#define ZTR_BASE_RTT      (7000u)
+#define ZTR_MAX_DELAY     (70000u)
+#define ZTR_MIN_RATE      (1u << (20 - 14))
+#define ZTR_DEC_FACTOR      ((1u << 16) - ZTR_UPDATE_FACTOR)
+#define ZTR_CNP_DEC_FACTOR  ((1u << 16) - 2u * ZTR_UPDATE_FACTOR)
+#define ZTR_NACK_DEC_FACTOR ((1u << 16) - 5u * ZTR_UPDATE_FACTOR)
+
+/* ========================= per-QP record ========================= */
 typedef struct {
-	volatile uint32_t flowtag;
-	volatile uint32_t dst_tag;	/* dst_ip (0 = any/single-dst) */
-	volatile uint32_t budget;
-	volatile uint32_t level;
-	volatile uint32_t epoch_ts;	/* us, timer_lo domain */
-	volatile uint32_t avg_b32_x16;	/* EWMA of 32B-units per packet, x16 fixed point */
-	volatile uint32_t r_ewma;	/* smoothed measured rate, units */
-	volatile uint32_t dbg_r_units;
-	volatile uint32_t dbg_epochs;
-	volatile uint32_t dbg_ev_b32;
-	volatile uint32_t dbg_hits;	/* racy per-event counter for visibility */
-	volatile uint32_t remote_rx_rate;	/* receiver-measured RX rate (agent/NP fed) */
-	volatile uint32_t last_rrx_used;	/* control-step gating on fresh samples */
-	volatile uint32_t cc_rate;		/* the underneath-CC term, 2^20 units */
-	volatile uint32_t ztr_flags;		/* bit0 was_cnp, bit1 was_nack (ZTR) */
-	volatile uint32_t rtt_last;		/* last measured RTT, device units */
-	volatile uint32_t rtt_min;		/* smallest seen (= this fabric's base) */
-	volatile uint32_t rtt_n;		/* RTT measurements taken */
-	volatile uint32_t rtt_req_n;		/* RTT requests raised (rtt_req=1) */
-	volatile uint32_t dq_target;		/* DCQCN Rt */
-	volatile uint32_t dq_alpha;		/* DCQCN alpha, fxp16 */
-	volatile uint32_t dq_stage;		/* recovery stage counter */
-	volatile uint32_t dq_t_rate;		/* last rate-timer tick, device us */
-	volatile uint32_t dq_t_alpha;		/* last alpha-timer tick */
-	volatile uint32_t dq_t_loss;		/* last slow-restart cut, device us */
-	volatile uint32_t dq_n_loss;		/* slow-restart cuts taken (diag) */
-	volatile uint32_t remote_cap;		/* from NP RTT response payload w2 */
-	volatile uint32_t sw_cwnd;		/* Swift: window, bytes */
-	volatile uint32_t sw_rtt_s;		/* Swift: smoothed RTT, ns (1/4 EWMA) */
-	volatile uint32_t sw_last_dec;		/* Swift: device ns of the last cut */
-	volatile uint32_t sw_target;		/* Swift: last target, ns (diag) */
-	volatile uint32_t sw_n_dec;		/* Swift: cuts taken (diag) */
-	volatile uint32_t sw_n_nack;		/* Swift: loss cuts taken (diag) */
-	volatile uint32_t d;		/* the observer's deviation from the share,
-					 * fxp20; 1<<20 = the share itself */
-	volatile uint32_t cc_prev;	/* last cc_rate read, to see its decreases */
-	volatile uint32_t d_ts;		/* us, last recovery step */
-	volatile uint32_t paced;	/* rate last programmed, for the pace test */
-	volatile uint32_t d_cuts;	/* decreases the observer counted; d recovers
-					 * in about a millisecond, so sampling d
-					 * alone cannot show the branch working */
-	volatile uint32_t qp_count;	/* N: QPs the pair is sending on */
-	volatile uint32_t qp_hi;	/* highest reading seen during the current dip */
-	volatile uint32_t qp_dip;	/* epochs the reading has stood below qp_count */
-	/* map slots of the QPs this pair has seen; N = how many of them were
-	 * seen within the last HPFT_QP_ACTIVE_EPOCHS epochs (see the epoch
-	 * block) */
-	volatile uint32_t qp_slot[HPFT_PAIR_QPS];
-	volatile uint32_t qp_nslot;
-	volatile uint32_t trust;	/* fxp16, executor-owned (fence design) */
-	volatile uint32_t trust_mode;	/* 1: rate = clip(cc, (1-T)*level, level).
-				 * NOT a weighted average - that form leaks
-				 * upward (12% trust let 24 G through, measured)
-				 * and design v4 rejects it. */
-	volatile uint32_t qfrac;	/* fxp16: q/D_r from the sender agent */
-	volatile uint32_t start_win;	/* 1 while the agent says the flow-set is
-					 * in its start window (design v4 5.4):
-					 * loss is then not trust evidence */
-	volatile uint32_t loss_ts;	/* device us of the last NACK on this pair */
-	volatile uint32_t n_nack;	/* NACKs matched to this pair; 0 = never any,
-					 * which is what makes loss_ts readable */
-	volatile uint32_t loss_ep;	/* epochs the loss fast path, rather than the
-					 * trend window, is what granted the rise */
-	volatile uint32_t epoch_id;	/* bumped once per epoch, ages the map */
-	volatile uint32_t cnp_hits;	/* DIAG 2026-07-22: CNP events matched to THIS pair
-					 * (target>=0 && ev_type==ROCE_CNP), vs g_hpft_cnp_any
-					 * which counts CNP events reaching the callback at all -
-					 * cc_rate observed pinned at MAX under confirmed real
-					 * CNP traffic (dense-sampled, 25 queries/17s, zero
-					 * variance); splitting "seen" from "matched" isolates
-					 * whether the decrease is skipped at dispatch or at
-					 * pair lookup. */
-	volatile uint32_t b32_shard[HPFT_MAX_THREADS];
-} hpft_pair_t;
+	volatile uint32_t gen;       /* 0 = free; matched against the context */
+	volatile uint32_t key;       /* hpft_bind_key(vhca, qpn) this record is for */
+	volatile uint32_t qpn;
+	volatile uint32_t vhca;      /* the function (VF) this QP belongs to */
+	volatile uint32_t set;       /* flow-set index + 1; 0 = not known yet */
+	volatile uint32_t last_ts;
 
-static hpft_pair_t g_hpft_pairs[HPFT_PAIRS];
+	hpft_dq_t dq;                /* DCQCN */
 
-static inline void hpft_swift_reset(volatile hpft_pair_t *c)
+	volatile uint32_t sw_cwnd;   /* Swift window, bytes */
+	volatile uint32_t sw_rtt_s;  /* Swift smoothed RTT, device ns */
+	volatile uint32_t sw_last_dec;
+	volatile uint32_t sw_target;
+
+	volatile uint32_t cc_rate;   /* ZTR / AIMD rate, fxp20 */
+	volatile uint32_t flags;     /* bit0 was_cnp, bit1 was_nack */
+
+	volatile uint32_t rtt_last;
+	volatile uint32_t rtt_min;
+	volatile uint32_t rtt_n;
+	/* probe state machine (the vendor template's): one probe in flight,
+	 * re-requested when it was evidently lost */
+	volatile uint32_t pr_inflight;   /* a request has left on the wire */
+	volatile uint32_t pr_start;      /* event timestamp it left at */
+	volatile uint32_t pr_pending;    /* TX events since a request with none sent */
+	volatile uint32_t pr_abort;      /* consecutive aborts (timeout doubles) */
+
+	volatile uint32_t paced;     /* last rate written to the wire */
+	volatile uint32_t epoch_ts;
+
+	volatile uint32_t n_cnp;
+	volatile uint32_t n_nack;
+	volatile uint32_t n_tx;
+	volatile uint32_t avg_b32_x16;
+} hpft_q_t;
+
+static hpft_q_t g_q[HPFT_QSLOTS];
+static volatile uint32_t g_q_next;   /* round-robin allocator */
+static volatile uint32_t g_gen = 1;
+/* {(vhca, qpn) -> record slot}. The framework's algo context is the fast
+ * path to a QP's record, but it is not one per QP: measured 2026-09-08, two
+ * QPs of different VFs (vf1 qpn 578 and vf3 qpn 294 on hpft-dpu) took turns
+ * in ONE context, and QPs of equal number on different VFs did the same.
+ * Whatever the context is keyed by, the record must be keyed by the QP
+ * itself, so a context that turns up with another QP's number is treated
+ * as a cache miss and the record is found here instead. */
+#define HPFT_QMAP_SIZE (4096)
+static volatile uint32_t g_qmap_key[HPFT_QMAP_SIZE];
+static volatile uint32_t g_qmap_slot[HPFT_QMAP_SIZE];
+
+static inline int hpft_qmap_find(uint32_t key)
 {
-	c->sw_cwnd = SW_INIT_CWND;
-	c->sw_rtt_s = 0;
-	c->sw_last_dec = 0;
-	c->sw_target = 0;
-	c->sw_n_dec = 0;
-	c->sw_n_nack = 0;
+	uint32_t h = ((key + 1u) * 2654435761u) >> 20;   /* top 12 bits */
+
+	for (uint32_t pr = 0; pr < 16u; pr++) {
+		uint32_t i = (h + pr) % HPFT_QMAP_SIZE;
+
+		if (g_qmap_key[i] == key + 1u)
+			return (int)g_qmap_slot[i];
+		if (g_qmap_key[i] == 0)
+			return -1;
+	}
+	return -1;
 }
 
-/* One Swift step, run on every RTT event of the pair. rtt = this sample,
- * ts = device ns now. Writes the pair's cc_rate. */
-static inline void hpft_swift_step(volatile hpft_pair_t *c, uint32_t rtt, uint32_t ts)
+static inline void hpft_qmap_put(uint32_t key, uint32_t slot)
 {
-	uint32_t cwnd = c->sw_cwnd;
-	uint32_t rs = c->sw_rtt_s;
+	uint32_t h = ((key + 1u) * 2654435761u) >> 20;
+
+	for (uint32_t pr = 0; pr < 16u; pr++) {
+		uint32_t i = (h + pr) % HPFT_QMAP_SIZE;
+
+		if (g_qmap_key[i] == key + 1u || g_qmap_key[i] == 0) {
+			g_qmap_key[i] = key + 1u;
+			g_qmap_slot[i] = slot;
+			return;
+		}
+	}
+}
+
+/* ========================= per-flow-set ========================= */
+typedef struct {
+	volatile uint32_t id;        /* set id chosen by the sender agent; 0 free */
+	volatile uint32_t budget;    /* R, fxp20 */
+	volatile uint32_t sum_cc;    /* sum of c_j over the QPs drawing tokens */
+	volatile uint32_t nq;
+	volatile uint32_t qslot[HPFT_SET_QPS];
+	volatile uint32_t epoch_ts;
+	volatile uint32_t nlive;     /* QPs counted in sum_cc */
+} hpft_set_t;
+
+static hpft_set_t g_set[HPFT_SETS];
+
+/* {QP -> set id} learned from the sender agent (mailbox 0xb48e). A QP is
+ * named by (vhca_id, qpn), packed as vhca_id << 24 | qpn: QP numbers are
+ * unique per FUNCTION only, and eight VFs on one host each hand them out
+ * from their own allocator, so two VFs can own the same number at the same
+ * time (measured 2026-09-07: vf0 held 546..549 while vf1 held 470..473 --
+ * neighbours, not equal, that day). The event carries the function as
+ * vhca_id (dword 1 of the event, bits 16..31 in the little-endian view);
+ * the agent learns each VF's vhca_id from the DPU with vhca_of. An agent
+ * that has no such table sends the bare qpn as the key, and the lookup
+ * falls back to that. */
+#define HPFT_MAP_SIZE (2048)
+static volatile uint32_t g_map_qpn[HPFT_MAP_SIZE];
+static volatile uint32_t g_map_set[HPFT_MAP_SIZE];
+
+static inline uint32_t hpft_map_hash(uint32_t key)
+{
+	return ((key + 1u) * 2654435761u) % HPFT_MAP_SIZE;
+}
+
+static inline uint32_t hpft_bind_key(uint32_t vhca, uint32_t qpn)
+{
+	return ((vhca & 0xffu) << 24) | (qpn & 0xffffffu);
+}
+
+/* vhca_id of the function that owns this event's QP */
+static inline uint32_t hpft_ev_vhca(doca_pcc_dev_event_t *event)
+{
+	uint32_t v = __builtin_bswap32(((volatile uint32_t *)event)[1]);
+
+	return v >> 16;
+}
+
+static inline uint32_t hpft_map_get(uint32_t qpn)
+{
+	uint32_t h = hpft_map_hash(qpn);
+
+	for (uint32_t pr = 0; pr < 8u; pr++) {
+		uint32_t i = (h + pr) % HPFT_MAP_SIZE;
+
+		if (g_map_qpn[i] == qpn + 1u)
+			return g_map_set[i];
+		if (g_map_qpn[i] == 0)
+			return 0;
+	}
+	return 0;
+}
+
+static inline void hpft_map_put(uint32_t qpn, uint32_t set_id)
+{
+	uint32_t h = hpft_map_hash(qpn);
+
+	for (uint32_t pr = 0; pr < 8u; pr++) {
+		uint32_t i = (h + pr) % HPFT_MAP_SIZE;
+
+		if (g_map_qpn[i] == qpn + 1u || g_map_qpn[i] == 0) {
+			g_map_qpn[i] = qpn + 1u;
+			g_map_set[i] = set_id;
+			return;
+		}
+	}
+}
+
+static inline int hpft_set_of(uint32_t id)
+{
+	int free_i = -1;
+
+	if (!id)
+		return -1;
+	for (int i = 0; i < HPFT_SETS; i++) {
+		if (g_set[i].id == id)
+			return i;
+		if (free_i < 0 && g_set[i].id == 0)
+			free_i = i;
+	}
+	if (free_i >= 0) {
+		g_set[free_i].id = id;
+		g_set[free_i].budget = 0;
+		g_set[free_i].sum_cc = 0;
+		g_set[free_i].nq = 0;
+		g_set[free_i].nlive = 0;
+	}
+	return free_i;
+}
+
+/* ========================= diagnostics ========================= */
+static volatile uint32_t g_ev_tx, g_ev_cnp, g_ev_nack, g_ev_rtt;
+static volatile uint32_t g_q_alloc, g_q_bound;
+/* record re-inits (QP number changed under a context), stale unbinds, and
+ * TX events whose vhca word differs from the record's (diagnostic, 0xdf3) */
+static volatile uint32_t g_q_reinit, g_q_unbind, g_vhca_mis, g_last_qpn_mis, g_last_vhca_mis;
+/* events whose algo_slot is not 0: who they are (diagnostic, 0xdf2) */
+static volatile uint32_t g_ev_slot, g_slot_port[2], g_slot_type[4], g_slot_val, g_slot_maxval;
+
+static inline void hpft_q_init(volatile hpft_q_t *q, uint32_t now)
+{
+	q->key = 0;
+	q->qpn = 0;
+	q->vhca = 0;
+	q->set = 0;
+	q->last_ts = now;
+	hpft_dq_reset(&q->dq, now);
+	q->sw_cwnd = SW_INIT_CWND;
+	q->sw_rtt_s = 0;
+	q->sw_last_dec = now;
+	q->sw_target = 0;
+	q->cc_rate = DOCA_PCC_DEV_MAX_RATE;
+	q->flags = 0;
+	q->rtt_last = 0;
+	q->rtt_min = 0;
+	q->rtt_n = 0;
+	q->pr_inflight = 0;
+	q->pr_start = now;
+	q->pr_pending = 1;
+	q->pr_abort = 0;
+	q->paced = 0;
+	q->epoch_ts = now;
+	q->n_cnp = 0;
+	q->n_nack = 0;
+	q->n_tx = 0;
+	q->avg_b32_x16 = 34 * 16;
+}
+
+/* One Swift step per RTT sample, on this QP's own window. */
+static inline void hpft_swift_step(volatile hpft_q_t *q, uint32_t rtt, uint32_t ts)
+{
+	uint32_t cwnd = q->sw_cwnd;
+	uint32_t rs = q->sw_rtt_s;
 	uint32_t target, fs, s;
 
 	if (rs == 0)
 		rs = rtt;
 	else
 		rs = rs + (uint32_t)(((int32_t)(rtt - rs)) >> 2);
-	c->sw_rtt_s = rs;
+	q->sw_rtt_s = rs;
 
-	/* flow-scaled target: sqrt(cwnd_pkts) with 4 fractional bits */
-	s = hpft_isqrt(cwnd >> 2);            /* = 16 * sqrt(cwnd / 1024) */
+	s = hpft_isqrt(cwnd >> 2);          /* 16 * sqrt(cwnd / 1024) */
 	if (s == 0) {
 		fs = g_sw_fs_range;
 	} else {
@@ -382,553 +624,479 @@ static inline void hpft_swift_step(volatile hpft_pair_t *c, uint32_t rtt, uint32
 			fs = g_sw_fs_range;
 	}
 	target = g_sw_base_target + fs;
-	c->sw_target = target;
-	/* One probe per RTT is one sample, and this fabric's probe jitter
-	 * (sd ~1-2 us under load, base 2.7 us) would otherwise turn every tail
-	 * spike into a cut: measured 2026-08-27, six pairs held the port at
-	 * 83% with the mean RTT 3 us under target. The paper's per-ACK RTT
-	 * is smoother by construction; the EWMA stands in for that here. */
+	q->sw_target = target;
 	if (g_sw_use_srtt)
 		rtt = rs;
-
 	{
-		int can_dec = (uint32_t)(ts - c->sw_last_dec) >= rs;
+		int can_dec = (uint32_t)(ts - q->sw_last_dec) >= rs;
 
-		if ((c->ztr_flags & 2u) && can_dec) {
-			/* loss: the paper's fast-recovery cut */
+		if ((q->flags & 2u) && can_dec) {
 			cwnd = (uint32_t)(((uint64_t)cwnd * ((1u << 16) - g_sw_max_mdf16)) >> 16);
-			c->ztr_flags &= ~2u;
-			c->sw_last_dec = ts;
-			c->sw_n_nack++;
+			q->flags &= ~2u;
+			q->sw_last_dec = ts;
 		} else if (rtt < target) {
 			cwnd += g_sw_ai;
-			c->ztr_flags &= ~2u;   /* a stale NACK flag must not fire later */
+			q->flags &= ~2u;
 		} else if (can_dec) {
 			uint32_t diff = rtt - target;
 			uint32_t mdf;
 
 			if (diff > (1u << 21))
 				diff = 1u << 21;
-			/* diff/rtt in fxp16 without a 64-bit divide */
 			mdf = (diff << 10) / ((rtt >> 6) ? (rtt >> 6) : 1u);
 			mdf = (uint32_t)(((uint64_t)mdf * g_sw_beta16) >> 16);
 			if (mdf > g_sw_max_mdf16)
 				mdf = g_sw_max_mdf16;
 			cwnd = (uint32_t)(((uint64_t)cwnd * ((1u << 16) - mdf)) >> 16);
-			c->sw_last_dec = ts;
-			c->sw_n_dec++;
+			q->sw_last_dec = ts;
 		}
 	}
 	if (cwnd < SW_MIN_CWND)
 		cwnd = SW_MIN_CWND;
 	if (cwnd > SW_MAX_CWND)
 		cwnd = SW_MAX_CWND;
-	c->sw_cwnd = cwnd;
+	q->sw_cwnd = cwnd;
+}
 
-	/* rate per QP = cwnd / (rtt_s * N) in fxp20 of line rate:
-	 * (cwnd << 12) / ((25 * rtt_s * N) >> 8); cwnd <= 1 MB keeps it 32-bit */
-	{
-		uint32_t n = c->qp_count ? c->qp_count : 1;
-		uint32_t den = (SW_LINE_BPNS * rs * n) >> 8;
-		uint32_t r;
+/* The rate this QP's CC would put on the wire on its own. For Swift that is
+ * the window over its own smoothed RTT; 2^20 units, 25 B/ns at 200 G. */
+static inline uint32_t hpft_cc_rate(volatile hpft_q_t *q)
+{
+	if (g_algo == HPFT_CC_SWIFT) {
+		/* 0xcd1 <n> 8: which RTT turns the window into the pacing rate.
+		 * 0 latest sample, 1 smoothed, 2 the larger of the two (the lower
+		 * of the two rates: a low probe sample never turns into a burst,
+		 * a high one slows the QP at once), 3 the smaller of the two. */
+		uint32_t rs;
+		uint64_t r;
 
-		if (den == 0)
-			den = 1;
-		r = (cwnd << 12) / den;
+		if (g_sw_rate_srtt == 1u)
+			rs = q->sw_rtt_s;
+		else if (g_sw_rate_srtt == 2u)
+			rs = q->sw_rtt_s > q->rtt_last ? q->sw_rtt_s : q->rtt_last;
+		else if (g_sw_rate_srtt == 3u)
+			rs = (q->sw_rtt_s && q->sw_rtt_s < q->rtt_last) ? q->sw_rtt_s : q->rtt_last;
+		else
+			rs = q->rtt_last;
+
+		if (!rs)
+			rs = q->sw_rtt_s ? q->sw_rtt_s : (q->rtt_last ? q->rtt_last : 3000u);
+		r = ((uint64_t)q->sw_cwnd << 20) / (25ull * rs);
+
 		if (r > DOCA_PCC_DEV_MAX_RATE)
 			r = DOCA_PCC_DEV_MAX_RATE;
-		if (r < ZTR_MIN_RATE)
-			r = ZTR_MIN_RATE;
-		c->cc_rate = r;
+		return (uint32_t)(r ? r : HPFT_MIN_RATE);
 	}
+	if (g_algo == HPFT_CC_DCQCN)
+		return q->dq.rc;
+	return q->cc_rate;
 }
 
-/* Is the executor itself what is holding this flow back? Compares what the
- * flow achieved (receiver-measured where available, the event estimate
- * otherwise) against what we last programmed. Both are in the same units,
- * so this is a ratio test and needs no calibration. */
-static inline int hpft_pace_limited(volatile hpft_pair_t *c)
+/* per-QP 1 ms housekeeping: keep the membership asserted */
+static inline void hpft_q_epoch(volatile hpft_q_t *q, uint32_t now)
 {
-	uint32_t paced = c->paced;
-
-	if (paced == 0)
-		return 0;
-	return (uint64_t)c->dbg_r_units * 100u >= (uint64_t)paced * g_pace_pct;
+	if ((uint32_t)(now - q->epoch_ts) < HPFT_EPOCH_US)
+		return;
+	q->epoch_ts = now;
 }
 
-/* Read the CC and fold its decreases into d; recover d towards the share on
- * its own period. The CC is never written to - cc_prev is our copy of what
- * we last saw it at. */
-static inline void hpft_observe(volatile hpft_pair_t *c, uint32_t now)
-{
-	uint32_t cc = c->cc_rate;
-	uint32_t prev = c->cc_prev;
-
-	if (cc < prev) {
-		if (!hpft_pace_limited(c)) {
-			/* d <- d * cc/prev. Normalise first so the divide stays
-			 * 32-bit: prev is a rate in fxp20, so one shift is
-			 * enough to bring it inside 16 bits. */
-			uint32_t sh = (prev > 0xffffu) ? 5u : 0u;
-			uint32_t pn = prev >> sh;
-			uint32_t cn = cc >> sh;
-			uint32_t ratio = pn ? ((cn << 16) / pn) : (1u << 16);
-			uint32_t nd = (uint32_t)(((uint64_t)c->d * ratio) >> 16);
-
-			c->d = (nd < g_d_floor) ? g_d_floor : nd;
-			c->d_cuts++;
-		}
-		c->cc_prev = cc;
-	} else if (cc > prev) {
-		/* the CC's own increase is about its own free-running rate,
-		 * which nothing is pacing to; it says nothing about ours */
-		c->cc_prev = cc;
-	}
-	if ((uint32_t)(now - c->d_ts) >= g_d_recover_us) {
-		c->d_ts = now;
-		if (c->d < HPFT_D_ONE)
-			c->d = (HPFT_D_ONE >> 1) + (c->d >> 1);
-	}
-}
-static volatile uint32_t g_hpft_cnp_any;  /* DIAG: any ROCE_CNP event seen by the callback */
-#define HPFT_QPMAP_SIZE (8192)
-#define HPFT_QPMAP_PROBE (8)
-static volatile uint32_t g_qpn_key[HPFT_QPMAP_SIZE];  /* hpft_qkey(); 0 = empty */
-/* A QPN is numbered per function, so two VFs of one sender reuse the same
- * numbers: keyed by qpn alone, vf3's QPs landed on vf1's pair (2026-08-27,
- * six-pair run: qp_count read 0-3 for 10-QP pairs and the rate went to the
- * wrong pair). The flowtag is per (src function, dst function), so (qpn,
- * flowtag) is unique on this RP. */
-static inline uint32_t hpft_qkey(uint32_t qpn, uint32_t ft)
-{
-	uint32_t k = (qpn + 1u) ^ (ft << 8);
-
-	return k ? k : 1u;
-}
-static volatile uint32_t g_qpn_pair[HPFT_QPMAP_SIZE]; /* pair index */
-/* Epoch in which each mapped QP was last counted. The level is assigned as
- * budget/N, so N has to be the number of QPs actually SENDING, not the
- * number ever seen: perftest recreates QPs, and stale entries made the
- * count read 7 and 5 where four were running, which would under-rate the
- * pair by the same ratio. Counting per epoch ages entries out for free -
- * a QP that stops sending simply stops being counted. */
-static volatile uint32_t g_qpn_epoch[HPFT_QPMAP_SIZE];
-/* the sighting before the last one: a QP counts as active only if it was
- * seen in two different epochs within the window, which keeps a QP that
- * raises one event every few hundred milliseconds (perftest's control QP
- * does) from taking a full 1/N of the pair's budget for 8 ms each time */
-static volatile uint32_t g_qpn_epoch_prev[HPFT_QPMAP_SIZE];
-static volatile uint32_t g_qpn_map_active;
-static volatile uint32_t g_hpft_rtt_traces;
-static volatile uint32_t g_hpft_unknown_ft;
-static volatile uint32_t g_hpft_cc_algo = HPFT_CC_DCQCN;
-/* Rate for a flow whose flowtag has no pair entry yet. Was MAX_RATE (fail
- * open): a joining RDMA flow-set ran at line rate for the ~100 ms until
- * its first budget landed, which on a saturated receiver charged every
- * incumbent's virtual queue with a burst it did not cause (st_vq_split,
- * 2026-08-25). The sender agent sets this at startup (mailbox 0xccf) to a
- * conservative allowance; without an agent it stays MAX, i.e. the old
- * behaviour. */
-static volatile uint32_t g_hpft_unknown_rate = DOCA_PCC_DEV_MAX_RATE;
-/* fence design trust (executor-owned, design v4 6.2/6.3): trust is a
- * LEASE. It rises at (1-T)/tau_r per epoch only on evidence of a
- * bottleneck the receiver's ledger cannot see, and on every epoch without
- * that evidence it decays by T*max(q/D_r, dt/tau_d): the q term is
- * over-taking, the tau_d term is expiry. Expiry must exist because the
- * bottleneck's disappearance produces no network fact of its own (its only
- * trace is that loss stops), and a trusted pair can never over-take (the
- * clip's upper bound is the fence at every T), so without it trust is a
- * latch with no exit - measured decay ~278 s from probe-sawtooth crumbs
- * alone (V8a 2026-09-02), i.e. the floor guarantee stays suspended for
- * minutes after a transient bottleneck clears.
+/* per-set 1 ms housekeeping: sum c_j over the QPs drawing tokens.
  *
- * The rise evidence is LOSS. Our own rate limiter never drops a packet -
- * it only makes a QP wait - so a NACK is the fabric stating that it
- * dropped this pair's packets, a fact belonging to no particular CC. A
- * live lossy bottleneck renews the lease many times per second; a
- * persistent bottleneck the CC has settled under is re-probed slowly as
- * the floor creeps up - the unavoidable price of having an exit.
- *
- * Asking instead whether the CC is what BINDS the flow - the trend test
- * this replaces - cannot separate a CC that yields too early at a
- * bottleneck we DO manage from one facing a bottleneck we do not: both
- * read as "cc below the fence and not rising". In the first case that test
- * raises the trust exactly while the flow is giving its share away, which
- * is the wrong direction. The fence is feasible at the receiver's port by
- * construction, so enforcing it can never overrun that port; deferring to
- * the CC is only ever justified by a bottleneck somewhere else. */
-#define HPFT_TRUST_BELOW_FXP16  (55706u)   /* 1 - delta, delta = 0.15: the
-					    * design's one fulfilment
-					    * tolerance (registry
-					    * delta_demand); keep in step */
-#define HPFT_TRUST_IDLE_US      (5000000u) /* tau_d: a pair idle longer
-					    * restarts from T = 0 (6.4) */
-#define HPFT_LOSS_WIN_US        (100000u)  /* the observation window, in us */
-static volatile uint32_t g_trust_step = 66u;   /* fxp16 per epoch = 1 ms / 1 s */
-static volatile uint32_t g_trust_decay = 13u;  /* fxp16 per epoch = 1 ms / 5 s
-						* (tau_d); 0 = no expiry, the
-						* pre-lease latch, kept only as
-						* an experiment arm */
-static volatile uint32_t g_hpft_rtt_events;   /* RTT events seen, any flowtag */
-/* DIAG 2026-08-27: which event types carry a stable QPN? Per ev_type&7:
- * last qpn seen and how often it differed from the previous one. */
-static volatile uint32_t g_hpft_qpn_last[8];
-static volatile uint32_t g_hpft_qpn_chg[8];
-static volatile uint32_t g_hpft_ev_cnt[8];
-static volatile uint32_t g_hpft_rtt_unmatched; /* ... with no pair match */
-
-doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
-						      uint32_t request_size,
-						      uint32_t max_response_size,
-						      void *response,
-						      uint32_t *response_size)
+ * The member list is NEVER compacted and its length never shrinks: a
+ * departed QP's entry is retired in place. Compaction is what made this
+ * wrong before -- the epoch rewrote qslot[] and nq while another DPA thread
+ * was appending a newly bound QP, so an append could be lost, the QP
+ * vanished from the denominator, and the whole flow set then sent
+ * N/(N-1) of its rate (measured 2026-09-06 on the V1 shape: flow sets 16 %
+ * over their share while the port was already full). Losses are now
+ * self-healing instead of permanent, because every bound QP re-asserts its
+ * membership once per millisecond (hpft_q_epoch). */
+static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t sidx)
 {
-	(void)max_response_size;
-	(void)response;
-	*response_size = 0;
-	if (request_size >= 2 * sizeof(uint32_t)) {
-		uint32_t ft = ((volatile uint32_t *)request)[0];
-		uint32_t budget = ((volatile uint32_t *)request)[1];
-		int free_idx = -1;
+	uint32_t sum = 0, live = 0, n = s->nq;
 
-		if ((ft & 0xffff0000u) == 0xb48e0000u) {
-			/* qpn map: word0=0xB48E|n, then n x {qpn, pair_idx}. */
-			uint32_t n = ft & 0xffffu;
-			volatile uint32_t *req = (volatile uint32_t *)request;
+	if ((uint32_t)(now - s->epoch_ts) < HPFT_EPOCH_US)
+		return;
+	s->epoch_ts = now;
+	if (n > HPFT_SET_QPS)
+		n = HPFT_SET_QPS;
+	for (uint32_t k = 0; k < n; k++) {
+		uint32_t si = s->qslot[k];
+		volatile hpft_q_t *q;
 
-			if (request_size < (1 + 2 * n) * sizeof(uint32_t))
-				return DOCA_PCC_DEV_STATUS_OK;
-			for (uint32_t e = 0; e < n; e++) {
-				uint32_t qpn = req[1 + 2 * e];
-				uint32_t pidx = req[2 + 2 * e];
-				uint32_t qk = hpft_qkey(qpn, g_hpft_pairs[pidx % HPFT_PAIRS].flowtag);
-				uint32_t h = (qk * 2654435761u) % HPFT_QPMAP_SIZE;
+		if (si >= HPFT_QSLOTS)
+			continue;              /* retired or never written */
+		q = &g_q[si];
+		if (!q->gen || q->set != sidx + 1u ||
+		    (uint32_t)(now - q->last_ts) > HPFT_QP_STALE_US) {
+			/* gone, or an entry a lost append left pointing at a QP
+			 * that belongs to another set */
+			s->qslot[k] = HPFT_SET_EMPTY;
+			continue;
+		}
+		if ((uint32_t)(now - q->last_ts) > HPFT_ACTIVE_US)
+			continue;              /* not drawing: not in the sum */
+		sum += hpft_cc_rate(q);
+		live++;
+	}
+	s->sum_cc = sum;
+	s->nlive = live;
+}
 
-				for (uint32_t pr = 0; pr < HPFT_QPMAP_PROBE; pr++) {
-					uint32_t idx = (h + pr) % HPFT_QPMAP_SIZE;
+static inline void hpft_set_add(volatile hpft_set_t *s, uint32_t slot)
+{
+	uint32_t n = s->nq, free_k = HPFT_SET_QPS;
 
-					if (g_qpn_key[idx] == qk || g_qpn_key[idx] == 0) {
-						if (g_qpn_key[idx] == 0)
-							g_hpft_pairs[pidx % HPFT_PAIRS].qp_count++;
-						g_qpn_key[idx] = qk;
-						g_qpn_pair[idx] = pidx % HPFT_PAIRS;
-						break;
-					}
+	if (n > HPFT_SET_QPS)
+		n = HPFT_SET_QPS;
+	for (uint32_t k = 0; k < n; k++) {
+		if (s->qslot[k] == slot)
+			return;                /* already a member */
+		if (free_k == HPFT_SET_QPS && s->qslot[k] == HPFT_SET_EMPTY)
+			free_k = k;
+	}
+	if (free_k < HPFT_SET_QPS) {
+		s->qslot[free_k] = slot;
+		return;
+	}
+	if (n < HPFT_SET_QPS) {
+		s->qslot[n] = slot;
+		s->nq = n + 1;             /* a lost race is repaired next epoch */
+	}
+}
+/* Re-assert this QP's membership of its flow set. Cheap (a scan of at most
+ * HPFT_SET_QPS words once per millisecond) and it is what makes a lost
+ * append harmless. */
+static inline void hpft_q_reassert(volatile hpft_q_t *q, uint32_t slot)
+{
+	int si = (int)q->set - 1;
+
+	if (si >= 0 && si < HPFT_SETS) {
+		/* The agent may correct a binding after the fact (the
+		 * resolver's first answer for a QP can be a stale pairing
+		 * from the previous run: one vf2 QP listed under vf1's set,
+		 * 2026-09-08). Once a millisecond, follow the map: a QP
+		 * whose set id no longer matches lets go and is bound again
+		 * on its next TX event. */
+		uint32_t id = hpft_map_get(q->key);
+
+		if (!id)
+			id = hpft_map_get(q->qpn);
+		if (id && g_set[si].id != id) {
+			q->set = 0;
+			g_q_unbind++;
+			return;
+		}
+		hpft_set_add(&g_set[si], slot);
+	}
+}
+
+/*
+ * Main entry point to user CC algorithm.
+ *
+ * @algo_ctxt [in]: this QP's own 12 dwords, restored by the framework.
+ * @event [in]: the event.
+ * @attr [in]: algo type.
+ * @results [out]: the rate to program.
+ */
+/* The HyperFront handler proper. A separate, never-inlined function on
+ * purpose: the framework's entry point must stay as small as the vendor
+ * template's. This function has dozens of locals across its arms and the
+ * DPA build is -O0, so folding it into the entry point put a large stack
+ * frame on EVERY event, including the stock reference arm's (2026-09-07). */
+static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
+						      doca_pcc_dev_event_t *event,
+						      doca_pcc_dev_results_t *results)
+{
+	doca_pcc_dev_event_general_attr_t a = doca_pcc_dev_get_ev_attr(event);
+	uint32_t now;
+	volatile hpft_q_t *q;
+	uint32_t slot, want_rtt = 0, r;
+	volatile uint32_t *cx = (volatile uint32_t *)algo_ctxt;
+
+	results->rtt_req = 0;
+	now = doca_pcc_dev_get_timer_lo();
+
+	/* ---- this QP's record ----
+	 * The framework's algo context is the attribution the hardware gives:
+	 * a CNP, NACK or RTT event carries no usable QP number of its own (its
+	 * qpn word reads 1, the function's GSI QP, measured 2026-09-08), so
+	 * for those the context's record is the QP's record. A TX event does
+	 * carry its QP number, and a context is not strictly one per QP
+	 * (two data QPs of different VFs took turns in one context), so a TX
+	 * event whose number is not the context's is looked up in the
+	 * (vhca, qpn) table and gets its own record; the context then points
+	 * at that record until the other QP's next TX event. */
+	{
+		int ctx_ok = (cx[0] == HPFT_CTX_MAGIC && cx[1] < HPFT_QSLOTS && cx[2] &&
+			      g_q[cx[1]].gen == cx[2]);
+		uint32_t key = 0, eq = 0, ev = 0;
+		int found = -1;
+
+		slot = cx[1];
+		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX) {
+			eq = doca_pcc_dev_get_flow_qpn(event);
+			ev = hpft_ev_vhca(event);
+			key = hpft_bind_key(ev, eq);
+		}
+		if (ctx_ok && (!key || g_q[slot].key == key || !g_q[slot].key)) {
+			q = &g_q[slot];
+			if (key && !q->key) {
+				q->key = key;
+				q->qpn = eq;
+				q->vhca = ev;
+				hpft_qmap_put(key, slot);
+			}
+		} else {
+			if (ctx_ok) {
+				g_q_reinit++;
+				g_last_qpn_mis = (g_q[slot].qpn << 16) | (eq & 0xffffu);
+				g_last_vhca_mis = (g_q[slot].vhca << 16) | (ev & 0xffffu);
+			}
+			if (key)
+				found = hpft_qmap_find(key);
+			if (found >= 0 && g_q[found].gen && g_q[found].key == key) {
+				slot = (uint32_t)found;
+				q = &g_q[slot];
+			} else {
+				slot = g_q_next;
+				g_q_next = (slot + 1u) % HPFT_QSLOTS;
+				q = &g_q[slot];
+				hpft_q_init(q, now);
+				q->gen = g_gen ? g_gen : 1u;
+				g_gen = q->gen + 1u;
+				if (key) {
+					q->key = key;
+					q->qpn = eq;
+					q->vhca = ev;
+					hpft_qmap_put(key, slot);
 				}
+				g_q_alloc++;
 			}
-			g_qpn_map_active = 1;
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if ((ft & 0xfffe0000u) == 0xb47c0000u) {
-			/* batch update: word0 = 0xB47C0000|n, then n x
-			 * {flowtag, budget, rx_rate}. budget=0 deletes.
-			 * 0xB47D0000|n: four words per entry, the fourth is the
-			 * trust T (fxp16) in the tenant CC; the pair is then shaped
-			 * to T*cc + (1-T)*level per QP (fence design, 2026-08-26). */
-			uint32_t n = ft & 0xffffu;
-			uint32_t w = ((ft & 0xffff0000u) == 0xb47d0000u) ? 4u : 3u;
-			volatile uint32_t *req = (volatile uint32_t *)request;
-
-			if (request_size < (1 + w * n) * sizeof(uint32_t))
-				return DOCA_PCC_DEV_STATUS_OK;
-			for (uint32_t e = 0; e < n; e++) {
-				uint32_t eft = req[1 + w * e];
-				uint32_t ebud = req[2 + w * e];
-				uint32_t erx = req[3 + w * e];
-				uint32_t etr = (w == 4u) ? req[4 + w * e] : 0u;
-				int fidx = -1;
-
-				for (int i = 0; i < HPFT_PAIRS; i++) {
-					hpft_pair_t *c = &g_hpft_pairs[i];
-
-					if (c->flowtag == eft) {
-						if (ebud == 0) {
-							c->flowtag = 0;
-							c->qp_count = 0;
-							c->qp_hi = 0;
-							c->qp_dip = 0;
-						} else {
-							if (c->budget != ebud) {
-									/* proportional feed-forward: level tracks bud/N,
-									 * so rescaling by the cap ratio lands it on the
-									 * new bud/N in one step (any N); the small-step
-									 * integral then only fine-tunes. level=ebud would
-									 * overshoot to Nx target and force a slow (~430ms)
-									 * integral descent. */
-									{
-						uint32_t n = c->qp_count ? c->qp_count : 1;
-						uint32_t w = ebud / n;
-
-						c->level = w < HPFT_MIN_LEVEL
-							? HPFT_MIN_LEVEL : w;
-					}
-									c->budget = ebud;
-									c->last_rrx_used = erx; /* don't integrate on pre-change (stale) R */
-												}
-								c->remote_rx_rate = erx;
-								c->qfrac = etr & 0xffffu;
-								c->start_win = (etr >> 16) & 1u;
-								c->trust_mode = (w == 4u);
-						}
-						fidx = -2;
-						break;
-					}
-					if (fidx < 0 && c->flowtag == 0)
-						fidx = i;
-				}
-				if (fidx >= 0 && ebud != 0) {
-					hpft_pair_t *c = &g_hpft_pairs[fidx];
-
-					c->budget = ebud;
-					c->level = ebud;
-					c->cc_rate = DOCA_PCC_DEV_MAX_RATE;
-					c->d = HPFT_D_ONE;
-					c->cc_prev = DOCA_PCC_DEV_MAX_RATE;
-					c->paced = 0;
-					c->qp_count = 0;	/* relearned from events */
-					c->qp_hi = 0;
-					c->qp_dip = 0;
-					c->qp_nslot = 0;
-					c->remote_rx_rate = erx;
-					c->qfrac = etr & 0xffffu;
-								c->start_win = (etr >> 16) & 1u;
-					c->trust = 0;
-					c->loss_ts = 0;
-					c->n_nack = 0;
-					c->loss_ep = 0;
-					c->trust_mode = (w == 4u);
-					for (int s = 0; s < HPFT_MAX_THREADS; s++)
-						c->b32_shard[s] = 0;
-					c->epoch_ts = 0;
-					hpft_swift_reset(c);
-					c->flowtag = eft;
-				}
-			}
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-
-		if (ft == 0xccau) {
-			/* combiner arm: 0xcca <0|1>. 0 = min(cc, level), 1 = the
-			 * observed-decrease coupling. Neither touches the CC; the
-			 * switch resets only the observer's own state. */
-			g_hpft_couple = budget ? HPFT_COUPLE_D : HPFT_COUPLE_MIN;
-			for (int i = 0; i < HPFT_PAIRS; i++) {
-				g_hpft_pairs[i].d = HPFT_D_ONE;
-				g_hpft_pairs[i].cc_prev = g_hpft_pairs[i].cc_rate;
-				g_hpft_pairs[i].paced = 0;
-			}
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xdedu) {
-			/* observer readback: 0xded <pair>. The host prints a fixed
-			 * eleven words, so the slots are reused - in its output
-			 * ft=flowtag bud=level lvl=paced avg16=loss_ep r=d
-			 * s16=cc_rate ep=n_nack evb32=pace_limited, and w9 =
-			 * dq_n_loss, the slow-restart cuts this pair has taken.
-			 * avg16 and ep carried dbg_r_units and cc_prev, which
-			 * belong to the observer coupling and are dead under the
-			 * fence arm; dbg_r_units is still reported by 0xdea. */
-			hpft_pair_t *c = &g_hpft_pairs[budget % HPFT_PAIRS];
-			volatile uint32_t *rsp = (volatile uint32_t *)response;
-
-			rsp[0] = c->flowtag;
-			rsp[1] = c->level;
-			rsp[2] = c->paced;
-			rsp[3] = c->loss_ep;
-			rsp[4] = c->d;
-			rsp[5] = c->cc_rate;
-			rsp[6] = c->n_nack;
-			rsp[7] = (uint32_t)hpft_pace_limited(c);
-			rsp[8] = c->dbg_hits;   /* events the DPA processed for this pair */
-			rsp[9] = c->dq_n_loss;   /* slow-restart cuts on this pair */
-			rsp[10] = c->trust;
-			*response_size = 11 * sizeof(uint32_t);
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xccdu) {
-			/* CC selection: 0xccd <0|1>. 0 = DCQCN-flavoured term,
-			 * 1 = ZTR-RTTCC. Applies to every pair; the HyperFront
-			 * level control is untouched either way. Resetting the
-			 * per-pair CC state on the switch keeps the first epoch
-			 * after it from mixing the two algorithms' histories. */
-			g_hpft_cc_algo = budget;   /* 0 AIMD, 1 ZTR, 2 DCQCN, 3 Swift */
-			for (int i = 0; i < HPFT_PAIRS; i++) {
-				g_hpft_pairs[i].cc_rate = DOCA_PCC_DEV_MAX_RATE;
-				g_hpft_pairs[i].ztr_flags = 0;
-				g_hpft_pairs[i].dq_target = DOCA_PCC_DEV_MAX_RATE;
-				g_hpft_pairs[i].dq_alpha = DQ_ALPHA_ONE;
-				g_hpft_pairs[i].dq_stage = 0;
-				g_hpft_pairs[i].dq_t_loss = 0;
-				g_hpft_pairs[i].dq_n_loss = 0;
-				hpft_swift_reset(&g_hpft_pairs[i]);
-			}
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xcd0u) {
-			/* 0xcd0 <0|1>: auto-register any unknown flowtag as a pair
-			 * with budget MAX. This is the "HyperFront off" form for
-			 * the motivation runs: the CC term runs on every flow with
-			 * no policy share above it and no agent needed. */
-			g_hpft_autoreg = budget;
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xcd1u) {
-			/* Swift tunables: 0xcd1 <value> <which>. which: 0 base_target
-			 * ns, 1 fs_range ns, 2 alpha ns, 3 beta ns, 4 ai bytes,
-			 * 5 b fxp16, 6 max_mdf fxp16. */
-			uint32_t which = ((volatile uint32_t *)request)[2];
-
-			if (which == 0) g_sw_base_target = budget;
-			else if (which == 1) g_sw_fs_range = budget;
-			else if (which == 2) g_sw_alpha_ns = budget;
-			else if (which == 3) g_sw_beta_ns = budget;
-			else if (which == 4) g_sw_ai = budget;
-			else if (which == 5) g_sw_beta16 = budget;
-			else if (which == 6) g_sw_max_mdf16 = budget;
-			else if (which == 7) g_sw_use_srtt = budget;
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xdeeu) {
-			/* Swift readback: 0xdee <pair>. Host labels reused:
-			 * ft=flowtag bud=cwnd lvl=rtt_s avg16=target r=cc_rate
-			 * s16=n_dec ep=n_nack evb32=qp_count w8=rtt_last
-			 * w9=qp_nslot w10=rtt_n */
-			hpft_pair_t *c = &g_hpft_pairs[budget % HPFT_PAIRS];
-			volatile uint32_t *rsp = (volatile uint32_t *)response;
-
-			rsp[0] = c->flowtag;
-			rsp[1] = c->sw_cwnd;
-			rsp[2] = c->sw_rtt_s;
-			rsp[3] = c->sw_target;
-			rsp[4] = c->cc_rate;
-			rsp[5] = c->sw_n_dec;
-			rsp[6] = c->sw_n_nack;
-			rsp[7] = c->qp_count;
-			rsp[8] = c->rtt_last;
-			rsp[9] = c->qp_nslot;
-			rsp[10] = c->rtt_n;
-			*response_size = 11 * sizeof(uint32_t);
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xcceu) {
-			/* Executor tunables: 0xcce <value> <which>. 0-2 are
-			 * the three knobs a firmware DCQCN exposes: 0 = AI
-			 * (rpg_ai_rate), 1 = HAI (rpg_hai_rate), 2 = rate
-			 * timer us (rpg_time_reset), values in the device's
-			 * fxp20 rate units / microseconds. 7 = trust rise
-			 * step, 10 = trust expiry step (both fxp16/epoch;
-			 * 10 at 0 = the pre-lease latch arm). 8/9 = slow
-			 * restart cut factor fxp16 / throttle us. */
-			uint32_t which = ((volatile uint32_t *)request)[2];
-
-			if (which == 0) g_dq_ai = budget;
-			else if (which == 1) g_dq_hai = budget;
-			else if (which == 2) g_dq_time_us = budget ? budget : 1u;
-			else if (which == 4) g_d_floor = budget;
-			else if (which == 5) g_d_recover_us = budget ? budget : 1u;
-			else if (which == 6) g_pace_pct = budget;
-			else if (which == 7) g_trust_step = budget;
-			else if (which == 8) g_dq_loss_mdf16 = budget > 65536u ? 65536u : budget;
-			else if (which == 9) g_dq_loss_gap_us = budget;
-			else if (which == 10) g_trust_decay = budget > 65536u ? 65536u : budget;
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xccfu) {
-			/* 0xccf <rate units>: cap for flows with no pair entry */
-			g_hpft_unknown_rate = budget ? budget : DOCA_PCC_DEV_MAX_RATE;
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xdefu) {
-			volatile uint32_t *rsp = (volatile uint32_t *)response;
-
-			for (int i = 0; i < 8; i++)
-				rsp[i] = budget ? g_hpft_ev_cnt[i] : g_hpft_qpn_chg[i];
-			rsp[8] = g_hpft_qpn_last[0]; rsp[9] = g_hpft_qpn_last[1]; rsp[10] = g_hpft_qpn_last[2];
-			*response_size = 11 * sizeof(uint32_t);
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xdeau) {
-			volatile uint32_t *rsp = (volatile uint32_t *)response;
-
-			rsp[0] = g_hpft_unknown_ft;
-			for (int i = 1; i < 8; i++)
-				rsp[i] = 0;
-			*response_size = 8 * sizeof(uint32_t);
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xdebu) {
-			hpft_pair_t *c = &g_hpft_pairs[budget % HPFT_PAIRS];
-			volatile uint32_t *rsp = (volatile uint32_t *)response;
-
-			rsp[0] = c->flowtag;
-			rsp[1] = c->budget;
-			rsp[2] = c->level;
-			rsp[3] = c->remote_rx_rate;
-			rsp[4] = c->dbg_r_units;
-			rsp[5] = c->cc_rate;
-			rsp[6] = c->dbg_epochs;
-			rsp[7] = c->remote_cap;
-			rsp[8] = c->dq_alpha;
-			rsp[9] = c->dq_target;
-			rsp[10] = c->dq_stage;
-			*response_size = 11 * sizeof(uint32_t);
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		if (ft == 0xdecu) {  /* DIAG 2026-07-22: CNP dispatch/match diagnostic */
-			hpft_pair_t *c = &g_hpft_pairs[budget % HPFT_PAIRS];
-			volatile uint32_t *rsp = (volatile uint32_t *)response;
-
-			rsp[0] = g_hpft_cnp_any;
-			rsp[1] = c->cnp_hits;
-			rsp[2] = c->qp_count;
-			rsp[3] = c->cc_rate;
-			rsp[8] = g_hpft_rtt_events;
-			rsp[9] = c->rtt_req_n;
-			rsp[10] = c->rtt_n;
-			rsp[4] = c->dbg_hits;
-			rsp[5] = c->flowtag;
-			rsp[6] = c->rtt_last;
-			rsp[7] = c->rtt_min;
-			*response_size = 11 * sizeof(uint32_t);
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-
-		for (int i = 0; i < HPFT_PAIRS; i++) {
-			if (g_hpft_pairs[i].flowtag == ft) {
-				if (budget == 0) {
-					g_hpft_pairs[i].flowtag = 0;
-				} else {
-					hpft_pair_t *c = &g_hpft_pairs[i];
-					{
-						uint32_t n = c->qp_count ? c->qp_count : 1;
-						uint32_t w = budget / n;
-
-						c->level = w < HPFT_MIN_LEVEL
-							? HPFT_MIN_LEVEL : w;
-					}
-					c->budget = budget;
-				}
-				return DOCA_PCC_DEV_STATUS_OK;
-			}
-			if (free_idx < 0 && g_hpft_pairs[i].flowtag == 0)
-				free_idx = i;
-		}
-		if (budget != 0 && free_idx >= 0) {
-			g_hpft_pairs[free_idx].budget = budget;
-			g_hpft_pairs[free_idx].level = budget;
-			g_hpft_pairs[free_idx].cc_rate = DOCA_PCC_DEV_MAX_RATE;
-			g_hpft_pairs[free_idx].dq_target = DOCA_PCC_DEV_MAX_RATE;
-			g_hpft_pairs[free_idx].dq_alpha = DQ_ALPHA_ONE;
-			g_hpft_pairs[free_idx].dq_stage = 0;
-			g_hpft_pairs[free_idx].avg_b32_x16 = 34 * 16; /* ~1088B pkts */
-			for (int s = 0; s < HPFT_MAX_THREADS; s++)
-				g_hpft_pairs[free_idx].b32_shard[s] = 0;
-			g_hpft_pairs[free_idx].epoch_ts = 0;
-			hpft_swift_reset(&g_hpft_pairs[free_idx]);
-			g_hpft_pairs[free_idx].flowtag = ft;
+			cx[0] = HPFT_CTX_MAGIC;
+			cx[1] = slot;
+			cx[2] = q->gen;
 		}
 	}
-	return DOCA_PCC_DEV_STATUS_OK;
+	/* A QP silent for HPFT_QP_STALE_US is treated as departed: its set
+	 * has already retired it (hpft_set_epoch), and the number may by
+	 * now belong to a new QP of the same function that talks to another
+	 * destination (V3: vf4 after vf0). Drop the binding so the next TX
+	 * event looks the QP up in the agent's map again. */
+	if (q->set && (uint32_t)(now - q->last_ts) > HPFT_QP_STALE_US) {
+		q->set = 0;
+		g_q_unbind++;
+	}
+	q->last_ts = now;
+	if (g_algo == HPFT_CC_SWIFT && g_sw_ctx) {
+		/* state in the context: load it into the slot for this event */
+		if (cx[3]) {
+			q->sw_cwnd = cx[3];
+			q->sw_rtt_s = cx[4];
+			q->sw_last_dec = cx[5];
+			q->flags = cx[6];
+			q->rtt_last = cx[7];
+		}
+	}
+
+	/* ---- events ---- */
+	if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX) {
+		doca_pcc_dev_roce_tx_cntrs_t tc = doca_pcc_dev_get_roce_tx_cntrs(event);
+		uint32_t b32 = (uint32_t)tc.sent_32bytes;
+		uint32_t pkts = (uint32_t)tc.sent_pkts;
+
+		g_ev_tx++;
+		q->n_tx++;
+		if (!q->qpn) {
+			q->qpn = doca_pcc_dev_get_flow_qpn(event);
+			q->vhca = hpft_ev_vhca(event);
+		}
+		if (pkts > 0) {
+			uint32_t avg = q->avg_b32_x16, est;
+
+			/* the 16-bit byte counter clips at 2 MB per coalesced
+			 * event; estimate from packets x a learned average */
+			if (b32 < 32768u && pkts < 900u) {
+				uint32_t sample = (b32 << 4) / pkts;
+
+				avg = avg + ((int32_t)(sample - avg) >> 4);
+				if (avg < 16u)
+					avg = 16u;
+				q->avg_b32_x16 = avg;
+			}
+			est = (pkts * avg) >> 4;
+			if (g_algo == HPFT_CC_DCQCN)
+				hpft_dq_bytes(&q->dq, est << 5, now);
+		}
+		/* Probe cadence for the delay-based CCs, as the vendor template
+		 * does it: the request goes out with a data packet (TX flag
+		 * RTT_REQ_SENT); while one is in flight nothing is asked; a
+		 * request that has not left after two more TX events, or a
+		 * probe that has not returned within 300 us (doubling on each
+		 * abort), is asked again. Requesting only on the answer, with a
+		 * 1 ms fallback, lost about half the samples on this fabric
+		 * (26 K/s per QP against a 15-40 us RTT) and Swift, which
+		 * grows one packet per SAMPLE, ran 4 % under the vendor build. */
+		if (g_algo == HPFT_CC_SWIFT || g_algo == HPFT_CC_ZTR) {
+			uint32_t ets = doca_pcc_dev_get_timestamp(event);
+
+			if ((a.flags & DOCA_PCC_DEV_TX_FLAG_RTT_REQ_SENT) && !q->pr_inflight) {
+				q->pr_inflight = 1;
+				q->pr_pending = 0;
+				q->pr_start = ets;
+			} else {
+				uint32_t el = ets - q->pr_start;
+				uint32_t lim = HPFT_PROBE_ABORT_NS << (q->pr_abort > 8u ? 8u : q->pr_abort);
+
+				if (!q->pr_inflight) {
+					el = 0;
+					q->pr_pending++;
+				}
+				if (el > lim || q->pr_pending > 2u) {
+					want_rtt = 1;
+					if (el > lim)
+						q->pr_abort++;
+					q->pr_pending = 1;
+					q->pr_inflight = 0;
+				}
+			}
+		}
+		/* bind the QP to its flow set once the agent has told us */
+		if (!q->set && q->qpn) {
+			uint32_t id = hpft_map_get(hpft_bind_key(q->vhca, q->qpn));
+			int si;
+
+			if (!id)
+				id = hpft_map_get(q->qpn);   /* agent without a vhca table */
+			si = hpft_set_of(id);
+
+			if (si >= 0) {
+				q->set = (uint32_t)si + 1u;
+				hpft_set_add(&g_set[si], slot);
+				g_q_bound++;
+			}
+		}
+	} else if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
+		g_ev_cnp++;
+		q->n_cnp++;
+		if (g_algo == HPFT_CC_DCQCN)
+			hpft_dq_cnp(&q->dq, now);
+		else if (g_algo == HPFT_CC_ZTR)
+			q->flags |= 1u;
+		/* Swift is delay-only: an ECN mark carries no information */
+	} else if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_NACK) {
+		g_ev_nack++;
+		q->n_nack++;
+		if (g_algo == HPFT_CC_DCQCN)
+			hpft_dq_loss(&q->dq, now);
+		else
+			q->flags |= 2u;      /* ZTR and Swift cut on their next RTT */
+	} else if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT) {
+		uint32_t s0 = doca_pcc_dev_get_rtt_req_send_timestamp(event);
+		uint32_t s1 = doca_pcc_dev_get_timestamp(event);
+		uint32_t d = s1 - s0;
+
+		g_ev_rtt++;
+		q->rtt_last = d;
+		q->rtt_n++;
+		q->pr_inflight = 0;
+		q->pr_abort = 0;
+		q->pr_pending = 1;
+		if (q->rtt_min == 0 || d < q->rtt_min)
+			q->rtt_min = d;
+		if (g_algo == HPFT_CC_SWIFT) {
+			hpft_swift_step(q, d, s1);
+			want_rtt = 1;        /* one probe in flight per QP */
+		} else if (g_algo == HPFT_CC_ZTR) {
+			uint32_t rr = q->cc_rate;
+
+			if ((q->flags & 2u) && d >= ZTR_MAX_DELAY) {
+				rr = doca_pcc_dev_fxp_mult(ZTR_NACK_DEC_FACTOR, rr);
+				q->flags &= ~2u;
+			} else if ((q->flags & 1u) || d >= ZTR_MAX_DELAY) {
+				rr = doca_pcc_dev_fxp_mult(ZTR_CNP_DEC_FACTOR, rr);
+				q->flags &= ~1u;
+			} else if (d > ZTR_BASE_RTT) {
+				rr = doca_pcc_dev_fxp_mult(ZTR_DEC_FACTOR, rr);
+			} else {
+				rr += ZTR_AI;
+			}
+			if (rr > DOCA_PCC_DEV_MAX_RATE)
+				rr = DOCA_PCC_DEV_MAX_RATE;
+			if (rr < ZTR_MIN_RATE)
+				rr = ZTR_MIN_RATE;
+			q->cc_rate = rr;
+			want_rtt = 1;
+		}
+	}
+
+	if (g_algo == HPFT_CC_AIMD) {
+		uint32_t cr = q->cc_rate + (DOCA_PCC_DEV_MAX_RATE >> 8);
+
+		q->cc_rate = (cr < q->cc_rate || cr > DOCA_PCC_DEV_MAX_RATE)
+				     ? DOCA_PCC_DEV_MAX_RATE : cr;
+	}
+	if (g_algo == HPFT_CC_DCQCN)
+		hpft_dq_advance(&q->dq, now);
+
+	/* the per-QP epoch */
+	if ((uint32_t)(now - q->epoch_ts) >= HPFT_EPOCH_US) {
+		hpft_q_epoch(q, now);
+		hpft_q_reassert(q, slot);
+	}
+
+	/* ---- the rate: the QP's own CC rate, capped by the set's bucket ---- */
+	r = hpft_cc_rate(q);
+	if (!g_cc_only) {
+		int si = (int)q->set - 1;
+
+		if (si >= 0 && si < HPFT_SETS && g_set[si].budget) {
+			volatile hpft_set_t *s = &g_set[si];
+			uint32_t R, S, n;
+
+			hpft_set_epoch(s, now, (uint32_t)si);
+			R = s->budget;
+			S = s->sum_cc;
+			n = s->nlive ? s->nlive : (s->nq ? s->nq : 1u);
+			if (g_law == HPFT_LAW_EQUAL) {
+				r = R / n;
+			} else if (g_law == HPFT_LAW_CAP) {
+				uint32_t share = R / n;
+
+				r = r < share ? r : share;
+			} else if (S > R) {
+				/* the bucket is empty: share R in proportion to
+				 * how fast each QP draws, r_i = c_i * R / S. A QP
+				 * whose c_i is not in S yet (first millisecond)
+				 * can at most get its own c_i. */
+				uint64_t v = ((uint64_t)r * R) / S;
+
+				if (v > R)
+					v = R;
+				r = (uint32_t)v;
+			}
+			/* else the bucket is not binding: r = c_i */
+		} else {
+			/* the flow set is not known yet: fail into a bounded
+			 * rate rather than line rate, so a joining QP cannot
+			 * charge a saturated receiver for a whole control loop */
+			uint32_t u = g_unknown_rate;
+
+			r = r < u ? r : u;
+		}
+	}
+	if (r < HPFT_MIN_RATE)
+		r = HPFT_MIN_RATE;
+	if (g_algo == HPFT_CC_SWIFT && g_sw_ctx) {
+		cx[3] = q->sw_cwnd ? q->sw_cwnd : 1u;
+		cx[4] = q->sw_rtt_s;
+		cx[5] = q->sw_last_dec;
+		cx[6] = q->flags;
+		cx[7] = q->rtt_last;
+	}
+	q->paced = r;
+	results->rate = r;
+	results->rtt_req = want_rtt;
 }
 
 void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
@@ -936,705 +1104,258 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			    const doca_pcc_dev_attr_t *attr,
 			    doca_pcc_dev_results_t *results)
 {
-	uint32_t ft = doca_pcc_dev_get_flowtag(event);
-	doca_pcc_dev_event_general_attr_t a = doca_pcc_dev_get_ev_attr(event);
-	uint32_t now = doca_pcc_dev_get_timer_lo();
+	/* About half of the events arrive with algo_slot != 0. The vendor
+	 * template hands those to the framework's internal algorithm; doing
+	 * that here hands OUR data QPs to the firmware's own CC (measured
+	 * 2026-09-07: every arm, HyperFront included, then read 174.75 G and
+	 * the bucket no longer capped anything). Every flow is ours, whatever
+	 * slot the framework tags it with; the slot is only counted. */
+	if (attr->algo_slot != 0) {
+		doca_pcc_dev_event_general_attr_t ea = doca_pcc_dev_get_ev_attr(event);
 
-	uint32_t want_rtt = 0;
-
-	if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP)  /* DIAG 2026-07-22 */
-		g_hpft_cnp_any++;
-
-	(void)algo_ctxt;
-	(void)attr;
-	results->rtt_req = 0;
-	if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT)
-		g_hpft_rtt_events++;
-	if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT && g_hpft_rtt_traces < 8) {
-		uint32_t *w = (uint32_t *)doca_pcc_dev_get_rtt_raw_data(event);
-
-		g_hpft_rtt_traces++;
-		/* format 3: raw w0,w1,w2 + flowtag + now (any pair) */
-		doca_pcc_dev_trace_5(3, w[0], w[1], w[2], ft, now);
-		doca_pcc_dev_trace_flush();
+		g_ev_slot++;
+		g_slot_port[ea.port_num & 1u]++;
+		g_slot_type[ea.ev_type & 3u]++;
+		g_slot_val = attr->algo_slot;
+		if (attr->algo_slot > g_slot_maxval)
+			g_slot_maxval = attr->algo_slot;
 	}
-	int target = -1;
-	uint32_t qpn = doca_pcc_dev_get_flow_qpn(event);
-	/* Only the data path (ROCE_TX) is trusted to name a QP: the map is
-	 * learned and stamped from those events alone. Everything else still
-	 * resolves its pair by flowtag when the map misses. */
-	int learn = (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX);
-	{
-		uint32_t t = a.ev_type & 7u;
+	if (g_algo == HPFT_CC_STOCK) {
+		uint32_t port_num = doca_pcc_dev_get_ev_attr(event).port_num;
+		uint32_t *param = doca_pcc_dev_get_algo_params(port_num, attr->algo_slot);
+		uint32_t *counter = doca_pcc_dev_get_counters(port_num, attr->algo_slot);
+		volatile uint32_t *cx = (volatile uint32_t *)algo_ctxt;
 
-		g_hpft_ev_cnt[t]++;
-		if (g_hpft_qpn_last[t] != qpn) {
-			g_hpft_qpn_chg[t]++;
-			g_hpft_qpn_last[t] = qpn;
-		}
-	}
-	uint32_t qk = hpft_qkey(qpn, ft);
-	uint32_t qh = (qk * 2654435761u) % HPFT_QPMAP_SIZE;
-	int qslot = -1;
-
-	for (uint32_t pr = 0; pr < HPFT_QPMAP_PROBE; pr++) {
-		uint32_t idx = (qh + pr) % HPFT_QPMAP_SIZE;
-
-		if (g_qpn_key[idx] == qk) {
-			target = g_qpn_pair[idx];
-			/* a pair deleted and re-created (motivation runs do this
-			 * between runs) can land at another index while the map
-			 * still points at the old one: re-resolve by flowtag */
-			if (g_hpft_pairs[target].flowtag != ft) {
-				target = -1;
-				qslot = (int)idx;
-			}
-			break;
-		}
-		if (g_qpn_key[idx] == 0) {
-			qslot = (int)idx;	/* first free slot on this chain */
-			break;
-		}
-	}
-	if (target < 0) {
-		for (int i = 0; i < HPFT_PAIRS; i++) {
-			if (g_hpft_pairs[i].flowtag == ft) {
-				target = i;
-				break;
-			}
-		}
-		/* Learn the QP here, on the event path.
-		 *
-		 * qp_count is what normalises the CNP decrease: the cut is
-		 * (cc_rate>>6)/nqp precisely so that the AGGREGATE response of
-		 * a pair does not scale with how many QPs it happens to have.
-		 * It was only ever incremented by the 0xB48E qpn-map mailbox,
-		 * and the sender agent does not send that format - it sends
-		 * 0xB47C batches - so nqp was 1 for every pair in production
-		 * and a 4-QP flow backed off four times harder than designed.
-		 *
-		 * Alone that is invisible, because a lone flow sitting at its
-		 * cap draws no CNPs. Put two senders on one dst, let them
-		 * briefly overshoot, and the resulting CNP burst collapses
-		 * cc_rate; since recovery is additive (MAX>>8 per epoch) the
-		 * wire then stays near zero for seconds. Measured 2026-07-28
-		 * as an 8 s limit cycle with both senders stalling together.
-		 *
-		 * Learning from the event stream makes the count reflect what
-		 * is actually running, independently of which mailbox format
-		 * the host uses, and it costs one hash probe on a path that
-		 * already computed the hash.
-		 */
-		if (learn && target >= 0 && qslot >= 0 && qpn > 1) {
-			g_qpn_key[qslot] = qk;
-			g_qpn_pair[qslot] = (uint32_t)target;
-			/* seen now, countable from the NEXT epoch */
-			g_qpn_epoch[qslot] = g_hpft_pairs[target].epoch_id;
-			qh = (uint32_t)qslot;	/* count it below */
-		}
-	}
-	/* QP0 and QP1 are reserved by the IB spec for management (SMI and
-	 * GSI) and never carry data; the GSI QP in particular exists on
-	 * every RoCE device, is owned by ib_core, and stays live for the
-	 * lifetime of the port. Counting it toward N hands it a full 1/N of
-	 * the pair's allowance which it then never uses - measured
-	 * 2026-07-28 as one incast pair reading a stable N=5 against four
-	 * data QPs and delivering 4/5 of its budget. This is NOT an artefact
-	 * of the traffic generator: the same QP is present in any real
-	 * deployment, so the exclusion belongs in the device code.
-	 */
-	if (learn && target >= 0 && qpn > 1) {
-		/* Stamp the QP's map slot with this epoch and make sure the
-		 * pair knows the slot. N is computed at the epoch boundary as
-		 * the number of slots stamped within the last
-		 * HPFT_QP_ACTIVE_EPOCHS epochs. The earlier rule - count a QP
-		 * only if it raised an event in this epoch AND the previous
-		 * one - undercounted whenever TX events for a QP arrived less
-		 * than once per millisecond: N read 3 for a 4-QP pair about
-		 * half the time, and level = budget/3 put the pair 33% over
-		 * its budget (measured 2026-08-25, executor_step). */
-		uint32_t eid = g_hpft_pairs[target].epoch_id;
-
-		for (uint32_t pr = 0; pr < HPFT_QPMAP_PROBE; pr++) {
-			uint32_t idx = (qh + pr) % HPFT_QPMAP_SIZE;
-
-			if (g_qpn_key[idx] == qk) {
-				if (g_qpn_epoch[idx] != eid) {
-					hpft_pair_t *c = &g_hpft_pairs[target];
-					uint32_t k, n = c->qp_nslot;
-					int known = 0;
-
-					if (n > HPFT_PAIR_QPS)
-						n = HPFT_PAIR_QPS;
-					for (k = 0; k < n; k++)
-						if (c->qp_slot[k] == idx) {
-							known = 1;
-							break;
-						}
-					if (!known && n < HPFT_PAIR_QPS) {
-						c->qp_slot[n] = idx;
-						c->qp_nslot = n + 1;
-					}
-					g_qpn_epoch_prev[idx] = g_qpn_epoch[idx];
-					g_qpn_epoch[idx] = eid;
-				}
-				break;
-			}
-			if (g_qpn_key[idx] == 0)
-				break;
-		}
-	}
-	if (target >= 0) {
-		hpft_pair_t *c = &g_hpft_pairs[target];
-
-		/* freeze gates the MD side too: 0xccc <MAX> pins cc_rate so
-		 * rate == level exactly (pure policy plane, no CC term) */
-		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_CNP) {
-			c->cnp_hits++;  /* DIAG 2026-07-22 */
-			if (g_hpft_cc_algo == HPFT_CC_ZTR) {
-				/* ZTR applies the CNP decrease when the next RTT
-				 * measurement lands (reference behaviour): latch it */
-				c->ztr_flags |= 1u;
-			} else if (g_hpft_cc_algo == HPFT_CC_DCQCN) {
-				/* Rt = Rc ; Rc = Rc(1 - alpha/2) ; alpha += g(1-alpha) */
-				uint32_t a = c->dq_alpha;
-				uint32_t cut = (uint32_t)(((uint64_t)c->cc_rate * a) >> 17);
-
-				c->dq_target = c->cc_rate;
-				c->cc_rate = (c->cc_rate > cut + HPFT_MIN_LEVEL)
-						     ? (c->cc_rate - cut) : HPFT_MIN_LEVEL;
-				a += (uint32_t)(((uint64_t)(DQ_ALPHA_ONE - a) * DQ_G_FXP16) >> 16);
-				c->dq_alpha = (a > DQ_ALPHA_ONE) ? DQ_ALPHA_ONE : a;
-				c->dq_stage = 0;      /* congestion restarts recovery */
-			} else if (g_hpft_cc_algo == HPFT_CC_SWIFT) {
-				/* delay-only: ECN marks carry no information here */
-			} else {
-				/* fabric congestion: multiplicative decrease (DCQCN-style) */
-				uint32_t nqp = c->qp_count ? c->qp_count : 1;
-				uint32_t nr = c->cc_rate - ((c->cc_rate >> 6) / nqp);
-
-				c->cc_rate = (nr < HPFT_MIN_LEVEL) ? HPFT_MIN_LEVEL : nr;
-			}
-		}
-		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_NACK) {
-			/* Counted for every CC, not just the two that act on it:
-			 * the trust rule reads it as the network's own statement
-			 * of loss, which is true whichever algorithm is running
-			 * underneath (design v4 6.3 step three). */
-			c->loss_ts = now;
-			c->n_nack++;
-			if (g_hpft_cc_algo == HPFT_CC_ZTR ||
-			    g_hpft_cc_algo == HPFT_CC_SWIFT) {
-				/* these two apply their own loss cut when the
-				 * next RTT measurement lands */
-				c->ztr_flags |= 2u;
-			} else if (g_dq_loss_mdf16 < 65536u &&
-				   (uint32_t)(now - c->dq_t_loss) >= g_dq_loss_gap_us) {
-				/* slow restart, for the two CNP-driven terms
-				 * (AIMD and the DCQCN RP state machine): cut the
-				 * rate, put the recovery ladder back to its first
-				 * stage, and let the normal rate timer climb out
-				 * of it. Rt keeps the pre-loss rate so the climb
-				 * has somewhere to aim. alpha is deliberately
-				 * untouched. */
-				uint32_t nr = (uint32_t)(((uint64_t)c->cc_rate
-						* g_dq_loss_mdf16) >> 16);
-
-				c->dq_target = c->cc_rate;
-				c->cc_rate = (nr > HPFT_MIN_LEVEL) ? nr : HPFT_MIN_LEVEL;
-				c->dq_stage = 0;
-				c->dq_t_rate = now;
-				c->dq_t_loss = now;
-				c->dq_n_loss++;
-			}
-		}
-		if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT) {
-			/* The RTT responder is the remote NIC's HW handler; its
-			 * payload is the standard response, NOT NP-authored data.
-			 * remote_rx_rate/remote_cap stay agent/mailbox-fed only. */
-			{
-				/* Measure first, always: ZTR's BASE_RTT has to be
-				 * this deployment's base RTT, and that is only
-				 * knowable from the device's own clock. */
-				uint32_t s0 = doca_pcc_dev_get_rtt_req_send_timestamp(event);
-				uint32_t s1 = doca_pcc_dev_get_timestamp(event);
-				uint32_t d = s1 - s0;
-
-				c->rtt_last = d;
-				c->rtt_n++;
-				if (c->rtt_min == 0 || d < c->rtt_min)
-					c->rtt_min = d;
-				if (g_hpft_cc_algo == HPFT_CC_SWIFT) {
-					hpft_swift_step(c, d, s1);
-					/* one probe in flight: re-arm on return so the
-					 * update cadence is the RTT itself, not the
-					 * 1 ms epoch */
-					want_rtt = 1;
-				}
-			}
-			if (g_hpft_cc_algo == HPFT_CC_ZTR) {
-				/* ZTR-RTTCC core (DOCA rtt_template reference):
-				 * NACK / CNP / rtt-above-base each shrink the rate
-				 * by their own factor, an on-time measurement grows
-				 * it additively. This is the whole CC term; the
-				 * HyperFront level is applied on top by min(). */
-				uint32_t rtt = c->rtt_last;
-				uint32_t r = c->cc_rate;
-
-
-				if ((c->ztr_flags & 2u) && rtt >= ZTR_MAX_DELAY) {
-					r = doca_pcc_dev_fxp_mult(ZTR_NACK_DEC_FACTOR, r);
-					c->ztr_flags &= ~2u;
-				} else if ((c->ztr_flags & 1u) || rtt >= ZTR_MAX_DELAY) {
-					r = doca_pcc_dev_fxp_mult(ZTR_CNP_DEC_FACTOR, r);
-					c->ztr_flags &= ~1u;
-				} else if (rtt > ZTR_BASE_RTT) {
-					r = doca_pcc_dev_fxp_mult(ZTR_DEC_FACTOR, r);
-				} else {
-					r += ZTR_AI;
-				}
-				if (r > DOCA_PCC_DEV_MAX_RATE)
-					r = DOCA_PCC_DEV_MAX_RATE;
-				if (r < ZTR_MIN_RATE)
-					r = ZTR_MIN_RATE;
-				c->cc_rate = r;
-			}
-			if (g_hpft_rtt_traces < 8) {
-				g_hpft_rtt_traces++;
-				/* format 3: rtt_last, rtt_min, count, flowtag, now */
-				doca_pcc_dev_trace_5(3, c->rtt_last, c->rtt_min,
-						     c->rtt_n, ft, now);
-				doca_pcc_dev_trace_flush();
-			}
-		}
-		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX) {
-			doca_pcc_dev_roce_tx_cntrs_t tc = doca_pcc_dev_get_roce_tx_cntrs(event);
-			uint32_t rank = doca_pcc_dev_thread_rank() % HPFT_MAX_THREADS;
-			/* the 16-bit byte counter clips/wraps at 2MB per coalesced
-			 * event; the packet counter clips two orders of magnitude
-			 * later. Estimate bytes as pkts x avg-pkt-size, where the
-			 * average is learned (EWMA) from unclipped events only -
-			 * adapts to any MTU/message mix. */
-			uint32_t b32 = (uint32_t)tc.sent_32bytes;
-			uint32_t pkts = (uint32_t)tc.sent_pkts;
-
-			if (pkts > 0) {
-				uint32_t avg = c->avg_b32_x16;
-
-				if (b32 < 32768 && pkts < 900) {
-					uint32_t sample = (b32 << 4) / pkts;
-
-					avg = avg + ((int32_t)(sample - avg) >> 4);
-					if (avg < 16)
-						avg = 16; /* >= 32B/pkt */
-					c->avg_b32_x16 = avg;
-				}
-				uint32_t est = (pkts * avg) >> 4;
-
-				c->b32_shard[rank] += est;
-			}
-		}
-		c->dbg_hits++;
-		uint32_t old = c->epoch_ts;
-
-		if ((uint32_t)(now - old) >= HPFT_EPOCH_US) {
-			/* racy claim: concurrent winners are rare and the EWMA absorbs
-			 * the occasional double-computed epoch */
-			c->epoch_ts = now;
-			{
-				uint32_t n = c->qp_nslot, k, w = 0, act = 0;
-				uint32_t eid = c->epoch_id;
-
-				if (n > HPFT_PAIR_QPS)
-					n = HPFT_PAIR_QPS;
-				for (k = 0; k < n; k++) {
-					uint32_t idx = c->qp_slot[k];
-					uint32_t age = eid - g_qpn_epoch[idx];
-
-					if (g_qpn_key[idx] == 0 || age > HPFT_QP_FORGET_EPOCHS)
-						continue;      /* gone: drop the slot */
-					c->qp_slot[w++] = idx;
-					if (age <= HPFT_QP_ACTIVE_EPOCHS &&
-					    eid - g_qpn_epoch_prev[idx] <= HPFT_QP_ACTIVE_EPOCHS)
-						act++;
-				}
-				c->qp_nslot = w;
-				/* N divides the budget - level = budget/N, and every
-				 * QP of the pair is paced at level, so the pair puts
-				 * N_sending x level on the wire. The two errors are
-				 * not symmetric. Too HIGH an N under-rates the pair;
-				 * the receiver then sees r < E and its allocator
-				 * lends the slack out, which is what 4.3 of the
-				 * design says should happen to capacity nobody is
-				 * using. Too LOW an N over-rates it by N_real/N_read,
-				 * and that is our own executor putting more than the
-				 * budget onto the bottleneck the fence exists to
-				 * bound - the one thing the design promises cannot
-				 * happen.
-				 *
-				 * A QP earns its place in N by raising events, and a
-				 * paced QP raises them less often the harder we pace
-				 * it, so an active QP does drop out of the activity
-				 * window now and then. Measured 2026-08-31 with the
-				 * budget frozen at 24 G and ten QPs sending flat out:
-				 * N read 10 in 92.4% of samples, 9 in 5.2% and 8 in
-				 * 2.4%, so the pair ran 11% and 25% over budget in
-				 * those epochs. With the control loop switched off
-				 * entirely that still left 9% jitter on the wire,
-				 * which is what charges the receiver's ledger and
-				 * sets the fence hunting.
-				 *
-				 * So make the error one-sided: N rises the instant a
-				 * QP is seen, and falls only after the lower reading
-				 * has stood for HPFT_QP_HOLD_EPOCHS. What it falls to
-				 * is the HIGHEST reading over that window, not the
-				 * one at its end, so a dip landing on the boundary
-				 * cannot latch. N is never lowered to zero - an idle
-				 * pair keeps its last count, so the first QP to
-				 * resume does not briefly own the whole budget.
-				 */
-				if (act > c->qp_hi)
-					c->qp_hi = act;
-				if (act >= c->qp_count) {
-					c->qp_count = act;
-					c->qp_hi = act;
-					c->qp_dip = 0;
-				} else if (++c->qp_dip >= HPFT_QP_HOLD_EPOCHS) {
-					if (c->qp_hi)
-						c->qp_count = c->qp_hi;
-					c->qp_hi = 0;
-					c->qp_dip = 0;
-				}
-			}
-			c->epoch_id++;
-			{
-				uint32_t b32 = 0;
-
-				for (int s = 0; s < HPFT_MAX_THREADS; s++) {
-					b32 += c->b32_shard[s];
-					c->b32_shard[s] = 0;
-				}
-				uint32_t dt = (uint32_t)(now - old);
-				/* R in 2^20-of-200G units: bytes32*32B*8b / dt_us / 200e9 * 2^20 */
-				uint64_t r_units = ((uint64_t)b32 << 28) / ((uint64_t)dt * 200000u);
-				uint32_t bud = c->budget;
-				uint32_t rrx = c->remote_rx_rate;
-				uint32_t rs;
-
-				uint32_t do_ctrl = 1;
-
-				if (rrx != 0) {
-					/* receiver-measured RX rate (agent-fed): exact,
-					 * no event-loss undercount. One control step per
-					 * fresh sample - R updates slower than epochs. */
-					rs = rrx;
-					c->r_ewma = rrx;
-					if (rrx == c->last_rrx_used)
-						do_ctrl = 0;
-					else
-						c->last_rrx_used = rrx;
-				} else {
-					/* fallback: smoothed TX-event estimate */
-					rs = c->r_ewma;
-					rs = rs + (uint32_t)(((int64_t)r_units - (int64_t)rs) >> 2);
-					c->r_ewma = rs;
-				}
-
-				c->dbg_r_units = rs;
-				c->dbg_epochs++;
-				c->dbg_ev_b32 = b32;
-
-				/* The level assignment below is stateless, so it needs
-				 * neither a fresh-measurement gate nor a settle hold -
-				 * both existed to protect an integral from acting on a
-				 * measurement that had not caught up. do_ctrl and rs
-				 * survive only as diagnostics. */
-				(void)do_ctrl;
-				if (bud > 0) {
-					/* small-step integral control: with 1000+ flows the
-					 * per-flow rate-application latency (event cadence)
-					 * makes fast level swings leave stale-rate mass;
-					 * a slowly-moving level converges every flow onto
-					 * the same L* and the integral term pins R to B. */
-					/* The level is ASSIGNED, not searched for.
-					 *
-					 * results->rate = min(cc_rate, level) is applied
-					 * to each of the pair's QPs, so the aggregate the
-					 * pair puts on the wire is N x level and the level
-					 * that delivers exactly the budget is budget/N.
-					 * Both terms are known here: the budget arrives in
-					 * the mailbox, and N is counted from the event
-					 * stream each epoch. There is nothing left to
-					 * search for.
-					 *
-					 * This is the same move the response law upstream
-					 * makes: when the target is known, computing it
-					 * beats converging on it. An integral search needs
-					 * a step size, a clip, a floor to stop it digging
-					 * and a hold to keep it from integrating against a
-					 * measurement that has not caught up yet - four
-					 * parameters and four ways to wind up. A large
-					 * budget step-down is exactly the input that finds
-					 * them: measured 2026-07-28, budget 11.25G with the
-					 * wire held at 29.3G for ~2 s, then the level dug
-					 * through the target to its minimum and both
-					 * senders stalled for ~3 s, cycling every 8 s.
-					 * Assignment has no state to wind up, so that whole
-					 * class of failure has nowhere to live.
-					 *
-					 * rs is no longer used to steer the level - it stays
-					 * only as the diagnostic the probe reports. What
-					 * remains dynamic is cc_rate, which is the response
-					 * to actual fabric congestion and belongs on its own
-					 * timescale; min() lets whichever is tighter bind.
-					 *
-					 * A QP that is idle this epoch is not counted, so an
-					 * unused share is not silently handed to its
-					 * siblings here - the allocator upstream owns that
-					 * decision and sees it as r < u.
-					 */
-					uint32_t n = c->qp_count ? c->qp_count : 1;
-					uint32_t want = bud / n;
-
-					if (want < HPFT_MIN_LEVEL)
-						want = HPFT_MIN_LEVEL;
-					c->level = want;
-				}
-				if (c->trust_mode) {
-					/* executor-owned trust, once per epoch */
-					uint32_t t = c->trust;
-					uint32_t qf = c->qfrac > 65536u ? 65536u : c->qfrac;
-					uint32_t under, lost;
-
-					/* 6.4: idle longer than tau_d restarts
-					 * from zero (old = this pair's previous
-					 * epoch stamp) */
-					if (g_trust_decay &&
-					    (uint32_t)(now - old) > HPFT_TRUST_IDLE_US)
-						t = 0;
-					under = (qf == 0 &&
-						 (uint64_t)c->cc_rate * 65536u <
-						 (uint64_t)c->level * HPFT_TRUST_BELOW_FXP16);
-					lost = (under && !c->start_win && c->n_nack &&
-						(uint32_t)(now - c->loss_ts) < HPFT_LOSS_WIN_US);
-					if (lost) {
-						/* evidence present: rise; at least
-						 * one tick so T really reaches 1 */
-						uint32_t inc = (uint32_t)(((uint64_t)(65536u - t)
-							* g_trust_step) >> 16);
-
-						if (!inc && t < 65536u && g_trust_step)
-							inc = 1;
-						t += inc;
-						c->loss_ep++;
-					} else if (t) {
-						/* over-taking or expiry,
-						 * whichever bites harder; at
-						 * least 1, or the fxp16 floor
-						 * parks T at decay/65536
-						 * (measured: stuck at 0.077) */
-						uint32_t d = (uint32_t)(((uint64_t)t
-							* (qf > g_trust_decay
-							   ? qf : g_trust_decay)) >> 16);
-
-						t -= d ? d : (g_trust_decay ? 1u : 0u);
-					}
-					c->trust = t > 65536u ? 65536u : t;
-				}
-				if (g_hpft_cc_algo == HPFT_CC_AIMD) {
-					/* AIMD backstop: fixed additive step per epoch */
-					uint32_t cr = c->cc_rate + (DOCA_PCC_DEV_MAX_RATE >> 8);
-
-					c->cc_rate = (cr < c->cc_rate || cr > DOCA_PCC_DEV_MAX_RATE)
-							     ? DOCA_PCC_DEV_MAX_RATE : cr;
-				} else if (g_hpft_cc_algo == HPFT_CC_DCQCN) {
-					/* alpha decays on its own timer; recovery advances
-					 * on the rate timer. The epoch is 1 ms, so both
-					 * are counted in epochs against their us periods. */
-					uint32_t us = now;   /* device timer, us granularity */
-
-					if (us - c->dq_t_alpha >= g_dq_alpha_us) {
-						uint32_t a = c->dq_alpha;
-
-						c->dq_alpha = a - (uint32_t)(((uint64_t)a * DQ_G_FXP16) >> 16);
-						c->dq_t_alpha = us;
-					}
-					if (us - c->dq_t_rate >= g_dq_time_us) {
-						uint32_t rt = c->dq_target;
-						uint32_t rc = c->cc_rate;
-
-						/* Rt is the pre-congestion rate to climb back
-						 * to; it can never sit below the current rate
-						 * (an uninitialised or stale Rt would otherwise
-						 * halve the rate on every timer tick). */
-						if (rt < rc)
-							rt = rc;
-
-						c->dq_stage++;
-						if (c->dq_stage >= 2u * DQ_F_STAGES)
-							rt += g_dq_hai;      /* hyper increase */
-						else if (c->dq_stage >= DQ_F_STAGES)
-							rt += g_dq_ai;       /* additive increase */
-						/* below F: pure fast recovery, Rt unchanged */
-						if (rt > DOCA_PCC_DEV_MAX_RATE)
-							rt = DOCA_PCC_DEV_MAX_RATE;
-						c->dq_target = rt;
-						rc = (rt >> 1) + (rc >> 1);   /* Rc = (Rt+Rc)/2 */
-						c->cc_rate = (rc > DOCA_PCC_DEV_MAX_RATE)
-								     ? DOCA_PCC_DEV_MAX_RATE : rc;
-						c->dq_t_rate = us;
-					}
-				}
-				want_rtt = 1;
-			}
-		}
-		uint32_t cc = c->cc_rate;
-		uint32_t lvl = c->level;
-
-		if (c->trust_mode) {
-			/* design v4 6.1: r = clip(cc, (1-T)*level, level). The
-			 * fence is the upper bound at every trust value - trust
-			 * buys the right to send LESS, never more - and the
-			 * lower bound opens linearly with trust. Inside the band
-			 * the QP is paced at exactly what the CC asked for, so a
-			 * CC that is behaving sees an unmodified fabric and its
-			 * own loop is intact. */
-			uint64_t t = c->trust;
-			uint32_t lo = (uint32_t)(((uint64_t)lvl
-					* (65536u - t)) >> 16);
-			uint32_t r = cc < lvl ? cc : lvl;
-
-			if (r < lo)
-				r = lo;
-			if (r < HPFT_MIN_LEVEL)
-				r = HPFT_MIN_LEVEL;
-			c->paced = r;
-			results->rate = r;
-		} else if (g_hpft_couple == HPFT_COUPLE_D) {
-			/* reading the CC is work only this arm needs; the min()
-			 * arm must not pay for it, or it stops being the
-			 * baseline its measurements are taken as */
-			uint32_t r;
-
-			hpft_observe(c, now);
-			r = (uint32_t)(((uint64_t)c->d * lvl) >> 20);
-			if (r < HPFT_MIN_LEVEL)
-				r = HPFT_MIN_LEVEL;
-			c->paced = r;
-			results->rate = r;
-		} else {
-			results->rate = (cc < lvl) ? cc : lvl;
-		}
-		results->rtt_req = want_rtt;
-		if (want_rtt)
-			c->rtt_req_n++;
+		/* a context this file touched before the arm was selected (QP
+		 * numbers, hence flow tags and contexts, are reused from run
+		 * to run) would be read as a running flow: hand over a clean one */
+		if (cx[0] == HPFT_CTX_MAGIC)
+			for (int i = 0; i < 12; i++)
+				cx[i] = 0;
+		rtt_template_algo(event, param, counter, algo_ctxt, results);
 		return;
 	}
-	/* no pair entry for this flowtag: fail open (probe occasionally so the
-	 * receiver-driven channel can be tested on any flow) */
-	g_hpft_unknown_ft = ft;
-	if (a.ev_type == DOCA_PCC_DEV_EVNT_RTT)
-		g_hpft_rtt_unmatched++;
-	if (g_hpft_autoreg && ft != 0) {
-		/* claim a free pair for this flowtag at budget MAX; a lost race
-		 * between two DPA threads leaves a duplicate entry, of which the
-		 * first match is the one every later event uses - harmless */
-		for (int i = 0; i < HPFT_PAIRS; i++) {
-			hpft_pair_t *c = &g_hpft_pairs[i];
-
-			if (c->flowtag != 0)
-				continue;
-			c->budget = DOCA_PCC_DEV_MAX_RATE;
-			c->level = DOCA_PCC_DEV_MAX_RATE;
-			c->cc_rate = DOCA_PCC_DEV_MAX_RATE;
-			c->d = HPFT_D_ONE;
-			c->cc_prev = DOCA_PCC_DEV_MAX_RATE;
-			c->paced = 0;
-			c->qp_count = 0;
-			c->qp_hi = 0;
-			c->qp_dip = 0;
-			c->qp_nslot = 0;
-			c->ztr_flags = 0;
-			c->rtt_min = 0;
-			c->rtt_last = 0;
-			c->rtt_n = 0;
-			c->rtt_req_n = 0;
-			c->cnp_hits = 0;
-			c->dq_target = DOCA_PCC_DEV_MAX_RATE;
-			c->dq_alpha = DQ_ALPHA_ONE;
-			c->dq_stage = 0;
-			c->avg_b32_x16 = 34 * 16;
-			for (int s = 0; s < HPFT_MAX_THREADS; s++)
-				c->b32_shard[s] = 0;
-			c->epoch_ts = 0;
-			hpft_swift_reset(c);
-			c->flowtag = ft;
-			break;
-		}
-		results->rtt_req = 1;
-		results->rate = g_hpft_unknown_rate;
-		return;
-	}
-	{
-		static volatile uint32_t g_hpft_fo_cnt;
-
-		g_hpft_fo_cnt++;
-		if ((g_hpft_fo_cnt & 1023u) == 0)
-			results->rtt_req = 1;
-	}
-	results->rate = g_hpft_unknown_rate;
+	hpft_user_algo(algo_ctxt, event, results);
 }
 
 /*
- * Main entry point to user algorithm initialization (reference code)
- * This function starts the user algorithm initialization code
- * The function will be called once per process load and should init all supported
- * algorithms and all ports
+ * Mailbox from the host: policy, knobs and read-back.
+ */
+doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
+						      uint32_t request_size,
+						      uint32_t max_response_size,
+						      void *response,
+						      uint32_t *response_size)
+{
+	(void)max_response_size;
+	*response_size = 0;
+	if (request_size < 2 * sizeof(uint32_t))
+		return DOCA_PCC_DEV_STATUS_FAIL;
+	{
+		volatile uint32_t *req = (volatile uint32_t *)request;
+		uint32_t ft = req[0];
+		uint32_t budget = req[1];
+
+		/* {QP -> set id} map: word0 = 0xB48E|n, then n x {key, set},
+		 * key = vhca_id << 24 | qpn (or the bare qpn, see hpft_bind_key) */
+		if ((ft & 0xffff0000u) == 0xb48e0000u) {
+			uint32_t n = ft & 0xffffu;
+
+			if (request_size < (1 + 2 * n) * sizeof(uint32_t))
+				return DOCA_PCC_DEV_STATUS_OK;
+			for (uint32_t e = 0; e < n; e++)
+				hpft_map_put(req[1 + 2 * e], req[2 + 2 * e]);
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		/* flow-set budgets: word0 = 0xB47F|n, then n x {set id, budget} */
+		if ((ft & 0xffff0000u) == 0xb47f0000u) {
+			uint32_t n = ft & 0xffffu;
+
+			if (request_size < (1 + 2 * n) * sizeof(uint32_t))
+				return DOCA_PCC_DEV_STATUS_OK;
+			for (uint32_t e = 0; e < n; e++) {
+				uint32_t id = req[1 + 2 * e];
+				uint32_t bud = req[2 + 2 * e];
+				int si = hpft_set_of(id);
+
+				if (si < 0)
+					continue;
+				if (!bud) {
+					g_set[si].id = 0;
+					g_set[si].nq = 0;
+					g_set[si].budget = 0;
+				} else {
+					g_set[si].budget =
+						bud > DOCA_PCC_DEV_MAX_RATE
+							? DOCA_PCC_DEV_MAX_RATE : bud;
+				}
+			}
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		/* 0xccd <n>: which tenant CC to run */
+		if (ft == 0xccdu) {
+			g_algo = budget;
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		/* 0xcce <value> <which>: parameters and arms */
+		if (ft == 0xcceu && request_size >= 3 * sizeof(uint32_t)) {
+			uint32_t which = req[2];
+
+			if (which == 0) g_dq_ai = budget;
+			else if (which == 1) g_dq_hai = budget;
+			else if (which == 2) g_dq_time_us = budget ? budget : 1u;
+			else if (which == 3) g_dq_f = budget;
+			else if (which == 8) g_dq_loss_mdf16 = budget > 65536u ? 65536u : budget;
+			else if (which == 9) g_dq_loss_gap_us = budget;
+			else if (which == 10) g_dq_loss_rt_reset = budget ? 1u : 0u;
+			else if (which == 11) g_dq_clamp_mode = budget ? 1u : 0u;
+			else if (which == 12) g_cc_only = budget ? 1u : 0u;
+			else if (which == 16) { g_dq_g16 = budget > 65535u ? 65535u : budget; hpft_dq_gpow_init(); }
+			else if (which == 17) g_dq_alpha_us = budget ? budget : 1u;
+			else if (which == 18) g_dq_bytes = budget ? budget : 1u;
+			else if (which == 19) g_dq_monitor_us = budget;
+			else if (which == 20) g_law = budget ? HPFT_LAW_CAP : HPFT_LAW_BUCKET;   /* legacy NOFLOOR */
+			else if (which == 21) g_unknown_rate = budget ? budget : DOCA_PCC_DEV_MAX_RATE;
+			else if (which == 22) g_law = budget > 2u ? HPFT_LAW_BUCKET : budget;
+			else if (which == 25) g_sw_ctx = budget ? 1u : 0u;
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		/* 0xcd1 <value> <which>: Swift parameters */
+		if (ft == 0xcd1u && request_size >= 3 * sizeof(uint32_t)) {
+			uint32_t which = req[2];
+
+			if (which == 0) g_sw_base_target = budget;
+			else if (which == 1) g_sw_fs_range = budget;
+			else if (which == 2) g_sw_alpha_ns = budget;
+			else if (which == 3) g_sw_beta_ns = budget;
+			else if (which == 4) g_sw_ai = budget ? budget : 1u;
+			else if (which == 5) g_sw_beta16 = budget;
+			else if (which == 6) g_sw_max_mdf16 = budget;
+			else if (which == 7) g_sw_use_srtt = budget ? 1u : 0u;
+			else if (which == 8) g_sw_rate_srtt = budget > 3u ? 0u : budget;
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		/* 0xded <slot>: per-flow-set read-back: id, R, sum of paced,
+		 * sum of cc over the whole list, sum of cc over drawing QPs, nlive, nq */
+		if (ft == 0xdedu) {
+			volatile hpft_set_t *s = &g_set[budget % HPFT_SETS];
+			volatile uint32_t *rsp = (volatile uint32_t *)response;
+			uint32_t sum_paced = 0, sum_cc = 0, k;
+
+			for (k = 0; k < s->nq && k < HPFT_SET_QPS; k++) {
+				uint32_t si = s->qslot[k];
+
+				if (si < HPFT_QSLOTS) {
+					sum_paced += g_q[si].paced;
+					sum_cc += hpft_cc_rate(&g_q[si]);
+				}
+			}
+			rsp[0] = s->id;
+			rsp[1] = s->budget;
+			rsp[2] = sum_paced;
+			rsp[3] = sum_cc;
+			rsp[4] = s->sum_cc;
+			rsp[5] = s->nlive;
+			rsp[6] = s->nq;
+			rsp[7] = g_ev_slot;
+			*response_size = 8 * sizeof(uint32_t);
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		/* 0xdee <slot>: per-QP read-back (qpn, set, cc rate, the set's
+		 * sum_cc, paced, last rtt, cnp count, vhca_id) */
+		if (ft == 0xdeeu) {
+			volatile hpft_q_t *q = &g_q[budget % HPFT_QSLOTS];
+			volatile uint32_t *rsp = (volatile uint32_t *)response;
+
+			rsp[0] = q->qpn;
+			rsp[1] = q->set;
+			rsp[2] = hpft_cc_rate(q);
+			rsp[3] = g_algo == HPFT_CC_SWIFT ? q->sw_cwnd
+				 : (q->set ? g_set[(q->set - 1) % HPFT_SETS].sum_cc : 0);
+			rsp[4] = q->paced;
+			rsp[5] = g_algo == HPFT_CC_SWIFT ? (q->rtt_min << 16 | (q->rtt_last & 0xffffu)) : q->rtt_last;
+			rsp[6] = q->n_cnp;
+			rsp[7] = q->vhca;
+			*response_size = 8 * sizeof(uint32_t);
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		/* 0xdf2: the slot != 0 events: total, on port 0, on port 1, by
+		 * event type (0..3 = the ev_type low bits), last slot value, max */
+		if (ft == 0xdf2u) {
+			volatile uint32_t *rsp = (volatile uint32_t *)response;
+
+			rsp[0] = g_ev_slot;
+			rsp[1] = g_slot_port[0];
+			rsp[2] = g_slot_port[1];
+			rsp[3] = g_slot_type[0];
+			rsp[4] = g_slot_type[1];
+			rsp[5] = g_slot_type[2];
+			rsp[6] = g_slot_type[3];
+			rsp[7] = g_slot_val | (g_slot_maxval << 16);
+			*response_size = 8 * sizeof(uint32_t);
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		/* 0xdf3: binding diagnostics */
+		if (ft == 0xdf3u) {
+			volatile uint32_t *rsp = (volatile uint32_t *)response;
+
+			rsp[0] = g_q_reinit;
+			rsp[1] = g_q_unbind;
+			rsp[2] = g_vhca_mis;
+			rsp[3] = g_q_bound;
+			rsp[4] = g_q_alloc;
+			rsp[5] = g_ev_tx;
+			rsp[6] = g_last_qpn_mis;    /* record's qpn << 16 | event's qpn (low 16) */
+			rsp[7] = g_last_vhca_mis;   /* record's vhca << 16 | event's vhca (low 16) */
+			*response_size = 8 * sizeof(uint32_t);
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+		/* 0xdef: event and binding counters */
+		if (ft == 0xdefu) {
+			volatile uint32_t *rsp = (volatile uint32_t *)response;
+
+			rsp[0] = g_ev_tx;
+			rsp[1] = g_ev_cnp;
+			rsp[2] = g_ev_nack;
+			rsp[3] = g_ev_rtt;
+			rsp[4] = g_q_alloc;
+			rsp[5] = g_q_bound;
+			rsp[6] = g_algo;
+			rsp[7] = g_cc_only | (g_law << 8);
+			*response_size = 8 * sizeof(uint32_t);
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
+	}
+	return DOCA_PCC_DEV_STATUS_OK;
+}
+
+/*
+ * Main entry point to user algorithm initialization.
  *
- * @disable_event_bitmask [out]: user code can tell the infrastructure which event
- * types to ignore (mask out). Events of this type will be dropped and not passed to
- * any algo
+ * @disable_event_bitmask [out]: event types to drop.
  */
 void doca_pcc_dev_user_init(uint32_t *disable_event_bitmask)
 {
 	uint32_t algo_idx = 0, algo_slot = 0, algo_en = 1;
 
-	/* Initialize algorithm with algo_idx=0 */
 	rtt_template_init(algo_idx);
 
 	for (int port_num = 0; port_num < DOCA_PCC_DEV_MAX_NUM_PORTS; ++port_num) {
-		/* Slot 0 will use algo_idx 0, default enabled */
 		doca_pcc_dev_init_algo_slot(port_num, algo_slot, algo_idx, algo_en);
 		doca_pcc_dev_trace_5(0, port_num, algo_idx, algo_slot, algo_en, DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK);
 	}
 
-
-	/* disable events of below type */
 	*disable_event_bitmask = DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK;
-	if (DOCA_PCC_DEV_ACK_NACK_TX_EVENT_DISABLED_SUPPORTED == 1) {
+	if (DOCA_PCC_DEV_ACK_NACK_TX_EVENT_DISABLED_SUPPORTED == 1)
 		*disable_event_bitmask |= (1 << DOCA_PCC_DEV_EVNT_ROCE_TX_FOR_ACK_NACK);
-	}
 
+	hpft_dq_gpow_init();
 	doca_pcc_dev_printf("%s, disable_event_bitmask=0x%x\n", __func__, *disable_event_bitmask);
 	doca_pcc_dev_trace_flush();
 }
 
 /*
  * Called when the parameter change was set externally.
- * The implementation should:
- *     Check the given new_parameters values. If those are correct from the algorithm perspective,
- *     assign them to the given parameter array.
-
- * @port_num [in]: index of the port
- * @algo_slot [in]: Algo slot identifier as referred to in the PPCC command field "algo_slot"
- * if possible it should be equal to the algo_idx
- * @param_id_base [in]: id of the first parameter that was changed.
- * @param_num [in]: number of all parameters that were changed
- * @new_param_values [in]: pointer to an array which holds param_num number of new values for parameters
- * @params [in]: pointer to an array which holds beginning of the current parameters to be changed
- * @return -
- * DOCA_PCC_DEV_STATUS_OK: Parameters were set
- * DOCA_PCC_DEV_STATUS_FAIL: the values (one or more) are not legal. No parameters were changed
  */
 doca_pcc_dev_error_t doca_pcc_dev_user_set_algo_params(uint32_t port_num,
 						       uint32_t algo_slot,
@@ -1643,11 +1364,6 @@ doca_pcc_dev_error_t doca_pcc_dev_user_set_algo_params(uint32_t port_num,
 						       const uint32_t *new_param_values,
 						       uint32_t *params)
 {
-	/* Notify the user that a change happened to take action.
-	 * I.E.: Pre calculate values to be used in the algo that are based on the parameter value.
-	 * Support more complex checks. E.G.: Param is a bit mask - min and max do not help
-	 * Param dependency checking.
-	 */
 	doca_pcc_dev_error_t ret = DOCA_PCC_DEV_STATUS_OK;
 
 	switch (algo_slot) {
@@ -1658,7 +1374,6 @@ doca_pcc_dev_error_t doca_pcc_dev_user_set_algo_params(uint32_t port_num,
 			ret = rtt_template_set_algo_params(param_id_base, param_num, new_param_values, params);
 		else
 			ret = DOCA_PCC_DEV_STATUS_FAIL;
-
 		break;
 	}
 	default:

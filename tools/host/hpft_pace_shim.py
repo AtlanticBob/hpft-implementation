@@ -50,7 +50,9 @@ def _gen_for(pair, rate_bps):
 
 TCP_PIN_DIR = Path("/sys/fs/bpf/hpft_tcp_edt")
 TCP_REGISTRY = "/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-tcp-registry.json"
-BURST_BYTES = 262_144
+# per CONNECTION now (each has its own clock): one TSO super-packet, the
+# least a clock can hand out at once, is also the natural burst
+BURST_BYTES = 65_536
 LISTEN = ("0.0.0.0", 9711)
 RE_EVNIC = re.compile(r"^(\w+)/vf(\d+)$")
 
@@ -116,14 +118,9 @@ def main():
                 dst_vnic=emap[msg["dst_vnic"]],
                 rate_bps=int(msg["rate_bps"]),
                 burst_bytes=BURST_BYTES,
-                # design v4 §6: bit31 selects the clip arm r = clip(cc,
-                # (1-T) rate, rate) in the BPF program; the low 16 bits carry
-                # the queue fraction q/D (fxp16) that drives the trust decay;
-                # bit30 = start window (§5.4): the BPF program takes no loss
-                # evidence for the trust while it is set
-                flags=((0x80000000 | (0x40000000 if msg.get("start") else 0)
-                        | int(round(min(max(float(msg["trust"]), 0.0), 1.0) * 65535)))
-                       if "trust" in msg else 0),
+                # the BPF program reads only rate_bps (the flow set's R)
+                # and burst_bytes (per connection); flags are unused
+                flags=0,
                 generation=_gen_for((msg["src_vnic"], msg["dst_vnic"]),
                                     int(msg["rate_bps"])))
             writer.update(upd)

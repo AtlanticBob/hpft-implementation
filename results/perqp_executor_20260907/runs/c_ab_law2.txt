@@ -1,0 +1,14 @@
+#    class  flow                       Gb/s
+0    rdma   sgpu01/vf0>sgpu02/vf0     20.64
+1    rdma   sgpu01/vf1>sgpu02/vf1     20.07
+2    rdma   sgpu01/vf2>sgpu02/vf2     20.51
+3    rdma   sgpu01/vf3>sgpu02/vf3     20.45
+4    rdma   sgpu03/vf0>sgpu02/vf0     20.62
+5    rdma   sgpu03/vf1>sgpu02/vf1     20.67
+6    rdma   sgpu03/vf2>sgpu02/vf2     20.54
+7    rdma   sgpu03/vf3>sgpu02/vf3     20.29
+TOTAL 163.79 Gb/s
+arm: algo=2 cc_only=0 law=2 agents=1 tcp_cc=cubic
+  sgpu01 readback algo/cc_only = 512 w8=0 w9=0 w10=0
+  sgpu03 readback algo/cc_only = 512 w8=0 w9=0 w10=0
+== c_ab_law2 (ALGO=2 LAW=2): TOTAL 163.79 Gb/s | switch swp37s0: ecn_marked=100707621 drops=0 wire=170.0G (85% of 200)

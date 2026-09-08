@@ -309,7 +309,7 @@
     }
   ],
   "rdma_flowtags": {
-    "comment": "per-(src,dst) PCC flowtags, probed via 0xdea 2026-07-11; sgpu03/sgpu04 added 2026-08-23. The tag hashes (src function, dst function) and is stable across QP recreation, IP choice and reflash. KNOWN COLLISION: src vf1 and src vf2 produce identical tags for every dst (rows below are equal), so vf1->X and vf2->X RDMA budgets are inseparable at the RP - never schedule both concurrently. tx_agent_e keys RDMA budgets by 'src>dst' with fallback to the per-vnic flowtag.  CARD-INDEPENDENT (2026-08-23): sgpu03 and sgpu04 return the same tag as sgpu01 for all four straight pairs, so the hash reads the function INDEX, not the card. Each sender DPU runs its own RP, so identical tags on different senders are not a collision. The vf1/vf2 SOURCE collision noted above is a property of the index hash and therefore applies to every sender node alike. The sgpu03/sgpu04 cross-pair rows were carried over from that argument and then CHECKED: vf0>vf1, vf3>vf0, vf1>vf3 and vf2>vf1 probed on sgpu03 all came back equal to the sgpu01 rows. Probing a cross pair needs the NON-CM path (-x <gid>, not -R): with rdma_cm the kernel picks the source VF from the destination subnet, the flow is really a straight pair, and the tag read back is the destination's own - which is what three of four first readings were before the method was fixed.",
+    "comment": "DESTINATION MATTERS (2026-09-04): the tag is independent of the source card but not of the destination (vf0>vf0 reads 0x74249a41 towards sgpu02 and 0x1e3dac89 towards sgpu04), so every receiving host needs its own rows, measured with tools/lab-infra/flowtag_probe.sh; tx_agent_e resolves a pair with no row by (source VF index, destination vnic). Rows for sgpu01/sgpu03/sgpu04 as destinations are straight pairs only (vfK>vfK), which is all the validation suite uses. per-(src,dst) PCC flowtags, probed via 0xdea 2026-07-11; sgpu03/sgpu04 added 2026-08-23. The tag hashes (src function, dst function) and is stable across QP recreation, IP choice and reflash. KNOWN COLLISION: src vf1 and src vf2 produce identical tags for every dst (rows below are equal), so vf1->X and vf2->X RDMA budgets are inseparable at the RP - never schedule both concurrently. tx_agent_e keys RDMA budgets by 'src>dst' with fallback to the per-vnic flowtag.  CARD-INDEPENDENT (2026-08-23): sgpu03 and sgpu04 return the same tag as sgpu01 for all four straight pairs, so the hash reads the function INDEX, not the card. Each sender DPU runs its own RP, so identical tags on different senders are not a collision. The vf1/vf2 SOURCE collision noted above is a property of the index hash and therefore applies to every sender node alike. The sgpu03/sgpu04 cross-pair rows were carried over from that argument and then CHECKED: vf0>vf1, vf3>vf0, vf1>vf3 and vf2>vf1 probed on sgpu03 all came back equal to the sgpu01 rows. Probing a cross pair needs the NON-CM path (-x <gid>, not -R): with rdma_cm the kernel picks the source VF from the destination subnet, the flow is really a straight pair, and the tag read back is the destination's own - which is what three of four first readings were before the method was fixed.",
     "sgpu01/vf0>sgpu02/vf0": "0x74249a41",
     "sgpu01/vf0>sgpu02/vf1": "0x3100bbe8",
     "sgpu01/vf0>sgpu02/vf2": "0xfe6cd913",
@@ -357,7 +357,33 @@
     "sgpu04/vf3>sgpu02/vf0": "0xb61f934b",
     "sgpu04/vf3>sgpu02/vf1": "0xf33bb2e2",
     "sgpu04/vf3>sgpu02/vf2": "0x3c57d019",
-    "sgpu04/vf3>sgpu02/vf3": "0x7973f1b0"
+    "sgpu04/vf3>sgpu02/vf3": "0x7973f1b0",
+    "sgpu03/vf0>sgpu04/vf0": "0x1e3dac89",
+    "sgpu03/vf1>sgpu04/vf1": "0x7bed0ea3",
+    "sgpu03/vf2>sgpu04/vf2": "0xb4816c58",
+    "sgpu03/vf3>sgpu04/vf3": "0x136ac778",
+    "sgpu03/vf4>sgpu04/vf4": "0xcc573e90",
+    "sgpu03/vf5>sgpu04/vf5": "0xa9879cba",
+    "sgpu03/vf6>sgpu04/vf6": "0x66ebfe41",
+    "sgpu03/vf7>sgpu04/vf7": "0x42d25b6d",
+    "sgpu01/vf0>sgpu04/vf0": "0x1e3dac89",
+    "sgpu01/vf1>sgpu04/vf1": "0x7bed0ea3",
+    "sgpu01/vf0>sgpu03/vf0": "0x6720ec9d",
+    "sgpu01/vf1>sgpu03/vf1": "0x2f04eb7",
+    "sgpu01/vf2>sgpu03/vf2": "0xcd9c2c4c",
+    "sgpu01/vf3>sgpu03/vf3": "0x6a77876c",
+    "sgpu01/vf4>sgpu03/vf4": "0xb54a7e84",
+    "sgpu01/vf5>sgpu03/vf5": "0xd09adcae",
+    "sgpu01/vf6>sgpu03/vf6": "0x1ff6be55",
+    "sgpu01/vf7>sgpu03/vf7": "0x3bcf1b79",
+    "sgpu03/vf0>sgpu01/vf0": "0x41280125",
+    "sgpu03/vf1>sgpu01/vf1": "0x24f8a30f",
+    "sgpu03/vf2>sgpu01/vf2": "0xeb94c1f4",
+    "sgpu03/vf3>sgpu01/vf3": "0x4c7f6ad4",
+    "sgpu03/vf4>sgpu01/vf4": "0x9342933c",
+    "sgpu03/vf5>sgpu01/vf5": "0xf6923116",
+    "sgpu03/vf6>sgpu01/vf6": "0x39fe53ed",
+    "sgpu03/vf7>sgpu01/vf7": "0x1dc7f6c1"
   },
   "rdma_rules": [
     {
@@ -644,7 +670,7 @@
     "per_sender_weights": {}
   },
   "control": {
-    "comment": "Scheme-E control plane addressing. telemetry: host -> its DPU's in-band ctl IP (PF1 SF on underlay-p1, rides the p1/switch data path per design_e §3.4 user note). pace_shim: sender host -> shim addr as reachable from that host's DPU (tmfifo). tree_stub_bps = static Tree_f until M5's sender tree. rate_export: receiver host -> its DPU rx_agent (tmfifo), fresh kernel-path byte counter for class attribution (2026-07-11).",
+    "comment": "Control plane addressing. Every node may send and receive (2026-09-04), so every map covers every host. telemetry_ip: host -> its DPU in-band ctl IP on p1 (the receiver agent sends feedback there; the sender agent sends its liveness feed to every other node there). pace_shim: host -> its TCP pace shim as reachable from its own DPU (tmfifo). tree_stub_bps = static Tree_f fallback. rate_export: retired 2026-07-13 (the vport meter replaced the host exporter), kept only as the documented fallback.",
     "telemetry_ip": {
       "sgpu01": "10.1.9.1",
       "sgpu02": "10.1.9.2",
@@ -653,6 +679,7 @@
     },
     "pace_shim": {
       "sgpu01": "192.168.102.1:9711",
+      "sgpu02": "192.168.102.1:9711",
       "sgpu03": "192.168.101.1:9711",
       "sgpu04": "192.168.101.1:9711"
     },
@@ -665,7 +692,7 @@
     "rate_export_ms": 5
   },
   "e_params": {
-    "comment": "design_v4.md: the fence law. The receiver keeps a virtual-queue ledger per flow-set (Q <- clip(Q + A - E, 0, D*E)) and sends only q = Q/E; the sender steps the fence multiplicatively R <- R*exp(alpha*min(m,m_max))*exp(-kappa*dq)*exp(-(kappa/D)*min(q,D)). Every constant below is per-feedback and dimensionless, so none of them change with link rate or flow count - see design_theory_v4.md §5 (scale invariance) and §6, which derives kappa, D and alpha_max from just two measurements (period T_p, loop delay tau) and two dimensionless choices (damping zeta, overshoot budget epsilon). HEADROOM=0.08: ~3% queue-warning margin plus the ~5% VxLAN encap tax (inner-byte ledger vs outer-byte wire, measured 4.99% at 1500 MTU).",
+    "comment": "design_v4.md: the fence law. The receiver keeps a virtual-queue ledger per flow-set (Q <- clip(Q + A - E, 0, D*E)) and sends only q = Q/E; the sender steps the fence multiplicatively R <- R*exp(alpha*min(m,m_max))*exp(-kappa*dq)*exp(-(kappa/D)*min(q,D)). Every constant below is per-feedback and dimensionless, so none of them change with link rate or flow count - see design_theory_v4.md §5 (scale invariance) and §6, which derives kappa, D and alpha_max from just two measurements (period T_p, loop delay tau) and two dimensionless choices (damping zeta, overshoot budget epsilon). HEADROOM=0.08: ~3% queue-warning margin plus the ~5% VxLAN encap tax (inner-byte ledger vs outer-byte wire, measured 4.99% at 1500 MTU). The ledger counts inner WIRE bytes, so for RoCE at MTU 1024 a share of X in the ledger is X/1.073 of application goodput; with this value the ledger fills the port to exactly what DCQCN alone achieves (184 G inner = 171.5 G goodput, q_ab 2026-09-07). Raising it to 0.13 and 0.17 was tried the same day against the switch marking seen under HyperFront pacing and changed nothing: the marks come from the burstiness of externally paced QPs, not from load, so a larger headroom only gives capacity away.",
     "period_ms": 10,
     "law": "conf",
     "d_repay_s": 0.3,

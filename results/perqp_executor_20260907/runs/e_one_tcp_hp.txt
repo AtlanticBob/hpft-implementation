@@ -1,0 +1,6 @@
+#    class  flow                       Gb/s
+0    tcp    sgpu01/vf1>sgpu02/vf1     44.94
+TOTAL 44.94 Gb/s
+arm: algo=2 cc_only=0 law=0 agents=1 tcp_cc=cubic
+  sgpu01 readback algo/cc_only = 0 w8=0 w9=0 w10=0
+== e_one_tcp_hp (): TOTAL 44.94 Gb/s | switch swp37s0: ecn_marked=0 drops=0 wire=45.4G (23% of 200)

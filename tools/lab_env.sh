@@ -15,13 +15,9 @@
 #   lab_env.sh plain       firmware DCQCN baseline: UPCC=0, no HPFT, no Jakiro
 #   lab_env.sh jakiro      firmware DCQCN + Jakiro DHTB at the receiver decap
 #                          point (multi-sender flows need cross_pair_net.sh)
-#   lab_env.sh swift       like ztr, but the Swift port of the stock template
-#                          (~/bzx/pcc_swift_stock, results/swift_20260827)
-#   lab_env.sh ztr         UPCC=1 + STOCK DOCA PCC RTT template (ZTR-RTTCC)
-#                          on every sender DPU, no HPFT agents -- the
-#                          native-ZTR arm of the CC matrix (binary:
-#                          ~/bzx/pcc_ztr_stock on each DPU, built from the
-#                          pristine SDK application source)
+#   lab_env.sh ztr|swift   the tenant CC alone, run by the HyperFront executor's
+#                          own per-QP ZTR / Swift (the only implementation that
+#                          counts, tools/dpu/pcc/README.md)
 #   lab_env.sh direct      LEGACY/debug: tear the overlay down to the old
 #                          direct topology (p1 + reps back on underlay-p1)
 #   lab_env.sh meter on [gbps] | off | status
@@ -54,8 +50,6 @@ REPO=/home/zhaoxiang/hyperfront/hpft-implementation
 CC="$REPO/tools/cc_mode.sh"
 MST=/dev/mst/mt41692_pciconf0
 JAKIRO_DIR=/home/ubuntu/bzx/jakiro_dhtb          # on hpft-dpu2
-ZTR_BIN=/home/ubuntu/bzx/pcc_ztr_stock/build/pcc/doca_pcc     # stock DOCA RTT template (ZTR-RTTCC), every sender DPU
-SWIFT_BIN=/home/ubuntu/bzx/pcc_swift_stock/build/pcc/doca_pcc # same tree with Swift in algorithm_core (results/swift_20260827), every sender DPU
 UL_SENDER=172.16.1.1; UL_RECV=172.16.1.2         # VxLAN underlay on p1
 
 # ---------------------------------------------------------------- status ----
@@ -188,31 +182,28 @@ direct)
   echo "== DIRECT ready (rx agent default bridge is ovsbr-p1: pass --bridge underlay-p1 by hand) ==" ;;
 
 ztr|swift)
-  STOCK_BIN=$ZTR_BIN; [ "$1" = swift ] && STOCK_BIN=$SWIFT_BIN
-  echo "== -> ${1^^} (stock RTT-template binary $STOCK_BIN, UPCC=1, no HPFT) on every SENDER DPU =="
+  # The tenant CC alone, run by the HyperFront executor's own per-QP
+  # implementation (0xccd 1 = ZTR, 0xccd 3 = Swift) with the bucket off
+  # (0xcce 1 12). This is the ONLY DCQCN/Swift/ZTR implementation that
+  # counts (tools/dpu/pcc/README.md, 2026-09-08). The stock template
+  # binaries were deleted from the DPUs: they handed the slot-15 events
+  # (96 % of the data QPs here) to the framework's internal algorithm, so
+  # their numbers were the firmware's CC, not theirs.
+  ALGO=1; [ "$1" = swift ] && ALGO=3
+  echo "== -> ${1^^} (HyperFront executor, tenant CC 0xccd $ALGO alone, UPCC=1, no agents) on every DPU =="
   jakiro_stop
   ensure_overlay
-  # UPCC=1 on all nodes (cc_mode pcc does the fw reset on every registry
-  # node); the HPFT stack it starts is torn down right after.
   if [ "$(upcc_of "$(dpu_of "$SENDER")")" != 1 ]; then
     bash "$CC" pcc
     ensure_overlay
   fi
   bash "$REPO/tools/lab-infra/roles.sh" stop >/dev/null 2>&1
-  # ZTR runs on the sender DPUs. The RECEIVER needs a PCC application too:
-  # with UPCC=1 and no app the NIC answers nothing and every RDMA flow into
-  # it dies with "retry counter exceeded" (probed 2026-08-26). The stock
-  # RTT-template binary as the responder ALSO kills the flows (0 iterations);
-  # the HPFT executor (rp_service.sh, same PCC framework) as the responder
-  # works, and with no sender agent it shapes nothing on the receive side.
-  ssh -n "$(dpu_of "$RECEIVER")" 'bash /opt/hpft/rp_service.sh start >/dev/null 2>&1; echo -n "  receiver responder: "; pgrep -ax doca_pcc | head -1' </dev/null
   for d in $(all_dpus); do
-    [ "$d" = "$(dpu_of "$RECEIVER")" ] && continue
-    ssh -n "$d" "sudo pkill -x doca_pcc 2>/dev/null; sleep 1
-      sudo setsid nohup $STOCK_BIN -d mlx5_0 -w -1 -l 40 >/tmp/ztr_pcc.log 2>&1 < /dev/null &
-      sleep 3; echo -n '  $d: '; pgrep -ax doca_pcc | head -1" </dev/null
+    ssh -n "$d" "bash /opt/hpft/rp_service.sh start >/dev/null 2>&1
+      for m in '0xccd $ALGO' '0xcce 1 12'; do timeout 5 bash -c \"echo \\\"\$m\\\" > /tmp/rp_fifo\"; done
+      echo -n '  $d: '; pgrep -ax doca_pcc | head -1" </dev/null
   done
-  echo "== ${1^^} ready (back to plain/hpft: lab_env.sh plain|hpft; re-run vf_caps.sh sync + cc_mode.sh gbn|sr + cross_pair_net after the fw reset) =="
+  echo "== ${1^^} ready (executor CC alone; back to hpft: lab_env.sh hpft) =="
   status ;;
 
 meter)

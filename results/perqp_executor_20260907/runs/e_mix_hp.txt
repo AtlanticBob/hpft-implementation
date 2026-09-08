@@ -1,0 +1,8 @@
+#    class  flow                       Gb/s
+0    rdma   sgpu01/vf1>sgpu02/vf1     22.98
+1    tcp    sgpu03/vf1>sgpu02/vf1     23.91
+TOTAL 46.89 Gb/s
+arm: algo=2 cc_only=0 law=0 agents=1 tcp_cc=cubic
+  sgpu01 readback algo/cc_only = 0 w8=0 w9=0 w10=0
+  sgpu03 readback algo/cc_only = 0 w8=0 w9=0 w10=0
+== e_mix_hp (ALGO=2): TOTAL 46.89 Gb/s | switch swp37s0: ecn_marked=0 drops=0 wire=48.0G (24% of 200)

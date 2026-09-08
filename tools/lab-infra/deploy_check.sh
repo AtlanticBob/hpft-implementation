@@ -35,6 +35,7 @@ cd "$REPO"
 # plausible numbers that show nothing.
 DPU_FILES="tools/dpu/rx_agent.py tools/dpu/tx_agent_e.py tools/dpu/fastfill.py
            tools/dpu/fastfill.c tools/dpu/hw_maxrate.py tools/dpu/vport_meter.c
+           tools/dpu/vhca_of.c
            tools/dpu/systemd/hpft-vport-meter.service tools/dpu/rp_service.sh"
 DPU_FILES=$(echo $DPU_FILES)
 CFG_FILE=config/lab-registry.json
@@ -118,6 +119,10 @@ if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
         ssh -o BatchMode=yes "$n" 'cd /opt/hpft && gcc -O2 -o vport_meter vport_meter.c -libverbs -lmlx5' \
           || echo "  WARN $n: vport_meter build failed (rx falls back to its old attribution chain)" ;;
       esac
+      case " $push " in *" tools/dpu/vhca_of.c "*)
+        ssh -o BatchMode=yes "$n" 'cd /opt/hpft && gcc -O2 -o vhca_of vhca_of.c -libverbs -lmlx5' \
+          || echo "  WARN $n: vhca_of build failed (tx agent keys QP bindings by bare qpn)" ;;
+      esac
       case " $push " in *" $PCC_SRC "*)
         ssh -o BatchMode=yes "$n" "cd $PCC_BUILD && meson setup --reconfigure build >/dev/null 2>&1 && ninja -C build pcc/doca_pcc >/dev/null 2>&1" \
           || echo "  WARN $n: doca_pcc rebuild failed - the RUNNING executor is still the old device code" ;;
@@ -194,8 +199,7 @@ done
 # tool exists to end. Only sgpu01 holds the git checkout; the others hold
 # exactly the files below, kept identical to it.
 HOST_FILES="tools/host/hpft_pace_shim.py tools/host/qpn_resolver.py
-            tools/host/edt_ensure.sh tools/host/edt_maps_ensure.sh
-            tools/host/bpf_trust_sample.sh
+            tools/host/edt_ensure.sh tools/host/edt_maps_ensure.sh tools/host/edt_reinstall.sh
             tools/lab-infra/vf_setup.sh tools/cross_pair_net.sh
             tools/tcp_shaper/tools/tcp_shaper_lib.py tools/tcp_shaper/tools/tcp-shaper-apply
             tcp/bpf-opt3/hpft_tcp_edt_kern.o tcp/bpf-opt3/hpft_tcp_edt_kern.c
@@ -291,6 +295,21 @@ import json;print({n['host']:n['dpu'] for n in json.load(open('$CFG_FILE'))['nod
   [ "$qr" = active ] || { echo "  NOT ACTIVE  $h/hpft-qpn-resolver (sender without it overshoots by its QP count)"; bad=1; }
 done
 
+# The QPN resolver on every host joins its QPs against every peer over ssh
+# AS THE LOGIN USER. A host whose user cannot reach a peer produces an empty
+# table and every one of its QPs then runs at the executor's unknown-flow
+# allowance while every service reports active (sgpu03/sgpu04, 2026-09-07:
+# "Permission denied (publickey)" since the all-senders layout of 09-04).
+echo "== resolver peers (user ssh) =="
+for h in $HOSTS; do
+  peers=$(for p in $HOSTS; do [ "$p" != "$h" ] && echo -n "$p "; done)
+  if [ "$h" = "$(hostname)" ]; then
+    unreach=$(for p in $peers; do timeout 8 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$p" true >/dev/null 2>&1 || echo -n "$p "; done)
+  else
+    unreach=$(ssh -o BatchMode=yes "$h" "for p in $peers; do timeout 8 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \$p true >/dev/null 2>&1 || echo -n \"\$p \"; done" 2>/dev/null)
+  fi
+  if [ -n "$unreach" ]; then echo "  DIFFERS  $h: user ssh to $unreach FAILS - its QPN resolver sends no bindings"; bad=1; else echo "  ok       $h -> all peers"; fi
+done
 PIN=/sys/fs/bpf/hpft_tcp_edt/maps/hpft_pair_state
 want_sz=$(python3 -c "import sys; sys.path.insert(0,'tools/tcp_shaper/tools'); from tcp_shaper_lib import pack_pair_state; print(len(pack_pair_state()))")
 for h in $HOSTS; do

@@ -16,7 +16,7 @@ hdr='''
  * the probe jitter on this fabric, sd 1-2 us, is the same order as the
  * base RTT, so raw samples would trigger a cut on every tail spike).
  * Thresholds are device-clock ns measured on THIS fabric (base RTT 2.7 us),
- * see hpft-implementation/results/swift_20260827/. */
+ * the executor compiles this core in as the 0xccd 4 reference arm. */
 #include "swift_params.h"
 static inline uint32_t sw_isqrt(uint32_t x)
 {

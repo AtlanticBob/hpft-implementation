@@ -1,5 +1,0 @@
-event_s,class,flowsets,converge_ms
-10,rdma,8,1598
-10,tcp,8,901
-20,rdma,4,821
-20,tcp,4,861

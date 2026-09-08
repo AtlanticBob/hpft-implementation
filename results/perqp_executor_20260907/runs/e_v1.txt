@@ -1,0 +1,31 @@
+#    class  flow                       Gb/s
+0    rdma   sgpu01/vf0>sgpu02/vf0      6.98
+1    tcp    sgpu01/vf0>sgpu02/vf0      7.67
+2    rdma   sgpu01/vf1>sgpu02/vf1      7.02
+3    tcp    sgpu01/vf1>sgpu02/vf1      7.64
+4    rdma   sgpu01/vf2>sgpu02/vf2      6.96
+5    tcp    sgpu01/vf2>sgpu02/vf2      7.67
+6    rdma   sgpu01/vf3>sgpu02/vf3      6.96
+7    tcp    sgpu01/vf3>sgpu02/vf3      7.72
+8    rdma   sgpu03/vf0>sgpu02/vf0      7.03
+9    tcp    sgpu03/vf0>sgpu02/vf0      7.69
+10   rdma   sgpu03/vf1>sgpu02/vf1      7.05
+11   tcp    sgpu03/vf1>sgpu02/vf1      7.65
+12   rdma   sgpu03/vf2>sgpu02/vf2      7.02
+13   tcp    sgpu03/vf2>sgpu02/vf2      7.63
+14   rdma   sgpu03/vf3>sgpu02/vf3      7.05
+15   tcp    sgpu03/vf3>sgpu02/vf3      7.59
+16   rdma   sgpu04/vf0>sgpu02/vf0      7.02
+17   tcp    sgpu04/vf0>sgpu02/vf0      7.71
+18   rdma   sgpu04/vf1>sgpu02/vf1      7.01
+19   tcp    sgpu04/vf1>sgpu02/vf1      7.64
+20   rdma   sgpu04/vf2>sgpu02/vf2      7.03
+21   tcp    sgpu04/vf2>sgpu02/vf2      7.62
+22   rdma   sgpu04/vf3>sgpu02/vf3      7.00
+23   tcp    sgpu04/vf3>sgpu02/vf3      7.69
+TOTAL 176.05 Gb/s
+arm: algo=2 cc_only=0 law=0 agents=1 tcp_cc=cubic
+  sgpu01 readback algo/cc_only = 0 w8=0 w9=0 w10=0
+  sgpu03 readback algo/cc_only = 0 w8=0 w9=0 w10=0
+  sgpu04 readback algo/cc_only = 0 w8=0 w9=0 w10=0
+== e_v1 (ALGO=2): TOTAL 176.05 Gb/s | switch swp37s0: ecn_marked=622025 drops=0 wire=177.1G (89% of 200)

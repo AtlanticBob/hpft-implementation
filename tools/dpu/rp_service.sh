@@ -2,7 +2,7 @@
 # NP service controller on the DPU: start | query | stop | status
 LOG=/tmp/pcc_rp.log
 FIFO=/tmp/rp_fifo
-BIN=/home/ubuntu/bzx/doca34-apps/build/pcc/doca_pcc
+BIN=${RP_BIN:-/home/ubuntu/bzx/doca34-apps/build/pcc/doca_pcc}   # RP_BIN overrides (e.g. the stock Swift build)
 case "$1" in
 start)
     # graceful first: SIGINT lets the host app destroy the PCC context so

@@ -1,6 +1,0 @@
-criterion,pass,detail
-1 稳态贴合,PASS,ok
-2 队列消得掉,FAIL,10-20s sgpu03/vf1>sgpu02/vf1|rdma went 1.1 s without clearing
-3 收敛 ≤ 1 s,FAIL,10s tcp x8 1174 ms
-4 不塌,PASS,ok
-5 平台健康,PASS,ok

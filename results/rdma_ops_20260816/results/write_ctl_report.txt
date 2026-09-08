@@ -1,6 +1,0 @@
-=== write_ctl ===
-aggregate=87.2G util=90%  RDMA_tot=37.9G TCP_tot=49.3G  Jain=0.983  min=9.4 max=12.6  conv=3s
-per-flow (G):  vf0.rdma=9.5  vf0.tcp=12.6  vf1.rdma=9.4  vf1.tcp=12.6  vf2.rdma=9.6  vf2.tcp=12.4  vf3.rdma=9.4  vf3.tcp=11.8
-stall seconds (any RDMA <3G, t in [5,84]): 7  at [74, 75, 76, 77, 78, 79, 80]
-clean window (39 s): aggregate=88.7G Jain=1.000 min=10.9 max=11.2
-clean per-flow (G): vf0.rdma=11.0  vf0.tcp=11.2  vf1.rdma=10.9  vf1.tcp=11.1  vf2.rdma=11.1  vf2.tcp=11.1  vf3.rdma=11.0  vf3.tcp=11.2

@@ -1,6 +1,0 @@
-=== read ===
-aggregate=88.8G util=92%  RDMA_tot=5.7G TCP_tot=83.1G  Jain=0.551  min=0.0 max=22.3  conv=3s
-per-flow (G):  vf0.rdma=5.7  vf0.tcp=16.2  vf1.rdma=0.0  vf1.tcp=22.3  vf2.rdma=0.0  vf2.tcp=22.3  vf3.rdma=0.0  vf3.tcp=22.3
-stall seconds (any RDMA <3G, t in [5,84]): 55  at [30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84]
-clean window (1 s): aggregate=24.9G Jain=0.499 min=0.0 max=6.6
-clean per-flow (G): vf0.rdma=0.0  vf0.tcp=5.9  vf1.rdma=0.0  vf1.tcp=5.9  vf2.rdma=0.0  vf2.tcp=6.6  vf3.rdma=0.0  vf3.tcp=6.5

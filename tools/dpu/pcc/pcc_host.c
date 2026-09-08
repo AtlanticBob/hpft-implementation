@@ -204,7 +204,7 @@ int main(int argc, char **argv)
 		unsigned long dropped = 0;
 		int fl = fcntl(STDIN_FILENO, F_GETFL);
 		while (!host_stop) {
-			char batch[1400], ctl[16][1400];
+			char batch[1400], ctl[32][1400];
 			int have_batch = 0, nctl = 0;
 			char more[1400];
 
@@ -215,12 +215,18 @@ int main(int argc, char **argv)
 			for (;;) {
 				unsigned long w0 = strtoul(line, NULL, 0);
 
-				if ((w0 & 0xfffe0000ul) == 0xb47c0000ul) {
+				/* a budget snapshot is complete in itself, so only the
+				 * newest one is worth a mailbox round: 0xb47c/0xb47d
+				 * (per flow tag, the pre-2026-09 executor) and 0xb47f
+				 * (per flow set). Everything else is a control line
+				 * and is sent in order. */
+				if ((w0 & 0xfffe0000ul) == 0xb47c0000ul ||
+				    (w0 & 0xffff0000ul) == 0xb47f0000ul) {
 					if (have_batch)
 						dropped++;
 					memcpy(batch, line, sizeof(batch));
 					have_batch = 1;
-				} else if (w0 != 0 && nctl < 16) {
+				} else if (w0 != 0 && nctl < 32) {
 					memcpy(ctl[nctl++], line, sizeof(line));
 				}
 				if (fgets(more, sizeof(more), stdin) == NULL)
