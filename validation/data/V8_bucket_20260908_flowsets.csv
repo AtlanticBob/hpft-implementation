@@ -1,0 +1,11 @@
+phase,fsid,expected_gbps,attributed_mean_gbps,attributed_sd_gbps
+0-20,sgpu01/vf0>sgpu02/vf0|rdma,50.00,47.98,4.59
+0-20,sgpu03/vf0>sgpu04/vf0|rdma,50.00,47.88,5.80
+20-40,sgpu01/vf0>sgpu02/vf0|rdma,30.67,29.91,1.20
+20-40,sgpu01/vf1>sgpu02/vf1|rdma,30.67,29.96,1.30
+20-40,sgpu01/vf2>sgpu02/vf2|rdma,30.67,29.88,1.11
+20-40,sgpu03/vf0>sgpu04/vf0|rdma,30.67,30.15,0.96
+20-40,sgpu03/vf1>sgpu04/vf1|rdma,30.67,30.08,1.45
+20-40,sgpu03/vf2>sgpu04/vf2|rdma,30.67,30.26,1.18
+40-60,sgpu01/vf0>sgpu02/vf0|rdma,50.00,47.84,4.62
+40-60,sgpu03/vf0>sgpu04/vf0|rdma,50.00,47.91,5.24

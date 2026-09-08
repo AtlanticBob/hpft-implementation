@@ -1,7 +1,0 @@
-# src_host src_vf dst_vf class count start_s end_s options   (dst host = sgpu02; times on the experiment clock, after the 5 s warm-up)
-# V8 的 TCP 版：vf0 上跑 TCP 而不是 RDMA，隐形瓶颈同样压在 vf0，vf1 仍是阴性对照。
-# 用来检验 TCP 执行面的置信度规则与 RDMA 执行面一致（design v4 §6.2–6.4）。
-sgpu01 0 0 tcp 4 0 90 -
-sgpu01 1 1 rdma 4 0 90 -
-sgpu01 1 1 tcp 4 0 90 -
-sgpu02 0 0 meter 1 30 60 gbps=5

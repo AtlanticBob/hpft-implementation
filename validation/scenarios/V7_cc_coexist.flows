@@ -1,26 +1,26 @@
-# src_host src_vf dst_vf class count start_s end_s options   (dst host = sgpu02; times on the experiment clock, after the 5 s warm-up)
-sgpu01 0 0 rdma 4 0 90 -
-sgpu01 0 0 tcp 4 0 90 -
-sgpu01 1 1 rdma 4 0 90 -
-sgpu01 1 1 tcp 4 0 90 -
-sgpu01 2 2 rdma 4 0 90 -
-sgpu01 2 2 tcp 4 0 90 -
-sgpu01 3 3 rdma 4 0 90 -
-sgpu01 3 3 tcp 4 0 90 -
-sgpu03 0 0 rdma 4 0 90 -
-sgpu03 0 0 tcp 4 0 90 -
-sgpu03 1 1 rdma 4 0 90 -
-sgpu03 1 1 tcp 4 0 90 -
-sgpu03 2 2 rdma 4 0 90 -
-sgpu03 2 2 tcp 4 0 90 -
-sgpu03 3 3 rdma 4 0 90 -
-sgpu03 3 3 tcp 4 0 90 -
-sgpu04 0 0 rdma 4 0 90 -
-sgpu04 0 0 tcp 4 0 90 -
-sgpu04 1 1 rdma 4 0 90 -
-sgpu04 1 1 tcp 4 0 90 -
-sgpu04 2 2 rdma 4 0 90 -
-sgpu04 2 2 tcp 4 0 90 -
-sgpu04 3 3 rdma 4 0 90 -
-sgpu04 3 3 tcp 4 0 90 -
-sgpu04 7 7 udp 1 30 60 gbps=40
+# src_host src_vf dst_host dst_vf class count start_s end_s options   (times on the experiment clock, after the 5 s warm-up)
+sgpu01 0 sgpu02 0 rdma 4 0 90 -
+sgpu01 0 sgpu02 0 tcp 4 0 90 -
+sgpu01 1 sgpu02 1 rdma 4 0 90 -
+sgpu01 1 sgpu02 1 tcp 4 0 90 -
+sgpu01 2 sgpu02 2 rdma 4 0 90 -
+sgpu01 2 sgpu02 2 tcp 4 0 90 -
+sgpu01 3 sgpu02 3 rdma 4 0 90 -
+sgpu01 3 sgpu02 3 tcp 4 0 90 -
+sgpu03 0 sgpu02 0 rdma 4 0 90 -
+sgpu03 0 sgpu02 0 tcp 4 0 90 -
+sgpu03 1 sgpu02 1 rdma 4 0 90 -
+sgpu03 1 sgpu02 1 tcp 4 0 90 -
+sgpu03 2 sgpu02 2 rdma 4 0 90 -
+sgpu03 2 sgpu02 2 tcp 4 0 90 -
+sgpu03 3 sgpu02 3 rdma 4 0 90 -
+sgpu03 3 sgpu02 3 tcp 4 0 90 -
+sgpu04 0 sgpu02 0 rdma 4 0 90 -
+sgpu04 0 sgpu02 0 tcp 4 0 90 -
+sgpu04 1 sgpu02 1 rdma 4 0 90 -
+sgpu04 1 sgpu02 1 tcp 4 0 90 -
+sgpu04 2 sgpu02 2 rdma 4 0 90 -
+sgpu04 2 sgpu02 2 tcp 4 0 90 -
+sgpu04 3 sgpu02 3 rdma 4 0 90 -
+sgpu04 3 sgpu02 3 tcp 4 0 90 -
+sgpu04 7 sgpu02 7 udp 1 30 60 gbps=40

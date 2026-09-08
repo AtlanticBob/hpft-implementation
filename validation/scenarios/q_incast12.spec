@@ -1,0 +1,12 @@
+rdma sgpu01 0 sgpu02 0 8
+rdma sgpu01 1 sgpu02 1 8
+rdma sgpu01 2 sgpu02 2 8
+rdma sgpu01 3 sgpu02 3 8
+rdma sgpu03 0 sgpu02 0 8
+rdma sgpu03 1 sgpu02 1 8
+rdma sgpu03 2 sgpu02 2 8
+rdma sgpu03 3 sgpu02 3 8
+rdma sgpu04 0 sgpu02 0 8
+rdma sgpu04 1 sgpu02 1 8
+rdma sgpu04 2 sgpu02 2 8
+rdma sgpu04 3 sgpu02 3 8

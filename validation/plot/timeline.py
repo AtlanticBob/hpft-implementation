@@ -6,8 +6,8 @@
            TCP blue, solid = first sender host in the table, dashed = others;
            black dotted = the expected rate of each group (README §四)
   panel 2  wire rate per VM per class from the receiver NIC counters (100 ms),
-           stacked, plus the C' line
-  panel 3  virtual queue per flow-set (ms)
+           stacked, plus the C' line - one such panel per receiving host
+  last     virtual queue per flow-set (ms)
 Reads only data/ (distill.py output) plus results/<tag>/flows.txt for the
 expected-rate steps.
 
@@ -24,7 +24,7 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
-from distill import load_flows, expected_at, C_ROOT
+from distill import load_flows, expected_at, receivers, C_ROOT
 tags = [t for t in sys.argv[1].split(",") if t]
 base = sys.argv[2] if len(sys.argv) > 2 else tags[0].split("_")[0]
 D = os.path.join(BASE, "data")
@@ -49,28 +49,38 @@ for tag in tags:
     rows = load_flows(os.path.join(R, "flows.txt"))
     t0 = float(open(os.path.join(R, "t0.txt")).read()); warm = float(open(os.path.join(R, "warm.txt")).read())
     z = t0 + warm; end = max(r["end"] for r in rows)
-    rx = [json.loads(l) for l in open(os.path.join(R, "rx.jsonl")) if l.strip()]
-    rx = [(x["ts"] - z, x) for x in rx if -1 <= x["ts"] - z <= end + 1]
+    # one agent log per receiving host (rx_<host>.jsonl); a run from before
+    # 2026-09-04 has a single receiver and a single rx.jsonl
+    rxh = {}
+    for dh in receivers(rows):
+        pth = os.path.join(R, f"rx_{dh}.jsonl")
+        if not os.path.exists(pth):
+            pth = os.path.join(R, "rx.jsonl")
+        rx = [json.loads(l) for l in open(pth) if l.strip()]
+        rxh[dh] = [(x["ts"] - z, x) for x in rx if -1 <= x["ts"] - z <= end + 1]
     with open(os.path.join(D, f"{tag}_vmclass.csv")) as f:
         vm = list(csv.DictReader(f))
-    runs.append((rows, end, rx, vm))
+    runs.append((rows, end, rxh, vm))
 rows, end = runs[0][0], runs[0][1]
+recv = receivers(rows)
 grid = np.arange(0, end + BIN_S / 2, BIN_S)
 hosts = []
 for r in rows:
-    if r["host"] not in hosts:
+    if r["host"] != "-" and r["host"] not in hosts:
         hosts.append(r["host"])
 col = {"rdma": "#d62728", "tcp": "#1f77b4"}
-fig, ax = plt.subplots(3, 1, figsize=(12, 9.5), sharex=True)
+npan = 2 + len(recv)
+fig, ax = plt.subplots(npan, 1, figsize=(12, 6.5 + 3 * len(recv)), sharex=True)
+axq = ax[-1]
 for r in [r for r in rows if r["cls"] in col]:
-    f = r["fsid"]
-    rate = np.nanmean([binned([t for t, _ in rx], [x["r"].get(f, 0) / 1e9 for _, x in rx], grid)
-                       for _, _, rx, _ in runs], axis=0)
-    q = np.nanmean([binned([t for t, _ in rx], [x.get("d", {}).get(f, 0) for _, x in rx], grid)
-                    for _, _, rx, _ in runs], axis=0)
+    f = r["fsid"]; dh = r["dhost"]
+    rate = np.nanmean([binned([t for t, _ in rxh[dh]], [x["r"].get(f, 0) / 1e9 for _, x in rxh[dh]], grid)
+                       for _, _, rxh, _ in runs], axis=0)
+    q = np.nanmean([binned([t for t, _ in rxh[dh]], [x.get("d", {}).get(f, 0) for _, x in rxh[dh]], grid)
+                    for _, _, rxh, _ in runs], axis=0)
     ax[0].plot(grid, rate, color=col[r["cls"]], lw=0.8,
                ls="-" if r["host"] == hosts[0] else "--", alpha=0.85)
-    ax[2].plot(grid, q, color=col[r["cls"]], lw=0.7, alpha=0.7)
+    axq.plot(grid, q, color=col[r["cls"]], lw=0.7, alpha=0.7)
 # expected steps: one dotted line per distinct trajectory
 tt = np.arange(0, end, 0.25); traj = {}
 for f in {r["fsid"] for r in rows if r["cls"] in col}:
@@ -85,7 +95,9 @@ if len(hosts) > 1:
 ax[0].plot([], [], color="k", ls=":", label="expected")
 ax[0].set_ylabel("attributed rate per flow-set (Gb/s), 100 ms"); ax[0].legend(ncol=5, fontsize=8); ax[0].grid(alpha=0.3)
 # wire per VM per class: distill writes every run on the same 100 ms grid,
-# so the columns can be averaged row by row after aligning on t
+# so the columns can be averaged row by row after aligning on t. Columns are
+# <host>_vf<i>_<class> (one block per receiver); a data file from before
+# 2026-09-04 has vf<i>_<class>, i.e. the one receiver of that run.
 cols = [c for c in runs[0][3][0] if c != "t"]
 vm_series = {}
 for _, _, _, vm in runs:
@@ -95,11 +107,15 @@ for _, _, _, vm in runs:
 vt = np.array(sorted(vm_series))
 stack = np.array([[np.nanmean([v[i] for v in vm_series[t]]) for t in vt] for i in range(len(cols))])
 stack = np.nan_to_num(stack)
-colors = [("#d62728" if c.endswith("rdma") else "#1f77b4") for c in cols]
-ax[1].stackplot(vt, stack, colors=colors, alpha=0.7, lw=0.2, edgecolor="white")
-ax[1].axhline(C_ROOT / 1e9, color="k", ls=":", lw=1); ax[1].text(0.5, C_ROOT / 1e9 + 2, "C' = 184 G", fontsize=8)
-ax[1].set_ylabel("wire per VM per class, stacked (Gb/s)"); ax[1].grid(alpha=0.3); ax[1].set_ylim(0, 215)
-ax[2].set_ylabel("virtual queue (ms), 100 ms mean"); ax[2].set_xlabel("experiment time (s)"); ax[2].grid(alpha=0.3)
+for j, dh in enumerate(recv):
+    idx = [i for i, c in enumerate(cols) if c.startswith(dh + "_") or "_vf" not in c]
+    colors = [("#d62728" if cols[i].endswith("rdma") else "#1f77b4") for i in idx]
+    a = ax[1 + j]
+    a.stackplot(vt, stack[idx], colors=colors, alpha=0.7, lw=0.2, edgecolor="white")
+    a.axhline(C_ROOT / 1e9, color="k", ls=":", lw=1); a.text(0.5, C_ROOT / 1e9 + 2, "C' = 184 G", fontsize=8)
+    a.set_ylabel(f"wire at {dh} per VM per class (Gb/s)" if len(recv) > 1 else "wire per VM per class, stacked (Gb/s)")
+    a.grid(alpha=0.3); a.set_ylim(0, 215)
+axq.set_ylabel("virtual queue (ms), 100 ms mean"); axq.set_xlabel("experiment time (s)"); axq.grid(alpha=0.3)
 for e in sorted({r["start"] for r in rows} | {r["end"] for r in rows}):
     if 0 < e < end:
         for a in ax:

@@ -1,7 +1,0 @@
-# src_host src_vf dst_vf class count start_s end_s options   (dst host = sgpu02; times on the experiment clock, after the 5 s warm-up)
-# class=meter 不是一条流：它把接收端那个 VF 的 OVS drop meter 在给定时段压到 gbps=，
-# 而注册表不动。账本因此看不见这个瓶颈，只看得见活下来的到达量。
-sgpu01 0 0 rdma 4 0 90 -
-sgpu01 1 1 rdma 4 0 90 -
-sgpu01 1 1 tcp 4 0 90 -
-sgpu02 0 0 meter 1 30 60 gbps=20
