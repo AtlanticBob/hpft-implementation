@@ -1,0 +1,5 @@
+arm,metric,overlap_max_gap_pct,shared_edges,total_edges
+hpft,buffer,1.82,3,33
+hpft,latency,1.81,4,32
+cc,buffer,4.28,5,49
+cc,latency,8.53,12,32

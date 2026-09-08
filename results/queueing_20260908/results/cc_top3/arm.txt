@@ -1,0 +1,4 @@
+arm: algo=2 cc_only=1 law=0 agents=0 tcp_cc=cubic
+  sgpu01 readback algo/cc_only = 1 w8=0 w9=0 w10=0
+  sgpu03 readback algo/cc_only = 1 w8=0 w9=0 w10=0
+  sgpu04 readback algo/cc_only = 1 w8=0 w9=0 w10=0
