@@ -109,8 +109,27 @@ static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE >> 6);
 #define HPFT_LAW_CAP    (1u)
 #define HPFT_LAW_EQUAL  (2u)
 static volatile uint32_t g_law = HPFT_LAW_BUCKET;
-/* a QP that sent within this long is drawing tokens */
-#define HPFT_ACTIVE_US  (1000u)
+/* a QP that sent within this long is drawing tokens (0xcce <us> 24).
+ * Ablation arm; 1 ms is the design point. Widening it to 5 ms on V2 left the
+ * paced sum unchanged and cost half a second on the join (2026-09-08): a QP
+ * that has stopped keeps its place in the denominator for longer, so the
+ * others get less than their share until it ages out. */
+static volatile uint32_t g_active_us = 1000u;
+#define HPFT_ACTIVE_US  (g_active_us)
+/* 0xcce <0|1|2> 23: where the two terms of the share come from. Ablation
+ * arms; 0 is the design point and the default.
+ * 0: c_i as of this event, denominator from the last epoch's sum.
+ * 1: both summed at this event over the set's drawing QPs (nq reads per
+ *    event).
+ * 2: both from the last epoch's snapshot, the live c_i still capping.
+ * Measured on V2, 2026-09-08: 0 keeps the paced sum at 1.004 R (95th
+ *    percentile 1.016); 1 pushes it to 1.07 R (1.32), because each QP then
+ *    divides by a sum taken at its own instant and the shares no longer add
+ *    up to R; 2 holds the sum but costs steady-state fit (one flow set 8 %
+ *    under its share) since a QP whose quota just fell keeps its old share
+ *    for up to an epoch. The join time is 1.55-2.07 s in all three, so the
+ *    denominator is not what makes a join slow. */
+static volatile uint32_t g_sum_live;
 /* 0xcce <0|1> 25: Swift's per-QP state lives in the framework's algo_ctxt
  * (cx[3..7]: cwnd, rtt_s, last_dec, flags, rtt_last), which travels with
  * the event, instead of in the global slot. Diagnostic: whether the DPA's
@@ -387,6 +406,7 @@ static inline uint32_t hpft_isqrt(uint32_t x)
 typedef struct {
 	volatile uint32_t gen;       /* 0 = free; matched against the context */
 	volatile uint32_t key;       /* hpft_bind_key(vhca, qpn) this record is for */
+	volatile uint32_t c_epoch;   /* this QP's CC rate as summed at its set's last epoch (0 = not in the sum) */
 	volatile uint32_t qpn;
 	volatile uint32_t vhca;      /* the function (VF) this QP belongs to */
 	volatile uint32_t set;       /* flow-set index + 1; 0 = not known yet */
@@ -568,12 +588,17 @@ static volatile uint32_t g_q_alloc, g_q_bound;
 /* record re-inits (QP number changed under a context), stale unbinds, and
  * TX events whose vhca word differs from the record's (diagnostic, 0xdf3) */
 static volatile uint32_t g_q_reinit, g_q_unbind, g_vhca_mis, g_last_qpn_mis, g_last_vhca_mis;
+/* which DPA threads have run the algorithm (0xdf4): the framework fans events
+ * out over doca_pcc's thread pool, so this is a direct read of how much
+ * concurrency the executor actually sees. */
+static volatile uint32_t g_thr_lo, g_thr_hi, g_thr_max;
 /* events whose algo_slot is not 0: who they are (diagnostic, 0xdf2) */
 static volatile uint32_t g_ev_slot, g_slot_port[2], g_slot_type[4], g_slot_val, g_slot_maxval;
 
 static inline void hpft_q_init(volatile hpft_q_t *q, uint32_t now)
 {
 	q->key = 0;
+	q->c_epoch = 0;
 	q->qpn = 0;
 	q->vhca = 0;
 	q->set = 0;
@@ -734,9 +759,12 @@ static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t
 			s->qslot[k] = HPFT_SET_EMPTY;
 			continue;
 		}
-		if ((uint32_t)(now - q->last_ts) > HPFT_ACTIVE_US)
-			continue;              /* not drawing: not in the sum */
-		sum += hpft_cc_rate(q);
+		if ((uint32_t)(now - q->last_ts) > HPFT_ACTIVE_US) {
+			q->c_epoch = 0;        /* not drawing: not in the sum */
+			continue;
+		}
+		q->c_epoch = hpft_cc_rate(q);
+		sum += q->c_epoch;
 		live++;
 	}
 	s->sum_cc = sum;
@@ -816,6 +844,16 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 
 	results->rtt_req = 0;
 	now = doca_pcc_dev_get_timer_lo();
+	{
+		unsigned int rank = doca_pcc_dev_thread_rank();
+
+		if (rank < 32u)
+			g_thr_lo |= 1u << rank;
+		else if (rank < 64u)
+			g_thr_hi |= 1u << (rank - 32u);
+		if (rank > g_thr_max)
+			g_thr_max = rank;
+	}
 
 	/* ---- this QP's record ----
 	 * The framework's algo context is the attribution the hardware gives:
@@ -1056,8 +1094,50 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 
 			hpft_set_epoch(s, now, (uint32_t)si);
 			R = s->budget;
-			S = s->sum_cc;
-			n = s->nlive ? s->nlive : (s->nq ? s->nq : 1u);
+			if (g_sum_live == 1u) {
+				/* the denominator as of THIS event: sum c_j over the
+				 * set's QPs that drew tokens in the last millisecond,
+				 * read now rather than at the last epoch. With the
+				 * epoch's cached sum a QP's c_i (this instant) and S
+				 * (up to 1 ms old) were out of step; for a CC that
+				 * moves its rate every RTT (Swift) the 1 s snapshot
+				 * of the paced sum wandered 0.77-1.43 x R, and at
+				 * 100 ms the RDMA flow-set's rate had a 5 % scatter
+				 * (validation 2026-09-08). Cost: nq reads of another
+				 * QP's state per event. */
+				uint32_t k, m = s->nq;
+
+				S = 0; n = 0;
+				if (m > HPFT_SET_QPS)
+					m = HPFT_SET_QPS;
+				for (k = 0; k < m; k++) {
+					uint32_t sj = s->qslot[k];
+
+					if (sj < HPFT_QSLOTS && g_q[sj].gen &&
+					    (uint32_t)(now - g_q[sj].last_ts) <= HPFT_ACTIVE_US) {
+						S += hpft_cc_rate(&g_q[sj]);
+						n++;
+					}
+				}
+				if (!n) {
+					S = r;
+					n = 1u;
+				}
+			} else {
+				S = s->sum_cc;
+				n = s->nlive ? s->nlive : (s->nq ? s->nq : 1u);
+			}
+			if (g_sum_live == 2u && g_law == HPFT_LAW_BUCKET && q->c_epoch && S > R) {
+				/* the share from the epoch's snapshot, capped by the
+				 * QP's live quota */
+				uint64_t v = ((uint64_t)q->c_epoch * R) / S;
+
+				if (v > R)
+					v = R;
+				if ((uint32_t)v < r)
+					r = (uint32_t)v;
+				goto shaped;
+			}
 			if (g_law == HPFT_LAW_EQUAL) {
 				r = R / n;
 			} else if (g_law == HPFT_LAW_CAP) {
@@ -1076,6 +1156,8 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 				r = (uint32_t)v;
 			}
 			/* else the bucket is not binding: r = c_i */
+shaped:
+			;
 		} else {
 			/* the flow set is not known yet: fail into a bounded
 			 * rate rather than line rate, so a joining QP cannot
@@ -1217,6 +1299,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 20) g_law = budget ? HPFT_LAW_CAP : HPFT_LAW_BUCKET;   /* legacy NOFLOOR */
 			else if (which == 21) g_unknown_rate = budget ? budget : DOCA_PCC_DEV_MAX_RATE;
 			else if (which == 22) g_law = budget > 2u ? HPFT_LAW_BUCKET : budget;
+			else if (which == 23) g_sum_live = budget > 2u ? 2u : budget;
+			else if (which == 24) g_active_us = budget ? budget : 1000u;
 			else if (which == 25) g_sw_ctx = budget ? 1u : 0u;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
@@ -1295,6 +1379,18 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			*response_size = 8 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
+		/* 0xdf4: which DPA threads ran the algorithm */
+		if (ft == 0xdf4u) {
+			volatile uint32_t *rsp = (volatile uint32_t *)response;
+
+			rsp[0] = g_thr_lo;
+			rsp[1] = g_thr_hi;
+			rsp[2] = g_thr_max;
+			rsp[3] = g_ev_tx;
+			rsp[4] = 0; rsp[5] = 0; rsp[6] = 0; rsp[7] = 0;
+			*response_size = 8 * sizeof(uint32_t);
+			return DOCA_PCC_DEV_STATUS_OK;
+		}
 		/* 0xdf3: binding diagnostics */
 		if (ft == 0xdf3u) {
 			volatile uint32_t *rsp = (volatile uint32_t *)response;
@@ -1321,7 +1417,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[4] = g_q_alloc;
 			rsp[5] = g_q_bound;
 			rsp[6] = g_algo;
-			rsp[7] = g_cc_only | (g_law << 8);
+			rsp[7] = g_cc_only | (g_law << 8) | (g_sum_live << 16);
 			*response_size = 8 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}

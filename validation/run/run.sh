@@ -241,6 +241,11 @@ CCALGO=${HPFT_RDMA_CC_ALGO:-2}
 echo "$ROWS" | awk '$5=="rdma" && $9 ~ /rdma_cc=swift/' | grep -q . && CCALGO=3
 LAW=${HPFT_LAW:-0}
 CCONLY=${HPFT_CC_ONLY:-0}
+# HPFT_RP_KNOBS: extra executor knobs, semicolon-separated mailbox lines
+#   (e.g. "0xcce 1 23;0xcce 5000 24"), written after the arm and restored to
+#   the executor's defaults at exit only for the two the runner knows
+#   (23 = per-event denominator, 24 = drawing window in us).
+RPKNOBS=${HPFT_RP_KNOBS:-}
 mbox() { # $1 host: write the remaining args, one line each, to its DPU's RP FIFO
   local d; d=$(dpu_of "$1"); shift
   local cmd=""; for m in "$@"; do cmd+="timeout 5 bash -c 'echo \"$m\" > /tmp/rp_fifo'; "; done
@@ -249,11 +254,16 @@ mbox() { # $1 host: write the remaining args, one line each, to its DPU's RP FIF
 cleanup() {
   [ -n "$METER_ROWS" ] && echo "$METER_ROWS" | while read -r _ _ dh dv _; do meter_set "$dh" "$dv" 50000000 >/dev/null 2>&1; done
   for h in $SENDERS; do mbox "$h" "0xccd 2" "0xcce 0 22" "0xcce 0 12"; done
+  [ -z "$RPKNOBS" ] || for h in $SENDERS; do mbox "$h" "0xcce 1 23" "0xcce 1000 24"; done
   [ "$CCONLY" = 0 ] || bash tools/lab-infra/roles.sh all >/dev/null 2>&1
   return 0
 }
 trap cleanup EXIT
 for h in $SENDERS; do mbox "$h" "0xccd $CCALGO" "0xcce $LAW 22" "0xcce $CCONLY 12"; done
+if [ -n "$RPKNOBS" ]; then
+  IFS=';' read -r -a KN <<<"$RPKNOBS"
+  for h in $SENDERS; do mbox "$h" "${KN[@]}"; done
+fi
 if [ "$CCONLY" = 1 ]; then
   for h in $SENDERS; do
     ssh -n -o BatchMode=yes "$(dpu_of $h)" "sudo systemctl stop hpft-txagent-e 2>/dev/null; sudo systemctl reset-failed hpft-txagent-e 2>/dev/null; true" </dev/null >/dev/null 2>&1
@@ -273,7 +283,7 @@ print(\"tcp rate table cleared: %d entries\"%n)
   done
   sleep 2
 fi
-echo "rdma executor: cc algo = $CCALGO (2 DCQCN, 3 Swift); law = $LAW (0 bucket, 1 equal cap, 2 equal split); cc-only arm = $CCONLY" | tee "$OUT/arm.txt"
+echo "rdma executor: cc algo = $CCALGO (2 DCQCN, 3 Swift); law = $LAW (0 bucket, 1 equal cap, 2 equal split); cc-only arm = $CCONLY; knobs = ${RPKNOBS:-default}" | tee "$OUT/arm.txt"
 if [ -n "$METER_ROWS" ]; then
   : > "$OUT/hidden_meter.txt"
   while read -r _ _ dh dv _ _ st en opt; do
