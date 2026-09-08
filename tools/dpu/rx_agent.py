@@ -1274,6 +1274,23 @@ def main():
     conf_other_tau = float(ep.get("other_tau_s", 0.1))
     conf_eps = float(ep.get("eps_at_share", 0.03))   # v4: "at share" band for the direction bit
     conf_aavg, conf_avg_tau = {}, float(ep.get("decision_avg_s", 0.1))   # v4: averaged arrival for b / lender decisions
+    # A flow-set that has just STARTED SENDING is not judged to be lending for
+    # this long: "I am not using my share" and "I have not finished ramping"
+    # look the same to a 100 ms average of the arrival, and reading a newcomer
+    # as a lender hands its share to the incumbents through the fill while the
+    # newcomer keeps that same share, so the entitlements add up to more than
+    # the root for as long as the ramp lasts.
+    # Armed by the first arrival, never by membership: a flow-set appears in
+    # the table when its sender connects, which is well before its scheduled
+    # start (iperf3's control connection, perftest's QP exchange), and a
+    # not-yet-sending flow-set that is exempt from the lender test holds a
+    # full share it cannot use - measured on V2, 2026-09-08: the four TCP
+    # flow-sets of the next phase cost the running ones 8 % of the port.
+    # The arm is remembered for n3_evict_s after the flow-set goes quiet, so
+    # one that blips in and out is not re-armed on every reappearance.
+    conf_first, conf_settle = {}, float(ep.get("lender_settle_s", ep.get("fs_grace_s", 0.5)))
+    conf_first_keep = float(ep.get("n3_evict_s", 30))
+    conf_start_floor = float(ep.get("r_floor_bps", 1e9))
     conf_croot = sched.c_root
     conf_dr = float(ep.get("d_repay_s", 0.15))
     vqs = VirtualQueueScheduler(sched, ep.get("d_clip_s", 0.2),
@@ -1428,11 +1445,30 @@ def main():
                     conf_aavg[f] = conf_aavg.get(f, active[f]) + (max(active.get(f, 0.0), 0.0) - conf_aavg.get(f, active[f])) * a_
                 for f in [f for f in conf_aavg if f not in active]:
                     del conf_aavg[f]
+                for f in active:
+                    if active.get(f, 0.0) >= conf_start_floor:
+                        w = conf_first.get(f)
+                        if w is None or now - w[1] > conf_first_keep:
+                            conf_first[f] = [now, now]
+                        else:
+                            w[1] = now
+                for f in [f for f in conf_first if now - conf_first[f][1] > conf_first_keep]:
+                    del conf_first[f]
+                # A flow-set still ramping asks for everything: its averaged
+                # arrival is climbing, so the lender test would read it as
+                # lending capacity it has not had the chance to use, and the
+                # incumbents would be granted that capacity on top of the
+                # share the newcomer keeps. Over the 2026-09-08 runs that
+                # double count put the entitlements 13 to 44 % above the root
+                # for 0.2 to 1.3 s after every join, which is what fills the
+                # ledger and buys the 1.5 s repayment that follows.
                 demand = {}
                 lenders = set()
                 for f in active:
                     want = conf_aavg[f] * (1.0 + ep["delta_demand"])
-                    if want < share.get(f, 0.0):
+                    w = conf_first.get(f)
+                    ramping = w is not None and now - w[0] < conf_settle
+                    if want < share.get(f, 0.0) and not ramping:
                         demand[f] = want
                         lenders.add(f)
                     else:

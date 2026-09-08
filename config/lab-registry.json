@@ -713,6 +713,8 @@
     "tcp_refresh_ms": 100,
     "rate_window_s": 0.01,
     "fs_grace_s": 0.5,
+    "lender_settle_s": 0.0,
+    "lender_settle_comment": "How long a flow-set must have been present before the ledger may call it a LENDER. A newcomer's averaged arrival is still climbing, so the lender test cannot tell \"not using my share\" from \"has not started yet\"; reading a newcomer as a lender hands its share to the incumbents through the water-filling while the newcomer keeps that same share, so the entitlements add up to more than the root. Measured over the 2026-09-08 suite: 1.13 to 1.50 x the root for 0.2 to 1.3 s after every join, which is what fills the ledger and buys the 1.5 s repayment that follows. 0 restores the old behaviour and is the A/B arm; the default is the membership grace, which answers the mirror question (how long an absence is believed).",
     "policy": null,
     "liveness_port": 9713,
     "split_by_sender": true,

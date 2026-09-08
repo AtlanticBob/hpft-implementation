@@ -1,0 +1,7 @@
+criterion,pass,detail
+1 稳态贴合,FAIL,40-60s sgpu03/vf4>sgpu02/vf4|rdma 14.07 vs 11.50; 40-60s sgpu03/vf4>sgpu02/vf4|tcp 7.27 vs 11.50; 40-60s group 11.5G Jain 0.988
+2 队列消得掉,FAIL,0-20s sgpu02 mean 1.07 ms; sgpu01/vf1>sgpu02/vf1|rdma went 1.1 s without clearing; 40-60s sgpu02 sgpu03/vf6>sgpu02/vf6|tcp went 1.5 s without clearing; 80-90s sgpu02 mean 1.06 ms
+3 收敛 ≤ 1 s,FAIL,20s rdma x8 1153 ms; 40s tcp x4 never; 80s rdma x4 2252 ms
+4 不塌,PASS,ok
+5 平台健康,PASS,ok
+6 执行面守约,FAIL,sgpu01/vf2>sgpu02/vf2|rdma paced/R mean 1.030 p95 1.038 over the samples with every QP drawing; sgpu03/vf7>sgpu02/vf7|rdma paced/R mean 1.047 p95 1.166 over the samples with every QP drawing
