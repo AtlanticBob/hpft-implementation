@@ -19,7 +19,7 @@ import os
 # The C implementation of both primitives (fastfill.c). Water-filling is
 # 77% of the receiver's per-tick cost at every scale measured, and the
 # scaling is already near-linear, so the constant factor is the whole
-# problem - see results/scale_20260727. Loaded through ctypes so the DPU
+# problem (measured on the 2026-07-27 scale sweep). Loaded through ctypes so the DPU
 # Arm needs only gcc, not Python headers.
 #
 # Absent or unloadable .so falls back to the pure-Python path below, which

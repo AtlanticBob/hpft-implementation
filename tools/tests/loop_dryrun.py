@@ -3,7 +3,7 @@
 no lab, no root: a local UDP socket stands in for the receiver DPU and a
 real FIFO with a local reader stands in for the PCC RP mailbox.
 
-conf_check.py proves the law's arithmetic. This proves the PROCESS: that
+This proves the PROCESS: that
 main() parses the new record format, drives the sender tree, steps the
 law, actuates, coalesces RDMA budgets at the mailbox rate and degrades
 through freeze -> fail-open. It is the cheapest way to catch a NameError

@@ -5,7 +5,7 @@
 #   swp37s1: nothing bound
 #   swp21/swp25 (the core link, tools/lab-infra/switch/): 200G (profile core_speed)
 # Profile DEFINITIONS (motiv_default_ecn, eval_split5050/7525, ...) are
-# kept -- binding is per-experiment, defined in each EXECUTION.md.
+# kept -- binding is per-experiment, defined in each experiment's README.
 set -eu
 ssh sn5600 '
   nv set interface swp37s0 qos congestion-control profile ecn_incast_bzx
