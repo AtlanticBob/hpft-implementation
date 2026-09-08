@@ -74,6 +74,10 @@
  * ====================================================================== */
 
 #define HPFT_MIN_RATE    (2u)        /* fxp20 floor the wire can still carry */
+/* Bytes a managed port carries in one microsecond at line rate: the token
+ * bucket is the only place the device needs an absolute unit. Platform
+ * quantity, like HPFT_MIN_RATE - 200 Gb/s on this fabric. */
+#define HPFT_LINE_B_PER_US (25000u)
 #define HPFT_EPOCH_US    (1000u)     /* per-QP and per-set housekeeping tick */
 #define HPFT_QSLOTS      (1024)      /* per-QP records */
 #define HPFT_SETS        (32)        /* flow sets this sender serves */
@@ -108,6 +112,28 @@ static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE >> 6);
 #define HPFT_LAW_BUCKET (0u)
 #define HPFT_LAW_CAP    (1u)
 #define HPFT_LAW_EQUAL  (2u)
+/* A real token bucket instead of a division. The flow set owns a pool of
+ * bytes refilled at R and drained by the bytes its QPs actually put on the
+ * wire; a QP may send at its own CC's rate as long as the pool can pay for
+ * it. Nothing here needs sum c_j: the volatile quantity (each QP's rate,
+ * which a delay-based CC changes every round trip) never enters an
+ * arithmetic that has to be consistent across the set, which is what made
+ * the numerator and the denominator disagree in HPFT_LAW_BUCKET. What the
+ * grant does need is how MANY QPs are drawing, and that is a count the
+ * epoch already keeps and that does not move every round trip.
+ *   ceiling = (R + whatever the pool has saved up) / nlive
+ *   r_i     = min(c_i, ceiling)
+ * A QP that wants less than its equal share simply leaves bytes in the
+ * pool, and every QP's ceiling rises by its share of them - the
+ * redistribution happens inside the same millisecond instead of one epoch
+ * later. The pool is charged by TRANSMITTED bytes and refilled at R, so it
+ * settles where the set is granted exactly R: each QP pays the pool for the
+ * interval it has just covered at the rate it was pacing, so the pool holds
+ * the integral of R minus what the set was allowed to send, and a ceiling
+ * derived from it is a plain integral controller with no gain to choose.
+ * The depth, a quarter of one control period's budget, bounds the burst a
+ * set may take after an idle stretch. */
+#define HPFT_LAW_TOKEN  (3u)
 static volatile uint32_t g_law = HPFT_LAW_BUCKET;
 /* a QP that sent within this long is drawing tokens (0xcce <us> 24).
  * Ablation arm; 1 ms is the design point. Widening it to 5 ms on V2 left the
@@ -443,6 +469,7 @@ typedef struct {
 	volatile uint32_t pr_abort;      /* consecutive aborts (timeout doubles) */
 
 	volatile uint32_t paced;     /* last rate written to the wire */
+	volatile uint32_t tok_ts;    /* token law: when this QP last paid the pool */
 	volatile uint32_t epoch_ts;
 
 	volatile uint32_t n_cnp;
@@ -505,6 +532,8 @@ typedef struct {
 	volatile uint32_t epoch_ts;
 	volatile uint32_t nlive;     /* QPs counted in sum_cc */
 	volatile uint32_t r_eff;     /* arm 3: R plus what the members left unused */
+	volatile int32_t  tok;       /* token law: pool level, bytes; may go negative */
+	volatile uint32_t tok_ts;    /* token law: last refill, us */
 } hpft_set_t;
 
 /* arm 3 may hand out at most this multiple of R in one epoch */
@@ -754,10 +783,13 @@ static inline void hpft_q_epoch(volatile hpft_q_t *q, uint32_t now)
 static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t sidx)
 {
 	uint32_t sum = 0, live = 0, paced = 0, n = s->nq;
+	uint32_t elapsed = (uint32_t)(now - s->epoch_ts);
 
-	if ((uint32_t)(now - s->epoch_ts) < HPFT_EPOCH_US)
+	if (elapsed < HPFT_EPOCH_US)
 		return;
 	s->epoch_ts = now;
+	if (elapsed > HPFT_EPOCH_US * 4u)
+		elapsed = HPFT_EPOCH_US * 4u;   /* the set was idle */
 	if (n > HPFT_SET_QPS)
 		n = HPFT_SET_QPS;
 	for (uint32_t k = 0; k < n; k++) {
@@ -801,6 +833,57 @@ static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t
 			s->r_eff = (uint32_t)v;
 		}
 	}
+}
+
+/* Refill the pool at R and cap it at one control period's worth: a set may
+ * burst up to the depth and no more, which is the classic bucket and the
+ * same time constant the rest of the executor already runs on. */
+static inline void hpft_bucket_refill(volatile hpft_set_t *s, uint32_t now)
+{
+	uint32_t dt = (uint32_t)(now - s->tok_ts);
+	int64_t depth, v;
+
+	if (!s->budget)
+		return;
+	if (dt > HPFT_EPOCH_US)
+		dt = HPFT_EPOCH_US;         /* first event, or the set idled */
+	if (!dt)
+		return;
+	s->tok_ts = now;
+	depth = (((int64_t)s->budget * HPFT_LINE_B_PER_US * HPFT_EPOCH_US) >> 20) / 4;
+	v = (int64_t)s->tok + (((int64_t)s->budget * HPFT_LINE_B_PER_US * dt) >> 20);
+	/* The debt is bounded like the credit. Without a floor a transient
+	 * over-grant drives the pool arbitrarily negative and every QP of the
+	 * set sits at the rate floor until the refill has paid it all back:
+	 * measured on V2, RDMA flow-sets fell to 1.6 G against a 23 G share
+	 * while the unshaped TCP half took 35 G. */
+	if (v > depth)
+		v = depth;
+	else if (v < -depth)
+		v = -depth;
+	s->tok = (int32_t)v;
+}
+
+/* What one QP may send: its equal share of R, plus whatever the pool has
+ * spare. The pool carries the outstanding reservations of every QP in the
+ * set (each reserves the bytes its current rate will send before its next
+ * event, and gets refunded what the wire did not carry), so "spare" means
+ * the set as a whole is under its budget - which is the only condition under
+ * which one QP may exceed its equal share. Both terms are rates in the
+ * device's fxp20; the spare term is the pool spread over one control
+ * period. */
+static inline uint32_t hpft_bucket_ceiling(volatile hpft_set_t *s)
+{
+	uint32_t n = s->nlive ? s->nlive : (s->nq ? s->nq : 1u);
+	int64_t bonus = ((int64_t)s->tok << 20) /
+			((int64_t)HPFT_EPOCH_US * HPFT_LINE_B_PER_US);
+	int64_t c = ((int64_t)s->budget + bonus) / n;
+
+	if (c < (int64_t)HPFT_MIN_RATE)
+		c = HPFT_MIN_RATE;
+	if (c > (int64_t)s->budget)
+		c = s->budget;
+	return (uint32_t)c;
 }
 
 static inline void hpft_set_add(volatile hpft_set_t *s, uint32_t slot)
@@ -1182,6 +1265,31 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 					r = (uint32_t)v;
 				goto shaped;
 			}
+			if (g_law == HPFT_LAW_TOKEN) {
+				uint32_t ceil_, dt;
+
+				hpft_bucket_refill(s, now);
+				/* Pay for the interval this QP has just covered,
+				 * at the rate it was pacing over it: summed over
+				 * the set that is exactly what it was allowed to
+				 * send, and no QP ever reads another QP's state.
+				 * Charging the whole membership once per period
+				 * from the epoch sweep was tried and is worse -
+				 * the lump drives the pool hard enough that QPs
+				 * fall out of the drawing window and the set
+				 * under-delivers (worst flow-set 0.890 of its
+				 * share against 0.975). */
+				dt = (uint32_t)(now - q->tok_ts);
+				if (dt > HPFT_EPOCH_US)
+					dt = HPFT_EPOCH_US;
+				q->tok_ts = now;
+				s->tok -= (int32_t)(((int64_t)q->paced *
+						     HPFT_LINE_B_PER_US * dt) >> 20);
+				ceil_ = hpft_bucket_ceiling(s);
+				if (ceil_ < r)
+					r = ceil_;
+				goto shaped;
+			}
 			if (g_law == HPFT_LAW_EQUAL) {
 				r = R / n;
 			} else if (g_law == HPFT_LAW_CAP) {
@@ -1342,7 +1450,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 19) g_dq_monitor_us = budget;
 			else if (which == 20) g_law = budget ? HPFT_LAW_CAP : HPFT_LAW_BUCKET;   /* legacy NOFLOOR */
 			else if (which == 21) g_unknown_rate = budget ? budget : DOCA_PCC_DEV_MAX_RATE;
-			else if (which == 22) g_law = budget > 2u ? HPFT_LAW_BUCKET : budget;
+			else if (which == 22) g_law = budget > 3u ? HPFT_LAW_BUCKET : budget;
 			else if (which == 23) g_sum_live = budget > 3u ? 3u : budget;
 			else if (which == 24) g_active_us = budget ? budget : 1000u;
 			else if (which == 25) g_sw_ctx = budget ? 1u : 0u;
