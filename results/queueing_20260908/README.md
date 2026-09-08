@@ -41,7 +41,7 @@ nv set system telemetry enable on
 
 ## 结果
 
-图：`fig/queueing.png`。数据：`data/queueing.csv`。原始：`results/<臂>/`。
+图：`fig/queueing.png`，两条曲线都是交换机自己的直方图画成的累积分布：左图读作"队列不深于 x 的时间占比"（每 1024 ns 一次采样），右图读作"排队不超过 x 的包占比"（每个包一次采样）。交换机把数据分好了档，所以曲线是阶梯，标记落在档的边界上；最高一档没有上界，图例注明了各自还剩多少落在它里面。数据：`data/queueing.csv`。原始：`results/<臂>/`。
 
 **出向缓冲占用**（采样点占比，越低越好）：
 
