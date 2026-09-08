@@ -1,7 +1,0 @@
-criterion,pass,detail
-1 稳态贴合,FAIL,30-40s sgpu01/vf1>sgpu02/vf1|rdma 21.12 vs 23.00; 30-40s sgpu01/vf3>sgpu02/vf3|rdma 21.51 vs 23.00
-2 队列消得掉,FAIL,20-30s sgpu02 mean 1.03 ms; sgpu01/vf2>sgpu02/vf2|rdma went 1.0 s without clearing; 40-50s sgpu02 mean 1.66 ms; sgpu01/vf1>sgpu02/vf1|rdma went 1.3 s without clearing
-3 收敛 ≤ 1 s,FAIL,10s rdma x8 1666 ms
-4 不塌,PASS,ok
-5 平台健康,PASS,ok
-6 执行面守约,FAIL,sgpu01/vf0>sgpu02/vf0|rdma paced/R mean 1.106 p95 1.563 over the samples with every QP drawing; sgpu01/vf3>sgpu02/vf3|rdma paced/R mean 1.067 p95 1.300 over the samples with every QP drawing

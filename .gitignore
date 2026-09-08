@@ -70,3 +70,7 @@ results/*/results/*_tx_*.jsonl
 results/*/results/*_rx_*.jsonl
 results/conf_20260828/
 results/step_arms_20260825/results/
+
+# queueing experiment: the raw switch histogram snapshots (one JSON per second
+# per arm); the distilled data/ and fig/ are tracked
+results/queueing_20260908/results/*/histogram_raw.jsonl
