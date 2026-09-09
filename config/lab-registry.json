@@ -385,28 +385,6 @@
     "sgpu03/vf6>sgpu01/vf6": "0x39fe53ed",
     "sgpu03/vf7>sgpu01/vf7": "0x1dc7f6c1"
   },
-  "rdma_rules": [
-    {
-      "src_vnic": "sgpu01/vf0",
-      "dst_vnic": "sgpu02/vf0",
-      "rate_bps": 8000000000
-    },
-    {
-      "src_vnic": "sgpu01/vf1",
-      "dst_vnic": "sgpu02/vf1",
-      "rate_bps": 4000000000
-    },
-    {
-      "src_vnic": "sgpu01/vf2",
-      "dst_vnic": "sgpu02/vf2",
-      "rate_bps": 2000000000
-    },
-    {
-      "src_vnic": "sgpu01/vf3",
-      "dst_vnic": "sgpu02/vf3",
-      "rate_bps": 2000000000
-    }
-  ],
   "policy": {
     "comment": "design_v4.md §2. VM == vnic in this lab. weight = W_i (inter-tenant); max_rate_bps = MaxRate_i (null = uncapped); class_weights = W_{i,TCP}/W_{i,RDMA}. per_sender_weights: 'dst_vnic|class|src_vnic' -> u (absent = 1). LAB SHAPE 2026-08-26: every host carries 8 VFs and every VF is sold at 50 Gb/s, enforced by two class-blind layers that do not know about each other (tools/lab-infra/vf_caps.sh): devlink tx_max on the VF's representor at its own DPU (uplink), and an OVS drop-band meter on traffic addressed to the VF at its own DPU (downlink, a naive cloud policer: drops excess, marks nothing). HPFT reads the same number as MaxRate. 8 VMs x 50G = 400G > C' so the ROOT layer binds under full load; one VM alone stays capped below the 200G link.",
     "vms": {
@@ -670,7 +648,7 @@
     "per_sender_weights": {}
   },
   "control": {
-    "comment": "Control plane addressing. Every node may send and receive (2026-09-04), so every map covers every host. telemetry_ip: host -> its DPU in-band ctl IP on p1 (the receiver agent sends feedback there; the sender agent sends its liveness feed to every other node there). pace_shim: host -> its TCP pace shim as reachable from its own DPU (tmfifo). tree_stub_bps = static Tree_f fallback. rate_export: retired 2026-07-13 (the vport meter replaced the host exporter), kept only as the documented fallback.",
+    "comment": "Control plane addressing. Every node may send and receive (2026-09-04), so every map covers every host. telemetry_ip: host -> its DPU in-band ctl IP on p1 (the receiver agent sends feedback there; the sender agent sends its liveness feed to every other node there). pace_shim: host -> its TCP pace shim as reachable from its own DPU (tmfifo). tree_stub_bps: the sender-local ceiling U used before the tree has been computed for a flow-set. pace_floor_bps: numerical floor of the fail-open tracking step.",
     "telemetry_ip": {
       "sgpu01": "10.1.9.1",
       "sgpu02": "10.1.9.2",
@@ -684,20 +662,11 @@
       "sgpu04": "192.168.101.1:9711"
     },
     "tree_stub_bps": 60000000000,
-    "pace_floor_bps": 50000000,
-    "rate_export": {
-      "sgpu02": "192.168.102.2:9712"
-    },
-    "rate_export_port": 9712,
-    "rate_export_ms": 5
+    "pace_floor_bps": 50000000
   },
   "e_params": {
     "comment": "design_v4.md: the fence law. The receiver keeps a virtual-queue ledger per flow-set (Q <- clip(Q + A - E, 0, D*E)) and sends only q = Q/E; the sender steps the fence multiplicatively: R <- R*(1+alpha*min(m,m_max)) while the queue is empty, R <- R*(1-clip(kappa*dq+(kappa/D)*min(q,D), -1/2, 1/2)) always (step_form=exp writes the same exponent as e^x). Every constant below is per-feedback and dimensionless, so none of them change with link rate or flow count - see design_theory_v4.md §5 (scale invariance) and §6, which derives kappa, D and alpha_max from just two measurements (period T_p, loop delay tau) and two dimensionless choices (damping zeta, overshoot budget epsilon). HEADROOM=0.08: ~3% queue-warning margin plus the ~5% VxLAN encap tax (inner-byte ledger vs outer-byte wire, measured 4.99% at 1500 MTU). The ledger counts inner WIRE bytes, so for RoCE at MTU 1024 a share of X in the ledger is X/1.073 of application goodput; with this value the ledger fills the port to exactly what DCQCN alone achieves (184 G inner = 171.5 G goodput, q_ab 2026-09-07). Raising it to 0.13 and 0.17 was tried the same day against the switch marking seen under HyperFront pacing and changed nothing: the marks come from the burstiness of externally paced QPs, not from load, so a larger headroom only gives capacity away.",
     "period_ms": 10,
-    "law": "conf",
-    "d_repay_s": 0.3,
-    "d_clip_s": 0.05,
-    "backlog_hold_s": 0.05,
     "k": 20.0,
     "delta_demand": 0.15,
     "headroom": 0.08,
@@ -715,14 +684,10 @@
     "fs_grace_s": 0.5,
     "lender_settle_s": 0.0,
     "lender_settle_comment": "How long a flow-set must have been present before the ledger may call it a LENDER. A newcomer's averaged arrival is still climbing, so the lender test cannot tell \"not using my share\" from \"has not started yet\"; reading a newcomer as a lender hands its share to the incumbents through the water-filling while the newcomer keeps that same share, so the entitlements add up to more than the root. Measured over the 2026-09-08 suite: 1.13 to 1.50 x the root for 0.2 to 1.3 s after every join, which is what fills the ledger and buys the 1.5 s repayment that follows. 0 restores the old behaviour and is the A/B arm; the default is the membership grace, which answers the mirror question (how long an absence is believed).",
-    "policy": null,
     "liveness_port": 9713,
-    "split_by_sender": true,
-    "trust_recover_s": 1.0,
-    "conf_comment": "law=conf = design v4 (hpft-design/docs/design_v4.md): receiver root = (port - unscheduled arrival)(1-h) with a 5% floor, two water-fillings (share; lenders demand A(1+delta) but keep E = share), virtual queue Q <- clip(Q + A - E, 0, D E), feedback = q = Q/E only (the rate field in the record is a leftover the law does not read); sender R <- R (1+alpha min(m, m_max)) when q = 0 and R <- R (1 - clip(kappa dq + (kappa/D) min(q, D), -1/2, 1/2)), the probe bounded by R <- max(R, min(R (1+step), R_max)), R_max = min(max(h C, r_cap_mult x own send rate), U (1+delta)); executors clip r = clip(cc, (1-T) R, R) with their own trust T: rise (1-T)/tau_r per 1 ms while loss was seen in the last 100 ms, cc < (1-delta) R, q = 0 and not in the start window; decay T max(q/D, dt/tau_d) otherwise (tau_r 1 s, tau_d 5 s, compile-time in the executors). PERIOD 10 ms (= one meter round): per-feedback constants are the 1 ms ones scaled by the period (kappa 0.1 linearly, D 30 unchanged, alpha 3e-4 quadratically since it is the growth rate of the step; alpha_max = alpha m_max = 3%, overshoot alpha_max tau ~ 9%); the trust epoch stays 1 ms",
+    "ledger_comment": "design v4 (hpft-design/docs/design_v4.md): receiver root = (port - unscheduled arrival)(1-h) with a 5% floor, two water-fillings (share; lenders demand A(1+delta) but keep E = share), virtual queue Q <- clip(Q + A - E, 0, D E), feedback = q = Q/E only (the rate field in the record is read by the sender's tree as demand, not by the law); sender R <- R (1+alpha min(m, m_max)) when q = 0 and R <- R (1 - clip(kappa dq + (kappa/D) min(q, D), -1/2, 1/2)), the probe bounded by R <- max(R, min(R (1+step), R_max)), R_max = min(max(h C, r_cap_mult x own send rate), U (1+delta)). PERIOD 10 ms (= one meter round): kappa 0.1, D 30, alpha 3e-4 (alpha_max = alpha m_max = 3%, overshoot alpha_max tau ~ 9%). k is the rate constant of the fail-open tracking step only (5.6). The attribution of a VM's class pool among its senders uses the senders' own liveness reports (platform_notes.md section 2).",
     "kappa": 0.1,
     "D": 30,
-    "rdma_budget_hyst": 0.0,
     "tree_backlog_theta": 0.85,
     "probe_cap_tree": true,
     "tree_period_ms": 100,

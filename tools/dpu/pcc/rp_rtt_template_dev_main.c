@@ -32,45 +32,33 @@
 #define DOCA_PCC_DEV_EVNT_ROCE_ACK_MASK (1 << DOCA_PCC_DEV_EVNT_ROCE_ACK)
 
 /* ======================================================================
- * HyperFront RDMA executor -- per-QP era (2026-09-06)
+ * HyperFront RDMA executor (design v4 section 6)
  *
  * The card is configured with ROCE_CC_SHAPER_COALESCE=SOURCE_QP on the port
- * that carries tenant traffic, so ONE PCC FLOW IS ONE QP: the event's flow
- * tag is unique per QP, and the 12-dword algo_ctxt the framework restores on
- * every event of that flow is that QP's own private memory. Measured
- * 2026-09-06 on this lab: 8 QPs on one VF pair produce 8 flow tags, 8
- * first-touch contexts, and 10.7 M TX events with zero cross-QP context
- * mixups. Before the change the same probe read one tag and one context per
- * VF pair, which is why the previous executor had to rebuild per-QP state
- * from a learned {qpn -> slot} map and charge CNPs and NACKs to "whichever
- * QP transmitted last".
+ * that carries tenant traffic, so ONE PCC FLOW IS ONE QP: the tenant
+ * congestion control (DCQCN, Swift or ZTR, selected by mailbox 0xccd) runs
+ * per QP with exact signal attribution, and HyperFront keeps its own
+ * granularity, the FLOW SET.
  *
- * What that buys, and what this file therefore does:
- *   - every congestion control runs PER QP with exact signal attribution;
- *   - the tenant CC state lives in a slot addressed by the context, so no
- *     map, no epochs, no N counting;
- *   - HyperFront keeps its own granularity, the FLOW SET, and distributes a
- *     flow-set's rate over that set's QPs by the tenant CC's own opinion.
+ * The law: one TOKEN POOL per flow set, refilled at the rate R the
+ * receiver's ledger set. Each QP pays the pool for the stretch it has just
+ * covered at the rate it was pacing, and is then capped at
  *
- * The law (design v4 section 6): HyperFront at the sender is ONE TOKEN
- * BUCKET PER FLOW SET, filled at the rate R the receiver's ledger set. The
- * QPs of the set draw tokens at the rate their own congestion control
- * asks for, c_i. While the bucket is not empty every QP sends at c_i;
- * when the set asks for more than R, the bucket is shared in proportion
- * to how fast each QP draws:
+ *      r_i = min(c_i, (R + pool) / N)
  *
- *      r_i = c_i * min(1, R / sum_j c_j)      (j over the QPs that draw)
+ * with c_i its own CC's rate, the pool level folded into a rate over one
+ * millisecond and bounded to a quarter of a millisecond of R, and N the
+ * QPs of the set that sent in the last millisecond. Nothing here ever
+ * raises a QP above its own c_i: HyperFront only caps the set at R, and
+ * the tenant CC keeps the whole job of reacting to the network below that
+ * cap. The equal-cap arm (r_i = min(c_i, R/N), no pool) and the equal-split
+ * arm (r_i = R/N, CC ignored) are the ablation arms of the design (mailbox
+ * 0xcce <n> 22); 0xcce 1 12 runs the tenant CC alone.
  *
- * The hardware has no bucket shared across QPs, so the DPA emulates it:
- * once per millisecond the set sums c_j over its QPs that sent in the last
- * millisecond, and every event of a QP programs its own shaper to r_i. A
- * QP that sends nothing draws nothing and is not in the sum. Nothing here
- * ever raises a QP above its own c_i: HyperFront only caps the set at R,
- * and the tenant CC keeps the whole job of reacting to the network below
- * that cap - which is what keeps the receiver port's queue short
- * (measured 2026-09-07: a law that normalised the CC's retreat away and
- * held the set at R marked 60x more frames at the switch for the same
- * throughput and fairness).
+ * QP records are keyed by (vhca_id, qpn) and placed by a hash of that key
+ * (the framework's per-flow context is only a cache hint: it is not
+ * strictly one per QP, and the DPA has no atomics to arbitrate a shared
+ * allocator with).
  * ====================================================================== */
 
 #define HPFT_MIN_RATE    (2u)        /* fxp20 floor the wire can still carry */
@@ -95,15 +83,9 @@
 #define HPFT_SET_EMPTY   (0xffffffffu) /* a retired entry in a set's member list */
 
 /* which tenant CC the executor runs for every QP (mailbox 0xccd) */
-#define HPFT_CC_AIMD  (0u)
 #define HPFT_CC_ZTR   (1u)
 #define HPFT_CC_DCQCN (2u)
 #define HPFT_CC_SWIFT (3u)
-/* 4: the vendor template's handlers with the stock Swift core (the
- * pcc_swift_stock build's algo/rtt_template.c compiled into this tree),
- * driven straight from the framework's context; none of this file's
- * per-QP machinery runs. A reference arm, only meaningful with cc_only. */
-#define HPFT_CC_STOCK (4u)
 static volatile uint32_t g_algo = HPFT_CC_DCQCN;
 
 /* 0xcce <0|1> 12: run the tenant CC alone, HyperFront ignored. This is the
@@ -112,8 +94,7 @@ static volatile uint32_t g_cc_only;
 /* 0xcce <units> 21: what a QP whose flow set is not known yet may send. */
 static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE >> 6);
 /* 2^20/64 = 3.1 G per QP: design v4 5.4 starts a new flow set at the port's
- * headroom R0 = h*C (16 G here) split over its expected QPs. The old 1/16 of
- * line let four unbound QPs offer 50 G before the agent had bound them. */
+ * headroom R0 = h*C (16 G here) split over its expected QPs. */
 /* 0xcce <n> 22: the law. 0 = the token pool (default); 1 = equal cap,
  * r_i = min(c_i, R/N), no sharing inside the set; 2 = equal split ignoring
  * the CC, r_i = R/N. 1 and 2 are the ablation arms. */
@@ -126,35 +107,24 @@ static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE >> 6);
  * every round trip - never enters an arithmetic that has to be consistent
  * across the set. What the grant does need is how MANY QPs are drawing, and
  * that is a count the epoch already keeps and that does not move every round
- * trip. (Until 2026-09-09 the pool was simulated by a division,
- * r_i = c_i R / sum c_j, whose numerator was read at the event and whose
- * denominator was a millisecond old; on Swift that cost 2.5 points of the
- * worst flow-set's share and 2 G of goodput, and it is gone.)
+ * trip.
  *   ceiling = (R + whatever the pool has saved up) / nlive
  *   r_i     = min(c_i, ceiling)
  * A QP that wants less than its equal share simply leaves bytes in the
  * pool, and every QP's ceiling rises by its share of them - the
  * redistribution happens inside the same millisecond instead of one epoch
- * later. The pool is charged by TRANSMITTED bytes and refilled at R, so it
- * settles where the set is granted exactly R: each QP pays the pool for the
- * interval it has just covered at the rate it was pacing, so the pool holds
- * the integral of R minus what the set was allowed to send, and a ceiling
+ * later. The pool is refilled at R and charged by what was ALLOWED: each
+ * QP pays the pool for the interval it has just covered at the rate it was
+ * pacing, so the pool holds the integral of R minus what the set was
+ * allowed to send, and a ceiling
  * derived from it is a plain integral controller with no gain to choose.
- * The depth, a quarter of one control period's budget, bounds the burst a
- * set may take after an idle stretch. */
+ * The depth, a quarter of a millisecond of R, bounds the burst a set may
+ * take after an idle stretch. */
 static volatile uint32_t g_law = HPFT_LAW_TOKEN;
-/* a QP that sent within this long is drawing tokens (0xcce <us> 24).
- * Ablation arm; 1 ms is the design point. Widening it to 5 ms on V2 left the
- * paced sum unchanged and cost half a second on the join (2026-09-08): a QP
- * that has stopped keeps its place in the denominator for longer, so the
- * others get less than their share until it ages out. */
+/* a QP that sent within this long is drawing tokens (0xcce <us> 24);
+ * ablation knob, 1 ms is the design point */
 static volatile uint32_t g_active_us = 1000u;
 #define HPFT_ACTIVE_US  (g_active_us)
-/* 0xcce <0|1> 25: Swift's per-QP state lives in the framework's algo_ctxt
- * (cx[3..7]: cwnd, rtt_s, last_dec, flags, rtt_last), which travels with
- * the event, instead of in the global slot. Diagnostic: whether the DPA's
- * execution units see each other's writes to global memory promptly. */
-static volatile uint32_t g_sw_ctx = 1u;
 /* probe abort: a request unanswered this long (device ns) is re-issued */
 #define HPFT_PROBE_ABORT_NS (300000u)
 
@@ -611,19 +581,10 @@ static inline int hpft_set_of(uint32_t id)
 /* ========================= diagnostics ========================= */
 static volatile uint32_t g_ev_tx, g_ev_cnp, g_ev_nack, g_ev_rtt;
 static volatile uint32_t g_q_alloc, g_q_bound;
-/* record re-inits (a context turned up holding another QP's number), stale
- * unbinds, and the last mismatching pair (diagnostic, 0xdf3) */
-static volatile uint32_t g_q_reinit, g_q_unbind, g_last_qpn_mis, g_last_vhca_mis;
-/* the two reasons a QP lets go of its set, counted apart: the map disagreeing
- * with the slot, and the QP having gone quiet. One counter for both could not
- * say which was behind the 9955 unbinds seen on 2026-09-09. */
-static volatile uint32_t g_unbind_map, g_unbind_quiet;
-/* which DPA threads have run the algorithm (0xdf4): the framework fans events
- * out over doca_pcc's thread pool, so this is a direct read of how much
- * concurrency the executor actually sees. */
-static volatile uint32_t g_thr_lo, g_thr_hi, g_thr_max;
-/* events whose algo_slot is not 0: who they are (diagnostic, 0xdf2) */
-static volatile uint32_t g_ev_slot, g_slot_port[2], g_slot_type[4], g_slot_val, g_slot_maxval;
+/* record re-inits (a context turned up holding another QP's number) and
+ * unbinds, the latter counted apart by reason: the map disagreeing with the
+ * record, and the QP having gone quiet (0xdf3) */
+static volatile uint32_t g_q_reinit, g_q_unbind, g_unbind_map, g_unbind_quiet;
 
 static inline void hpft_q_init(volatile hpft_q_t *q, uint32_t now)
 {
@@ -807,14 +768,6 @@ static inline uint32_t hpft_cc_rate(volatile hpft_q_t *q)
 	return q->cc_rate;
 }
 
-/* per-QP 1 ms housekeeping: keep the membership asserted */
-static inline void hpft_q_epoch(volatile hpft_q_t *q, uint32_t now)
-{
-	if ((uint32_t)(now - q->epoch_ts) < HPFT_EPOCH_US)
-		return;
-	q->epoch_ts = now;
-}
-
 /* per-set 1 ms housekeeping: sum c_j over the QPs drawing tokens.
  *
  * The member list is NEVER compacted and its length never shrinks: a
@@ -825,7 +778,7 @@ static inline void hpft_q_epoch(volatile hpft_q_t *q, uint32_t now)
  * N/(N-1) of its rate (measured 2026-09-06 on the V1 shape: flow sets 16 %
  * over their share while the port was already full). Losses are now
  * self-healing instead of permanent, because every bound QP re-asserts its
- * membership once per millisecond (hpft_q_epoch). */
+ * membership once per millisecond (the per-QP epoch in the handler). */
 static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t sidx)
 {
 	uint32_t sum = 0, live = 0, n = s->nq;
@@ -987,33 +940,25 @@ static inline void hpft_q_reassert(volatile hpft_q_t *q, uint32_t slot)
  * @attr [in]: algo type.
  * @results [out]: the rate to program.
  */
-/* The HyperFront handler proper. A separate, never-inlined function on
- * purpose: the framework's entry point must stay as small as the vendor
- * template's. This function has dozens of locals across its arms and the
- * DPA build is -O0, so folding it into the entry point put a large stack
- * frame on EVERY event, including the stock reference arm's (2026-09-07). */
-static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
-						      doca_pcc_dev_event_t *event,
-						      doca_pcc_dev_results_t *results)
+/* Every event of every flow, whatever algo_slot the framework tags it
+ * with: about 96 % of the data QPs' events arrive with slot 15 (the slot the
+ * firmware keeps for its built-in CC), and handing those to the framework's
+ * default algorithm would hand our data QPs to the firmware's own CC. */
+void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
+			    doca_pcc_dev_event_t *event,
+			    const doca_pcc_dev_attr_t *attr,
+			    doca_pcc_dev_results_t *results)
 {
 	doca_pcc_dev_event_general_attr_t a = doca_pcc_dev_get_ev_attr(event);
 	uint32_t now;
 	volatile hpft_q_t *q;
 	uint32_t slot, want_rtt = 0, r;
+	int ctx_ok;
 	volatile uint32_t *cx = (volatile uint32_t *)algo_ctxt;
 
+	(void)attr;
 	results->rtt_req = 0;
 	now = doca_pcc_dev_get_timer_lo();
-	{
-		unsigned int rank = doca_pcc_dev_thread_rank();
-
-		if (rank < 32u)
-			g_thr_lo |= 1u << rank;
-		else if (rank < 64u)
-			g_thr_hi |= 1u << (rank - 32u);
-		if (rank > g_thr_max)
-			g_thr_max = rank;
-	}
 
 	/* ---- this QP's record ----
 	 * The framework's algo context is the attribution the hardware gives:
@@ -1026,9 +971,10 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 	 * record is claimed from the key's own home slot; the context then
 	 * points at that record until the other QP's next TX event. */
 	{
-		int ctx_ok = (cx[0] == HPFT_CTX_MAGIC && cx[1] < HPFT_QSLOTS && cx[2] &&
-			      g_q[cx[1]].gen == cx[2]);
 		uint32_t key = 0, eq = 0, ev = 0;
+
+		ctx_ok = (cx[0] == HPFT_CTX_MAGIC && cx[1] < HPFT_QSLOTS && cx[2] &&
+			  g_q[cx[1]].gen == cx[2]);
 
 		slot = cx[1];
 		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX) {
@@ -1039,11 +985,9 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 		if (ctx_ok && (!key || g_q[slot].key == key)) {
 			q = &g_q[slot];
 		} else {
-			if (ctx_ok) {
+			if (ctx_ok)
 				g_q_reinit++;
-				g_last_qpn_mis = (g_q[slot].qpn << 16) | (eq & 0xffffu);
-				g_last_vhca_mis = (g_q[slot].vhca << 16) | (ev & 0xffffu);
-			}
+			ctx_ok = 0;
 			if (key) {
 				slot = hpft_q_claim(key, eq, ev, now);
 				q = &g_q[slot];
@@ -1074,15 +1018,17 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 		g_unbind_quiet++;
 	}
 	q->last_ts = now;
-	if (g_algo == HPFT_CC_SWIFT && g_sw_ctx) {
-		/* state in the context: load it into the slot for this event */
-		if (cx[3]) {
-			q->sw_cwnd = cx[3];
-			q->sw_rtt_s = cx[4];
-			q->sw_last_dec = cx[5];
-			q->flags = cx[6];
-			q->rtt_last = cx[7];
-		}
+	if (g_algo == HPFT_CC_SWIFT && ctx_ok && cx[3]) {
+		/* Swift's window travels with the event in the framework's
+		 * context (cx[3..7]: cwnd, rtt_s, last_dec, flags, rtt_last);
+		 * load it into the record for this event. Only when the context
+		 * was this record's: after a cache miss the words still belong
+		 * to the QP the context served before. */
+		q->sw_cwnd = cx[3];
+		q->sw_rtt_s = cx[4];
+		q->sw_last_dec = cx[5];
+		q->flags = cx[6];
+		q->rtt_last = cx[7];
 	}
 
 	/* ---- events ---- */
@@ -1216,18 +1162,12 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 		}
 	}
 
-	if (g_algo == HPFT_CC_AIMD) {
-		uint32_t cr = q->cc_rate + (DOCA_PCC_DEV_MAX_RATE >> 8);
-
-		q->cc_rate = (cr < q->cc_rate || cr > DOCA_PCC_DEV_MAX_RATE)
-				     ? DOCA_PCC_DEV_MAX_RATE : cr;
-	}
 	if (g_algo == HPFT_CC_DCQCN)
 		hpft_dq_advance(&q->dq, now);
 
-	/* the per-QP epoch */
+	/* the per-QP epoch: re-assert the set membership once a millisecond */
 	if ((uint32_t)(now - q->epoch_ts) >= HPFT_EPOCH_US) {
-		hpft_q_epoch(q, now);
+		q->epoch_ts = now;
 		hpft_q_reassert(q, slot);
 	}
 
@@ -1291,7 +1231,7 @@ shaped:
 	}
 	if (r < HPFT_MIN_RATE)
 		r = HPFT_MIN_RATE;
-	if (g_algo == HPFT_CC_SWIFT && g_sw_ctx) {
+	if (g_algo == HPFT_CC_SWIFT) {
 		cx[3] = q->sw_cwnd ? q->sw_cwnd : 1u;
 		cx[4] = q->sw_rtt_s;
 		cx[5] = q->sw_last_dec;
@@ -1302,45 +1242,6 @@ shaped:
 	q->paced = r;
 	results->rate = r;
 	results->rtt_req = want_rtt;
-}
-
-void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
-			    doca_pcc_dev_event_t *event,
-			    const doca_pcc_dev_attr_t *attr,
-			    doca_pcc_dev_results_t *results)
-{
-	/* About half of the events arrive with algo_slot != 0. The vendor
-	 * template hands those to the framework's internal algorithm; doing
-	 * that here hands OUR data QPs to the firmware's own CC (measured
-	 * 2026-09-07: every arm, HyperFront included, then read 174.75 G and
-	 * the bucket no longer capped anything). Every flow is ours, whatever
-	 * slot the framework tags it with; the slot is only counted. */
-	if (attr->algo_slot != 0) {
-		doca_pcc_dev_event_general_attr_t ea = doca_pcc_dev_get_ev_attr(event);
-
-		g_ev_slot++;
-		g_slot_port[ea.port_num & 1u]++;
-		g_slot_type[ea.ev_type & 3u]++;
-		g_slot_val = attr->algo_slot;
-		if (attr->algo_slot > g_slot_maxval)
-			g_slot_maxval = attr->algo_slot;
-	}
-	if (g_algo == HPFT_CC_STOCK) {
-		uint32_t port_num = doca_pcc_dev_get_ev_attr(event).port_num;
-		uint32_t *param = doca_pcc_dev_get_algo_params(port_num, attr->algo_slot);
-		uint32_t *counter = doca_pcc_dev_get_counters(port_num, attr->algo_slot);
-		volatile uint32_t *cx = (volatile uint32_t *)algo_ctxt;
-
-		/* a context this file touched before the arm was selected (QP
-		 * numbers, hence flow tags and contexts, are reused from run
-		 * to run) would be read as a running flow: hand over a clean one */
-		if (cx[0] == HPFT_CTX_MAGIC)
-			for (int i = 0; i < 12; i++)
-				cx[i] = 0;
-		rtt_template_algo(event, param, counter, algo_ctxt, results);
-		return;
-	}
-	hpft_user_algo(algo_ctxt, event, results);
 }
 
 /*
@@ -1422,7 +1323,6 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 21) g_unknown_rate = budget ? budget : DOCA_PCC_DEV_MAX_RATE;
 			else if (which == 22) g_law = budget > 2u ? HPFT_LAW_TOKEN : budget;
 			else if (which == 24) g_active_us = budget ? budget : 1000u;
-			else if (which == 25) g_sw_ctx = budget ? 1u : 0u;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		/* 0xcd1 <value> <which>: Swift parameters */
@@ -1466,7 +1366,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[4] = s->sum_cc;
 			rsp[5] = s->nlive;
 			rsp[6] = s->nq;
-			rsp[7] = g_ev_slot;
+			rsp[7] = 0;
 			*response_size = 8 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
@@ -1485,34 +1385,6 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[5] = g_algo == HPFT_CC_SWIFT ? (q->rtt_min << 16 | (q->rtt_last & 0xffffu)) : q->rtt_last;
 			rsp[6] = q->n_cnp;
 			rsp[7] = q->vhca;
-			*response_size = 8 * sizeof(uint32_t);
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		/* 0xdf2: the slot != 0 events: total, on port 0, on port 1, by
-		 * event type (0..3 = the ev_type low bits), last slot value, max */
-		if (ft == 0xdf2u) {
-			volatile uint32_t *rsp = (volatile uint32_t *)response;
-
-			rsp[0] = g_ev_slot;
-			rsp[1] = g_slot_port[0];
-			rsp[2] = g_slot_port[1];
-			rsp[3] = g_slot_type[0];
-			rsp[4] = g_slot_type[1];
-			rsp[5] = g_slot_type[2];
-			rsp[6] = g_slot_type[3];
-			rsp[7] = g_slot_val | (g_slot_maxval << 16);
-			*response_size = 8 * sizeof(uint32_t);
-			return DOCA_PCC_DEV_STATUS_OK;
-		}
-		/* 0xdf4: which DPA threads ran the algorithm */
-		if (ft == 0xdf4u) {
-			volatile uint32_t *rsp = (volatile uint32_t *)response;
-
-			rsp[0] = g_thr_lo;
-			rsp[1] = g_thr_hi;
-			rsp[2] = g_thr_max;
-			rsp[3] = g_ev_tx;
-			rsp[4] = 0; rsp[5] = 0; rsp[6] = 0; rsp[7] = 0;
 			*response_size = 8 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}

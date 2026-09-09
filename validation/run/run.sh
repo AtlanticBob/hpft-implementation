@@ -191,13 +191,13 @@ meter_set() { # $1 = destination host, $2 = destination VF index, $3 = kbps
     sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=121,tcp,nw_dst=$dip,actions=meter:$m,output:$rep'
     sudo ovs-ofctl -O OpenFlow13 add-flow ovsbr-p1 'priority=120,ip,nw_dst=$dip,actions=meter:$m,output:$rep'" </dev/null
 }
-# ---- the arm on every sender's executor (design 6: the bucket) -------------
+# ---- the arm on every sender's executor (design 6: the token pool) ---------
 # HPFT_RDMA_CC_ALGO: the tenant CC the RDMA executor runs (0xccd): 2 = DCQCN
 #   (default), 3 = Swift. A flow table whose rdma rows carry rdma_cc=swift
 #   selects 3 by itself. Selecting one resets every QP's CC state on the
 #   device, so it is written before any flow starts.
-# HPFT_LAW: the executor's law (0xcce <n> 22): 0 = the bucket (default),
-#   r_i = c_i min(1, R / sum c_j); 1 = equal cap min(c_i, R/N); 2 = equal
+# HPFT_LAW: the executor's law (0xcce <n> 22): 0 = the token pool (default),
+#   r_i = min(c_i, (R + pool)/N); 1 = equal cap min(c_i, R/N); 2 = equal
 #   split R/N ignoring the CC. 1 and 2 are the ablation arms of design 6.
 # HPFT_CC_ONLY=1: the tenant CC alone, HyperFront out of the picture: the
 #   RDMA executor ignores its budgets (0xcce 1 12), the sender agents are

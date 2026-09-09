@@ -58,7 +58,7 @@ done
 sleep 2
 for h in $SENDERS; do
   d=$(dpu_of "$h")
-  for m in "0xccd $ALGO" "0xcce $CC_ONLY 12" "0xcce $LAW 22" "0xcd1 ${SW_TARGET:-6000} 0" "0xcd1 $SW_FS 1" "0xcd1 $SW_BETA 5" "0xcd1 $SW_MDF 6" "0xcd1 ${SW_AI:-256} 4" "0xcd1 ${SW_ALPHA:-50000} 2" "0xcd1 ${SW_BETA_NS:-5000} 3" "0xcd1 $SW_RATE_SRTT 8" "0xcce ${SW_CTX:-1} 25"; do
+  for m in "0xccd $ALGO" "0xcce $CC_ONLY 12" "0xcce $LAW 22" "0xcd1 ${SW_TARGET:-6000} 0" "0xcd1 $SW_FS 1" "0xcd1 $SW_BETA 5" "0xcd1 $SW_MDF 6" "0xcd1 ${SW_AI:-256} 4" "0xcd1 ${SW_ALPHA:-50000} 2" "0xcd1 ${SW_BETA_NS:-5000} 3" "0xcd1 $SW_RATE_SRTT 8"; do
     ssh -n -o BatchMode=yes "$d" "timeout 5 bash -c 'echo \"$m\" > /tmp/rp_fifo'" >/dev/null 2>&1
   done
 done

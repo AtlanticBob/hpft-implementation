@@ -67,7 +67,7 @@ def switch_delta():
     return "；".join(out) or "无（快照缺失或端口无流量）"
 
 
-keyp = {k: ep[k] for k in ("law", "k", "delta_demand", "d_repay_s", "headroom", "rdma_push_ms", "split_by_sender", "rdma_unknown_rate_bps") if k in ep}
+keyp = {k: ep[k] for k in ("period_ms", "kappa", "D", "alpha", "m_max", "step_form", "delta_demand", "headroom", "r_floor_bps", "rdma_push_ms") if k in ep}
 overall = all(v["pass"] == "PASS" for v in verdict)
 md = [f"# {tag}", "",
       f"**判定：{'通过' if overall else '不通过'}**（六条判据见下）。执行面臂：`{arm}`；账本参数 `{json.dumps(keyp, ensure_ascii=False)}`。", "",

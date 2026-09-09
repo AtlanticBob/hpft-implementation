@@ -95,12 +95,7 @@ def load_registry(path: str | Path) -> dict[str, Any]:
 
 def select_rules(registry: dict[str, Any], section: str) -> list[dict[str, Any]]:
     if section == "auto":
-        if registry.get("tcp_rules"):
-            section = "tcp_rules"
-        elif registry.get("rdma_rules"):
-            section = "rdma_rules"
-        else:
-            raise TcpShaperError("registry has neither tcp_rules nor rdma_rules")
+        section = DEFAULT_RULES_SECTION
     rules = registry.get(section)
     if not isinstance(rules, list):
         raise TcpShaperError(f"registry section {section!r} is not a list")

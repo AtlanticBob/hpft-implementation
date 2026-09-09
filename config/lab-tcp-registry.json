@@ -1,5 +1,4 @@
 {
-  "version": 1,
   "local_host": "sgpu01",
   "vnics": [
     {
@@ -641,32 +640,6 @@
       "gids": [
         "00000000000000000000ffff0a010704"
       ]
-    }
-  ],
-  "rdma_rules": [
-    {
-      "src_vnic": "sgpu01/0000:38:00.1/vf0",
-      "dst_vnic": "sgpu02/0000:38:00.1/vf0",
-      "rate_bps": 8000000000,
-      "burst_bytes": 262144
-    },
-    {
-      "src_vnic": "sgpu01/0000:38:00.1/vf1",
-      "dst_vnic": "sgpu02/0000:38:00.1/vf1",
-      "rate_bps": 8000000000,
-      "burst_bytes": 262144
-    },
-    {
-      "src_vnic": "sgpu01/0000:38:00.1/vf2",
-      "dst_vnic": "sgpu02/0000:38:00.1/vf2",
-      "rate_bps": 8000000000,
-      "burst_bytes": 262144
-    },
-    {
-      "src_vnic": "sgpu01/0000:38:00.1/vf3",
-      "dst_vnic": "sgpu02/0000:38:00.1/vf3",
-      "rate_bps": 8000000000,
-      "burst_bytes": 262144
     }
   ],
   "tcp_rules": [

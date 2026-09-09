@@ -40,6 +40,7 @@ import os
 import re
 import socket
 import struct
+import sys
 import time
 
 import mmap
@@ -51,13 +52,13 @@ FIFO = "/tmp/rp_fifo"   # PCC RP mailbox (batched: 0xb47c000N ft bud rate ...)
 
 # binary telemetry - MUST match rx_agent.Telemetry.REC exactly; the two
 # agents are deployed and restarted together or the loop parses garbage.
-# header (seq16, n) then n x (fsid[64], u_bps u64, r_bps u64)
+# header (seq16, n) then n x (fsid[64], r_bps u64, d_us u64)
 _THDR = struct.Struct("<HH")
-_TREC = struct.Struct("<64sQQQ")   # (fsid, u/g bps, r bps, d us)
+_TREC = struct.Struct("<64sQQ")   # (fsid, r bps, d us)
 
 
 def parse_telemetry(data):
-    """bytes -> (seq, {fsid: {'u','r'}}); tolerant of short buffers."""
+    """bytes -> (seq, {fsid: {'r','d'}}); tolerant of short buffers."""
     if len(data) < _THDR.size:
         return None, {}
     seq, n = _THDR.unpack_from(data, 0)
@@ -66,15 +67,11 @@ def parse_telemetry(data):
     for _ in range(n):
         if off + _TREC.size > len(data):
             break
-        fb, u, r, d_us = _TREC.unpack_from(data, off)
+        fb, r, d_us = _TREC.unpack_from(data, off)
         off += _TREC.size
         recs[fb.rstrip(b"\x00").decode("ascii", "ignore")] = {
-            "u": u, "r": r, "d": d_us / 1e6}
+            "r": r, "d": d_us / 1e6}
     return seq, recs
-
-
-
-
 
 
 def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
@@ -158,47 +155,6 @@ def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
     return max(R1, floor), dq, below
 
 
-def conf_step(R, T, Ehat, q, dt, k, d_r, tau_r, floor, gamma=0.0, delta=0.15,
-              under=0, under_n=20, A=0.0, a_ref=0.0):
-    """Fence design v4 (2026-08-26), one feedback step.
-    R tracks Ehat in log space with the repayment term exp(-(k dt/D_r) q);
-    when the queue is empty and Ehat is above R it jumps straight up.
-    Trust: recovers at 1/tau_r ONLY while the flow-set owes nothing
-    (q == 0) AND is clearly under its share (gamma < -delta/2: its own CC
-    is holding it back), and only once that has held for under_n
-    consecutive feedbacks (one loop delay). Decays by the queue, a full
-    queue clearing it within one period.
-    Why each clause (lab, conf_i8 2026-08-28): with the gate on gamma
-    alone, the repayment phase itself - R pushed below E to drain the
-    queue - reads as "under share", trust recovered DURING repayment,
-    12% trust x 200G line rate leaked 24G into every TCP flow-set, the
-    link ran at 103%, DCQCN got CNPs and RDMA starved at 0.5G. The q == 0
-    clause removes that cycle; the consecutive-period clause keeps 20 ms
-    arrival noise from opening the gate. Third clause (sim, join
-    transient): a flow-set CLIMBING under the receiver's delta margin
-    also reads gamma = -delta/(1+delta) by construction (E chases A), so
-    it earned trust while joining and 5% trust x line rate threw it to
-    3x its share; recovery therefore also requires the arrival to be
-    flat over the run (A within delta/2 of where the run started) - a
-    CC-limited flow is flat, a climbing one is not.
-    Returns (R, T, under, a_ref)."""
-    Ehat = max(float(Ehat), floor)
-    R0 = max(R, floor)
-    if q <= 0.0 and Ehat > R0:
-        R1 = Ehat
-    else:
-        a = 1.0 - math.exp(-k * dt)
-        R1 = max(R0 * (Ehat / R0) ** a * math.exp(-(k * dt / d_r) * q), floor)
-    # The trust itself lives in the executor (it is the only place that
-    # sees the tenant CC's rate next to ours; from the sender agent a
-    # CC-limited flow and one we are fencing look the same, since at zero
-    # trust the wire IS our rate). The agent forwards the queue fraction
-    # q/D_r; the executor decays its trust by it and recovers trust only
-    # while the CC asks for less than the fence allows.
-    T1 = min(q / d_r, 1.0)
-    return R1, T1, under, a_ref
-
-
 def track_step(R, target, dt, k, floor):
     """First-order step of R towards `target` in log space. Under design v4
     this is no longer the law - it is the fail-open actuator (§5.5): when
@@ -232,14 +188,12 @@ def track_step(R, target, dt, k, floor):
 class FlowState:
     __slots__ = ("R", "last_rx", "last_step", "last_seq", "mode", "pace", "r",
                  "log_R", "log_age", "log_mode", "esc_since", "esc_log",
-                 "shim_last", "epoch", "phase", "acts", "T", "Ehat", "under",
-                 "q_prev", "dq", "b", "below", "as_avg", "enforced",
-                 "a_ref")
+                 "shim_last", "q_prev", "dq", "below", "as_avg", "enforced")
 
-    def __init__(self, tree, now):
-        self.R = tree          # optimistic start at the tree share (§4.2)
+    def __init__(self, now):
+        self.R = 0.0           # set by the first feedback (§5.4 start)
         self.last_rx = now
-        self.last_step = now   # wall-clock anchor for the tracking step
+        self.last_step = now   # wall-clock anchor for the fail-open tracking step
         self.last_seq = -1
         self.mode = "fresh"
         self.pace = 0.0
@@ -250,38 +204,11 @@ class FlowState:
         self.esc_since = 0.0   # executor-escape tripwire: since when r >> pace
         self.esc_log = 0.0     # last escape alarm emitted
         self.shim_last = 0.0   # last TCP rate push to the host shim
-        self.epoch = -1        # mimd gating: last epoch index acted in
-        self.phase = 0.0       # mimd gating: per-flow-set phase offset (s)
-        self.acts = 0          # mimd: multiplicative steps taken
-        self.T = 0.0           # conf: trust in the tenant CC (starts at 0)
-        self.Ehat = 0.0        # (v3 leftover, unused by v4)
-        self.q_prev = 0.0      # v4: last feedback's queue (periods)
-        self.dq = 0.0          # v4: last queue growth
-        self.b = 0             # v4: last direction bit
-        self.below = 0         # v4: consecutive feedbacks below share with no queue
-        self.enforced = False  # v4: has the fence ever actually held this flow-set
-        self.as_avg = 0.0      # v4: own send rate, ~100 ms average (for the probe cap)
-        self.under = 0         # conf: consecutive feedbacks clearly under share
-        self.a_ref = 0.0       # conf: arrival when that run started
-
-
-def waterfill(capacity, items):
-    """Bounded weighted water-filling; items: {key: (weight, cap)}."""
-    alloc = {k: 0.0 for k in items}
-    active = {k: v for k, v in items.items() if v[1] > 0}
-    while active and capacity - sum(alloc.values()) > 1e-3:
-        remaining = capacity - sum(alloc.values())
-        wsum = sum(w for w, _ in active.values())
-        t_sat = min((cap - alloc[k]) / w for k, (w, cap) in active.items())
-        t = min(t_sat, remaining / wsum)
-        for k, (w, cap) in list(active.items()):
-            alloc[k] += w * t
-            if alloc[k] >= cap - 1e-3:
-                alloc[k] = cap
-                del active[k]
-        if t < t_sat and t_sat != float("inf"):
-            break
-    return alloc
+        self.q_prev = 0.0      # last feedback's queue (periods)
+        self.dq = 0.0          # last queue growth
+        self.below = 0         # consecutive feedbacks with an empty queue
+        self.enforced = False  # has the fence ever actually held this flow-set
+        self.as_avg = 0.0      # own send rate, ~100 ms average (for the probe cap)
 
 
 class SenderTree:
@@ -303,32 +230,9 @@ class SenderTree:
         self.floor = floor
         self.theta = theta
 
-    def _fill(self, demand):
-        tree = {}
-        for f, d in demand.items():
-            src_dst, cls = f.rsplit("|", 1)
-            src = src_dst.split(">")[0]
-            tree.setdefault(src, {}).setdefault(cls, {})[f] = d
-        vms = self.policy["vms"]
-        vm_items = {}
-        for src, classes in tree.items():
-            dsum = sum(d for fs in classes.values() for d in fs.values())
-            maxr = vms.get(src, {}).get("max_rate_bps") or float("inf")
-            vm_items[src] = (vms.get(src, {}).get("weight", 1),
-                             min(maxr, dsum))
-        vm_share = waterfill(self.cap, vm_items)
-        out = {}
-        for src, classes in tree.items():
-            cw = vms.get(src, {}).get("class_weights", {})
-            cls_items = {c: (cw.get(c, 1), sum(fs.values()))
-                         for c, fs in classes.items()}
-            cls_share = waterfill(vm_share[src], cls_items)
-            for c, fs in classes.items():
-                fs_items = {f: (1, d) for f, d in fs.items()}
-                out.update(waterfill(cls_share[c], fs_items))
-        return out
-
-    def _alloc_c(self, demand):
+    def _alloc(self, demand):
+        if not demand:
+            return {}
         vms = self.policy["vms"]
         fsids = list(demand)
         vm_ids, cls_ids = {}, {"rdma": 0, "tcp": 1}
@@ -387,20 +291,15 @@ class SenderTree:
         theta test is still a downstream observation, but it only
         classifies; it does not produce a number."""
         big = self.cap
-        share = self._fill_any({f: big for f in flows})
+        share = self._alloc({f: big for f in flows})
         demand = {}
         for f, st in flows.items():
             if st.pace > 0 and st.r >= self.theta * st.pace:
                 demand[f] = max(st.R, self.floor)
             else:
                 demand[f] = max(st.r * (1.0 + self.delta), self.floor)
-        alloc = self._fill_any(demand)
+        alloc = self._alloc(demand)
         return {f: max(alloc.get(f, 0.0), share.get(f, 0.0)) for f in flows}
-
-    def _fill_any(self, demand):
-        if fastfill.USING_C and demand:
-            return self._alloc_c(demand)
-        return self._fill(demand)
 
 
 class RpMailbox:
@@ -426,48 +325,28 @@ class RpMailbox:
 
     def ensure_open(self):
         """Hold the FIFO write end open at all times: if every writer
-        closes, the RP's stdin reader hits EOF and never reads again
-        (rp_service.sh's dummy keep-open writer is a 20-min sleep;
-        observed dead reader 2026-07-09 after the old tx_agent2 - the
-        last permanent writer - was retired)."""
+        closes, the RP's stdin reader hits EOF and never reads again."""
+        self._open()
+
+    def _open(self):
+        """(Re)open the write end; the FIFO is recreated by rp_service.sh on
+        every executor restart, which shows as a new inode."""
         try:
             ino = os.stat(FIFO).st_ino
         except FileNotFoundError:
-            return
+            return False
         if self.fd < 0 or ino != self.ino:
             if self.fd >= 0:
                 os.close(self.fd)
                 self.fd = -1
             try:
                 self.fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
-                if self.ino != -1:
-                    self.restarted = True
-                self.ino = ino
             except OSError:
-                pass
-
-    def write_batch(self, entries, trust=False):
-        """LEGACY (pre-2026-09 executor, keyed by hardware flow tag). The
-        per-QP executor does not handle 0xb47c/0xb47d at all; the line is
-        kept only for rp_probe.py-style tooling against an old build.
-        entries: [(flowtag_int, budget_bps, rate_bps[, trust_fxp16])].
-        trust=True selects the 0xb47d format (four words per entry): the
-        fourth word carries the queue fraction q/D (low 16 bits, fxp16) and
-        the start-window bit (bit 16); the device clips the CC rate to
-        [(1-T) level, level] with its own trust T (design v4 §6)."""
-        if not entries:
-            return
-        parts = ["0x%x" % ((0xb47d0000 if trust else 0xb47c0000) | len(entries))]
-        for e in entries:
-            ft, bud, rate = e[0], e[1], e[2]
-            parts.append("0x%x %d %d"
-                         % (ft, self._units(bud), self._units(rate)))
-            if trust:
-                parts.append("%d" % (e[3] if len(e) > 3 else 0))
-        if self._fifo_write(" ".join(parts) + "\n"):
-            self.writes += 1
-        else:
-            self.errs += 1
+                return False
+            if self.ino != -1:
+                self.restarted = True
+            self.ino = ino
+        return True
 
     def write_sets(self, entries):
         """entries: [(set_id, budget_bps)] -> 0xb47f batch.
@@ -504,22 +383,8 @@ class RpMailbox:
             self.errs += 1
 
     def _fifo_write(self, line):
-        # reopen on inode change: rp_service.sh recreates the FIFO
-        try:
-            ino = os.stat(FIFO).st_ino
-        except FileNotFoundError:
+        if not self._open():
             return False
-        if self.fd < 0 or ino != self.ino:
-            if self.fd >= 0:
-                os.close(self.fd)
-                self.fd = -1
-            try:
-                self.fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
-                if self.ino != -1:
-                    self.restarted = True
-                self.ino = ino
-            except OSError:
-                return False
         try:
             os.write(self.fd, line.encode())
             return True
@@ -665,26 +530,21 @@ def main():
     args = ap.parse_args()
 
     reg = json.load(open(args.registry))
+    if not fastfill.USING_C:
+        sys.exit("tx_agent_e: libfastfill.so is missing next to fastfill.py "
+                 "(deploy_check.sh --deploy builds it); refusing to run")
     ep = reg["e_params"]
     ctl = reg["control"]
     local_host = args.local_host or reg["sender_host"]
     line = reg["line_rate_bps"]
     period = ep["period_ms"] / 1e3
-    # The law is a wall-clock rate constant (k, s^-1) applied over the
-    # MEASURED interval since this flow-set's last step, not a per-tick
-    # constant: nothing here needs recalibrating when period_ms changes,
-    # and telemetry jitter or a dropped datagram costs accuracy, not
-    # stability. The exact discretisation of zdot = k(ln u - z) over dt is
-    #   z <- z + (1 - exp(-k*dt)) * (ln u - z)
-    # i.e. R <- R*(u/R)**alpha with alpha = 1-exp(-k*dt). At the nominal
-    # 1 ms tick alpha = 0.0198 vs a literal k*T = 0.0200
-    # (0.99% apart); unlike k*T it can never exceed 1, so a late datagram
-    # converges towards the target instead of shooting past it.
+    # k (s^-1) is the rate constant of the fail-open tracking step only
+    # (design v4 5.6: after n2_failopen_s R tracks the local tree in log
+    # space with time constant 1/k). It is applied over the MEASURED
+    # interval since the flow-set's last step, clamped: below one period
+    # it is measurement noise, above dt_max the target is stale enough that
+    # the smooth approach is preferred to one large jump.
     k = ep["k"]
-    # dt is clamped: below one period it is measurement noise, above
-    # dt_max the target is stale enough that we would rather keep the
-    # smooth 1/k approach than jump most of the way to it in one step
-    # (alpha at 10 periods is 0.18).
     dt_min, dt_max = period, 10.0 * period
     n1_s = ep["n1_freeze_s"]
     n2_s = ep["n2_failopen_s"]
@@ -699,7 +559,7 @@ def main():
     # reporting for this long. Without it the table only ever grows -
     # every flow-set ever seen stays in fail-open forever, ticking,
     # actuating and writing budgets.
-    evict_s = ep.get("n3_evict_s", ep.get("flow_evict_s", 30))
+    evict_s = ep.get("n3_evict_s", 30)
     # §5.1 transition-process clause: the contract binds the TRANSITION,
     # not only the steady state - a rate change violent enough that the
     # controlled transport reads it as a fault is a dropped packet in
@@ -738,38 +598,9 @@ def main():
         st.last_step = now
         st.R = track_step(st.R, target, dt, k, floor)
 
-    # law=conf is design v4 (design_v4.md §5): probe by silence, brake on
-    # the ledger's rate of change, repay on its depth. conf_v3 is the
-    # ablation arm that is also handed the explicit rate.
-    law = ep.get("law", "conf")
-    vq_repay = float(ep.get("d_repay_s", 0.06))
-
-    # Pure-factor MIMD arm. gate_s is the loop delay: one multiplicative
-    # step per gate per flow-set. mi_gate selects HOW the once-per-delay
-    # rule is enforced:
-    #   phase  - deterministic: epochs of gate_s, each flow-set offset by a
-    #            hash of its id, so the population's steps are spread over
-    #            the delay instead of landing in the same millisecond
-    #   random - sparse MI: every record acts with probability T/gate_s
-    #            (one step per delay on average, desynchronised by chance)
-    #   none   - act on every record (the overreaction control arm)
-    _rng = __import__("random").Random(0x4851)
-
-
-    # vq2: ONE target, tracked with the v2 first-order step.
-    #   u = g * (1 + (d_star - d)/d_repay), floored at phi_min*g
-    # "your share, corrected by how far your queue is from the standing
-    # delay d_star". Linearised: x'' + k x' + (k/d_repay) x = 0, so
-    # zeta = 0.5*sqrt(k*d_repay) for every flow-set regardless of share.
-
-    # conf (fence design v4): Ehat = A/(1+gamma); R tracks Ehat with the
-    # log first-order step plus the repayment term exp(-(k dt/D_r) q);
-    # exception: q == 0 and Ehat > R jumps straight up. Trust
-    # T' = (1-T)/tau_r - (q/D_r)(T/D_r). The executor blends r = T c + (1-T) R.
-    conf_tr = float(ep.get("trust_recover_s", 1.0))
     # design v4 (per-feedback, dimensionless): probe alpha, brake kappa,
     # repayment horizon D in feedbacks, fence cap = mult x own send rate
-    # probe (§5.2/§5.5): step = alpha * min(m, m_max) per feedback, m =
+    # probe (§5.2/§5.3): step = alpha * min(m, m_max) per feedback, m =
     # consecutive empty-queue feedbacks. alpha = alpha_max / m_max, where
     # alpha_max is the overshoot budget (alpha_max * tau <= 10%) and m_max
     # is how long a silence has to be before the share is believed to have
@@ -778,8 +609,8 @@ def main():
     # period, while kappa scales linearly.
     v4_alpha = float(ep.get("alpha", 3e-4))
     v4_mmax = float(ep.get("m_max", 100))
-    v4_kappa = float(ep.get("kappa", k * period))
-    v4_D = float(ep.get("D", vq_repay / period))
+    v4_kappa = float(ep.get("kappa", 0.1))
+    v4_D = float(ep.get("D", 30))
     # The form of the step. "linear" (the default, design v4 5.2) applies the
     # exponent as 1 + x, bounded to a half; "exp" applies it as e^x, which is
     # the same to first order (measured: the two factors differ by under 0.1%
@@ -801,99 +632,70 @@ def main():
     # from a floor at alpha_max (the open-loop regime, an order of magnitude
     # slower over the same distance). The probe ceiling never sits below
     # the start value. No absolute number: h and C are policy/platform.
-    # §5.4: a flow-set starts at the port's headroom h*C - the capacity the
-    # receiver keeps free for transients - so a newcomer can never push the
-    # port past line rate even when everyone else is at their share, and it
-    # starts ABOVE any realistic share, so the ledger brings it down in ~D
-    # periods (the damped closed-loop regime) instead of the fence climbing
-    # from a floor at alpha_max. No absolute number: h and C are
-    # policy/platform. (h x the destination VM's cap was tried on V2,
-    # 2026-09-02: RDMA joins slower by 0.4 s, TCP joins no better - the TCP
-    # delay is upcall loss in the sender DPU's OVS, not the VM meter.)
-    def start_of(fsid):
-        return float(ep["headroom"]) * float(line)
     v4_start = float(ep["headroom"]) * float(line)
-    v4_cap_floor = v4_start
     # Absolute floor of the fence: the lowest rate the executor shapes
     # correctly (platform quantity, §7) - below it the RDMA executor
     # miscounts QPs and releases several times the budget when it rises.
     v4_floor = max(floor, float(ep.get("r_floor_bps", 1e9)))
 
-    def step_law(st, rec, now, fsid=""):
-        if law == "conf_v3":
-            # ablation arm: the same receiver ledger, but the sender also gets
-            # the explicit rate (A/E on the wire) and tracks it (v3 law)
-            dt = min(max(now - st.last_step, dt_min), dt_max)
-            st.last_step = now
-            gam = rec.get("u", 1e6) / 1e6 - 1.0
-            q_s = rec.get("d", 0.0)                 # seconds
-            A = float(rec.get("r", 0))
-            if A > 0 and 1.0 + gam > 0:
-                st.Ehat = A / (1.0 + gam)
-            if st.mode == "fresh":
-                st.R = min(st.R, st.Ehat if st.Ehat > 0 else v4_cap_floor); st.mode = "v3"
-            st.R, _T, _u, _a = conf_step(st.R, 0.0, st.Ehat, q_s, dt, k, vq_repay, conf_tr, v4_floor)
-            st.q_prev = q_s / period; st.T = min(q_s / vq_repay, 1.0)
-        elif law == "conf":
-            # design v4: q (periods), b (1 = at share), own send rate for the cap
-            q = rec.get("d", 0.0) / period          # seconds -> periods
-            b = 1 if rec.get("u", 0.0) >= 5e5 else 0
-            src, cls = fsid.split(">")[0], fsid.rsplit("|", 1)[1]
-            a_s = live.rate.get("%s|%s" % (src, cls)) if live is not None else None
-            if a_s is not None:
-                st.as_avg += (float(a_s) - st.as_avg) * min(1.0, (now - st.last_step) / 0.1) if st.as_avg > 0 else float(a_s) - st.as_avg
-            # 5.3: the probe may not climb into rates the flow-set could
-            # never use. pace = min(R, Tree), so a fence above the local
-            # tree buys nothing and only lengthens the fall when the share
-            # drops - measured on V2, the incumbents sat at 2 x their send
-            # rate (46 G) while the tree held them at 23 G, so a halving of
-            # the share meant falling a factor of four instead of two.
-            # The margin matters: 5.6 takes R as a pressing flow-set's
-            # demand on the tree, so capping R AT the tree would make
-            # demand == tree, the fill would sit at its own fixed point and
-            # the tree could never grow again. One delta of headroom keeps
-            # the demand above the tree and the growth path open.
-            cap = line if a_s is None else max(v4_cap_mult * st.as_avg, start_of(fsid))
-            if probe_cap_tree:
-                cap = min(cap, tree_of(fsid) * (1.0 + ep["delta_demand"]))
-            if st.mode == "fresh":
-                # §5.4: start at the port's headroom (bounded by the local
-                # tree), not at a floor. The silence starts at its cap, not
-                # at zero: a flow-set that has never seen a queue has no
-                # evidence at all about where its share is, which is the
-                # maximum-uncertainty state and the one case where the
-                # largest step is the right one.
-                st.R = min(start_of(fsid), tree_of(fsid), line)
-                st.below = int(v4_mmax)
-                st.mode = "v4"
-            # The fence has taken hold once the flow-set's OWN measured send
-            # rate is within the fence. No measurement is not evidence of
-            # anything: latching on a_s == None (as this once did) declared
-            # the fence in force before the first sample and disabled the
-            # adoption rule below for the flow-set's whole life.
-            if not st.enforced and a_s is not None and float(a_s) \
-                    <= max(st.R, v4_floor) * (1.0 + ep["delta_demand"]):
-                st.enforced = True          # latched: the fence has taken hold
-            # An empty ledger is a statement by the receiver that this
-            # flow-set did NOT exceed its entitlement, so the rate it is
-            # already putting on the wire is one the receiver has just
-            # certified. The fence may adopt it at once; probing up to a
-            # rate that has already been sent and accounted for is work the
-            # loop does not need to do. In the steady state the flow is
-            # held at its fence, so this is a no-op; it fires only where
-            # the wire is ahead of the fence, which is exactly a flow-set
-            # whose executor admitted it at a startup allowance before any
-            # budget arrived - and that is the 810 ms the newcomer used to
-            # spend climbing from the floor at the maximum step.
-            if q <= 0.0 and not st.enforced and a_s is not None:
-                st.R = max(st.R, min(float(a_s), cap, line))
-            st.R, st.dq, st.below = v4_step(st.R, q, st.q_prev, st.below,
-                                            v4_alpha, v4_mmax, v4_kappa, v4_D,
-                                            v4_floor, min(cap, line),
-                                            not st.enforced, v4_linear)
-            st.q_prev, st.b = q, b
-            st.last_step = now
-            st.T = min(q / v4_D, 1.0)               # queue fraction for the executors' trust
+    def step_law(st, rec, now, fsid):
+        """Design v4 §5, one feedback: q (periods) and the flow-set's own
+        send rate (for the probe cap) in, a new R out."""
+        q = rec.get("d", 0.0) / period          # seconds -> periods
+        src, cls = fsid.split(">")[0], fsid.rsplit("|", 1)[1]
+        a_s = live.rate.get("%s|%s" % (src, cls)) if live is not None else None
+        if a_s is not None:
+            st.as_avg += (float(a_s) - st.as_avg) * min(1.0, (now - st.last_step) / 0.1) if st.as_avg > 0 else float(a_s) - st.as_avg
+        # 5.3: the probe may not climb into rates the flow-set could
+        # never use. pace = min(R, Tree), so a fence above the local
+        # tree buys nothing and only lengthens the fall when the share
+        # drops - measured on V2, the incumbents sat at 2 x their send
+        # rate (46 G) while the tree held them at 23 G, so a halving of
+        # the share meant falling a factor of four instead of two.
+        # The margin matters: 5.6 takes R as a pressing flow-set's
+        # demand on the tree, so capping R AT the tree would make
+        # demand == tree, the fill would sit at its own fixed point and
+        # the tree could never grow again. One delta of headroom keeps
+        # the demand above the tree and the growth path open.
+        cap = line if a_s is None else max(v4_cap_mult * st.as_avg, v4_start)
+        if probe_cap_tree:
+            cap = min(cap, tree_of(fsid) * (1.0 + ep["delta_demand"]))
+        if st.mode == "fresh":
+            # §5.4: start at the port's headroom (bounded by the local
+            # tree), not at a floor. The silence starts at its cap, not
+            # at zero: a flow-set that has never seen a queue has no
+            # evidence at all about where its share is, which is the
+            # maximum-uncertainty state and the one case where the
+            # largest step is the right one.
+            st.R = min(v4_start, tree_of(fsid), line)
+            st.below = int(v4_mmax)
+        # The fence has taken hold once the flow-set's OWN measured send
+        # rate is within the fence. No measurement is not evidence of
+        # anything: latching on a_s == None (as this once did) declared
+        # the fence in force before the first sample and disabled the
+        # adoption rule below for the flow-set's whole life.
+        if not st.enforced and a_s is not None and float(a_s) \
+                <= max(st.R, v4_floor) * (1.0 + ep["delta_demand"]):
+            st.enforced = True          # latched: the fence has taken hold
+        # An empty ledger is a statement by the receiver that this
+        # flow-set did NOT exceed its entitlement, so the rate it is
+        # already putting on the wire is one the receiver has just
+        # certified. The fence may adopt it at once; probing up to a
+        # rate that has already been sent and accounted for is work the
+        # loop does not need to do. In the steady state the flow is
+        # held at its fence, so this is a no-op; it fires only where
+        # the wire is ahead of the fence, which is exactly a flow-set
+        # whose executor admitted it at a startup allowance before any
+        # budget arrived - and that is the 810 ms the newcomer used to
+        # spend climbing from the floor at the maximum step.
+        if q <= 0.0 and not st.enforced and a_s is not None:
+            st.R = max(st.R, min(float(a_s), cap, line))
+        st.R, st.dq, st.below = v4_step(st.R, q, st.q_prev, st.below,
+                                        v4_alpha, v4_mmax, v4_kappa, v4_D,
+                                        v4_floor, min(cap, line),
+                                        not st.enforced, v4_linear)
+        st.q_prev = q
+        st.last_step = now
     shim = PaceShim(ctl["pace_shim"][local_host])
     # sender-liveness feed (advisory, see SenderLiveness): tells the receiver
     # which senders are actually sending, at vport freshness (~1 ms), so its
@@ -1184,13 +986,11 @@ def main():
     flows = {}   # fsid -> FlowState
     last_any_rx = time.monotonic()   # last telemetry from ANY flow-set
     logf = open(args.log, "a", buffering=1)
-    print("tx_agent_e: local=%s T=%.0fms law=%s k=%.1f/s (tau=%.0fms, "
-          "alpha@T=%.4f) failopen=%.2f/%.1fs evict=%.0fs tree=%s shim=%s "
-          "log=%s"
-          % (local_host, period * 1e3, law, k, 1e3 / k,
-             1.0 - math.exp(-k * period), n1_s, n2_s, evict_s,
-             "C" if fastfill.USING_C else "python",
-             ctl["pace_shim"][local_host], args.log), flush=True)
+    print("tx_agent_e: local=%s T=%.0fms kappa=%.3f D=%.0f alpha=%.1e m_max=%.0f "
+          "failopen=%.2f/%.1fs (k=%.1f/s) evict=%.0fs shim=%s log=%s"
+          % (local_host, period * 1e3, v4_kappa, v4_D, v4_alpha, v4_mmax,
+             n1_s, n2_s, k, evict_s, ctl["pace_shim"][local_host], args.log),
+          flush=True)
 
     def actuate(fsid, st, r_bps, rdma_batch):
         # design v4 §5.5: min(R, U), never below the platform minimum rate
@@ -1258,20 +1058,8 @@ def main():
     # freshest snapshot at the mailbox rate. The RDMA congestion response
     # stays event-speed on the DPA; only the policy target is rate-limited.
     latest_rdma = {}    # set id -> R (bps)
-    # dsts whose RDMA rate the receiver can only split by estimate, i.e.
-    # those carrying more than one RDMA sender. Recomputed per datagram
-    # from the FULL record set (not the local filter): a remote sender we
-    # do not pace still makes our own dst's split an estimate.
-    ambiguous_dsts = set()
     rdma_push_s = ep.get("rdma_push_ms", 13) / 1e3
     last_rdma_push = time.monotonic()
-    # The RP device code takes a control step only when the FED rate
-    # changes; a wire held at a constant (e.g. floor) rate therefore
-    # freezes the RP forever - budget updates alone do not un-freeze it
-    # (M2@1ms deadlock, 2026-07-11: bud=12.6G, lvl stuck at 0.02G while
-    # the fed rate never moved). Alternate the fed rate by +-max(3%, one
-    # 2^20-unit) every push so the RP always sees a change and keeps
-    # converging its level toward the budget.
     # Per-datagram cost histogram, the sender's counterpart to the
     # receiver's. It matters MORE here: tx was measured to be the tighter
     # of the two agents, rebuilding its whole sender tree on every
@@ -1321,22 +1109,12 @@ def main():
         rdma_batch = []
         if recs_all:
             last_any_rx = now
-            srcs_per_dst = {}
-            for f in recs_all:
-                sd, c = f.rsplit("|", 1)
-                if c == "rdma":
-                    s_, d_ = sd.split(">")
-                    srcs_per_dst.setdefault(d_, set()).add(s_)
-            ambiguous_dsts = {d for d, ss in srcs_per_dst.items()
-                              if len(ss) > 1}
             recs = {f: rec for f, rec in recs_all.items()
                     if f.split(">")[0].startswith(local_host + "/")}
-            fresh = []
             for fsid, rec in recs.items():
                 st = flows.get(fsid)
                 if st is None:
-                    st = flows[fsid] = FlowState(0.0, now)
-                    fresh.append(fsid)
+                    st = flows[fsid] = FlowState(now)
                 st.r = rec.get("r", 0)
             _t0 = time.monotonic()
             # 5.6: the tree is an upper bound, not a second controller, so
@@ -1349,40 +1127,13 @@ def main():
                     or keys_now != tree_keys or not trees):
                 trees = stree.trees(flows)
                 tree_recomputed, tree_keys = now, keys_now
-            apply_trees(now)                # §5.1 transition limiting
+            apply_trees(now)                # §5.5 transition limiting
             tree_us = int((time.monotonic() - _t0) * 1e6)
-            for fsid in fresh:
-                # Optimistic start (§4.2), but no more optimistic than what
-                # the receiver has ALREADY said. Tree_f is the sender-local
-                # allowance and is the right start when nothing better is
-                # known; the very record that creates this flow-set carries
-                # u_f, which is the receiver's ceiling for it right now.
-                # Starting above u and tracking down means the first budget
-                # written to the executor is knowingly too large.
-                #
-                # It matters most in exactly the case that hurts: joining a
-                # dst that is already at its MaxRate. There u is the joint
-                # fair share while Tree is the whole VM allowance, so the
-                # old start doubled the load on a saturated node for the
-                # 50 ms the law needs to come down - and the RDMA executor
-                # reads a 2x over-budget condition as something to dig out
-                # of, hard, for both senders at once (2026-07-28).
-                u0 = recs[fsid].get("u", 0)
-                if law == "conf":
-                    rr = recs[fsid].get("r", 0)
-                    g1 = u0 / 1e6 if u0 > 0 else 1.0
-                    u0 = (rr / g1) if (rr > 0 and g1 > 0) else 0
-                flows[fsid].R = min(tree_of(fsid), u0) if u0 > 0 \
-                    else tree_of(fsid)
             for fsid, rec in recs.items():
                 st = flows[fsid]
                 st.last_rx = now
                 st.last_seq = seq if seq is not None else -1
-                u, r = rec.get("u", 0.0), rec.get("r", 0)
-                # THE LAW (§4.2): one first-order step towards the target.
-                # Nothing guards this line: the target is not a guess, it
-                # is bounded at the receiver, so there is nothing for an
-                # increase cap or a decrease floor to protect against.
+                r = rec.get("r", 0)
                 step_law(st, rec, now, fsid)
                 st.mode = "track"
                 actuate(fsid, st, r, rdma_batch)
@@ -1398,10 +1149,9 @@ def main():
                     st.log_mode = st.mode
                     logf.write(json.dumps(
                         {"ts": round(time.time(), 4), "fs": fsid,
-                         "seq": st.last_seq, "u": int(u), "r": r,
+                         "seq": st.last_seq, "r": r,
                          "d": round(rec.get("d", 0.0) * 1e3, 3),
-                         "acts": st.acts, "T": round(st.T, 3),
-                         "Ehat": int(st.Ehat), "q": round(st.q_prev, 3), "b": st.b, "dq": round(st.dq, 4),
+                         "q": round(st.q_prev, 3), "dq": round(st.dq, 4),
                          "As": int(live.rate.get("%s|%s" % (fsid.split(">")[0], fsid.rsplit("|", 1)[1]), 0)) if live is not None else -1,
                          "R": int(st.R), "pace": int(st.pace),
                          "tree": int(tree_of(fsid)), "tus": tree_us,

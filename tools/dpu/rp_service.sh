@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NP service controller on the DPU: start | query | stop | status
+# RDMA executor (DOCA PCC RP) controller on the DPU: start | query | setcap | stop | status
 LOG=/tmp/pcc_rp.log
 FIFO=/tmp/rp_fifo
 BIN=${RP_BIN:-/home/ubuntu/bzx/doca34-apps/build/pcc/doca_pcc}   # RP_BIN overrides (e.g. the stock Swift build)
@@ -23,7 +23,7 @@ start)
     ps -C doca_pcc -o pid,etime,cmd | tail -1
     ;;
 query)
-    timeout 3 bash -c "echo '0xdeb 0' > $FIFO" || { echo QUERY_WRITE_BLOCKED; exit 1; }
+    timeout 3 bash -c "echo '0xdef 0' > $FIFO" || { echo QUERY_WRITE_BLOCKED; exit 1; }
     sleep 1
     grep -a HPFT_RSP $LOG | tail -1
     ;;

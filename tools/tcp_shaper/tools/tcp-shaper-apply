@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="HPFT TCP EDT/BPF shaper planner and loader")
     parser.add_argument("--registry", required=True, help="registry JSON path")
     parser.add_argument("--backend", default="edt-bpf", help="only edt-bpf is supported")
-    parser.add_argument("--rules-section", default=DEFAULT_RULES_SECTION, help="tcp_rules, rdma_rules, or auto")
+    parser.add_argument("--rules-section", default=DEFAULT_RULES_SECTION, help="registry section holding the pair rules")
     parser.add_argument("--local-host", help="override registry local_host")
     parser.add_argument("--netdev-preference", default="pf,dpu", help="accepted for DPU CLI compatibility")
     parser.add_argument("--egress-dev", default=DEFAULT_EGRESS_DEV, help="DPU egress device to shape")

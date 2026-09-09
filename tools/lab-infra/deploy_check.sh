@@ -216,7 +216,7 @@ HOST_FILES="tools/host/hpft_pace_shim.py tools/host/qpn_resolver.py
             tools/lab-infra/vf_setup.sh tools/cross_pair_net.sh
             tools/tcp_shaper/tools/tcp_shaper_lib.py tools/tcp_shaper/tools/tcp-shaper-apply
             tcp/bpf-opt3/hpft_tcp_edt_kern.o tcp/bpf-opt3/hpft_tcp_edt_kern.c
-            tcp/bpf-opt3/hpft_bpf_helpers.h tools/dpu-timesync.sh
+            tcp/bpf-opt3/hpft_bpf_helpers.h
             tools/host/udp_blast.c
             config/lab-tcp-registry.json config/lab-registry.json"
 HOST_FILES=$(echo $HOST_FILES)

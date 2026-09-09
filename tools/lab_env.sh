@@ -89,8 +89,8 @@ status() {
   # verdict
   if [ "$u1" = 1 ] && [ "$rx" = active ] && [ "$tx" = active ]; then
     echo "==> environment: HPFT"
-  elif [ "$u1" = 1 ] && ssh "$SDPU" 'pgrep -a -x doca_pcc | grep -q pcc_ztr_stock' 2>/dev/null; then
-    echo "==> environment: ZTR (stock RTT template, no HPFT)"
+  elif [ "$u1" = 1 ]; then
+    echo "==> environment: CC ALONE (HyperFront executor without agents: ztr or swift)"
   elif [ "$jak" -gt 0 ]; then
     echo "==> environment: JAKIRO (DHTB up)"
   else
@@ -183,12 +183,9 @@ direct)
 
 ztr|swift)
   # The tenant CC alone, run by the HyperFront executor's own per-QP
-  # implementation (0xccd 1 = ZTR, 0xccd 3 = Swift) with the bucket off
-  # (0xcce 1 12). This is the ONLY DCQCN/Swift/ZTR implementation that
-  # counts (tools/dpu/pcc/README.md, 2026-09-08). The stock template
-  # binaries were deleted from the DPUs: they handed the slot-15 events
-  # (96 % of the data QPs here) to the framework's internal algorithm, so
-  # their numbers were the firmware's CC, not theirs.
+  # implementation (0xccd 1 = ZTR, 0xccd 3 = Swift) with the pool off
+  # (0xcce 1 12); the only DCQCN/Swift/ZTR implementation that counts
+  # (tools/dpu/pcc/README.md).
   ALGO=1; [ "$1" = swift ] && ALGO=3
   echo "== -> ${1^^} (HyperFront executor, tenant CC 0xccd $ALGO alone, UPCC=1, no agents) on every DPU =="
   jakiro_stop

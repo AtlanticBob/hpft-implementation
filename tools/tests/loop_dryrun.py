@@ -64,9 +64,6 @@ reg["e_params"]["telemetry_port"] = PORT
 # than waiting, which is the only way the POSITIVE half is reachable in a
 # run this short
 reg["e_params"]["n3_evict_s"] = 0.5
-# this dry run exercises the v2 tracking arm; the vq arm has its own
-# closed-loop check (vq_check.py)
-reg["e_params"]["law"] = "conf"
 reg["control"]["pace_shim"] = {"sgpu01": "127.0.0.1:%d" % SHIM_PORT}
 regpath = os.path.join(tmp, "registry.json")
 json.dump(reg, open(regpath, "w"))
@@ -110,9 +107,9 @@ sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 t0 = time.monotonic()
 
 
-def feed(u, r, until, q_us=0):
+def feed(r, until, q_us=0):
     while time.monotonic() - t0 < until:
-        sender.sendto(tel._pack([(FS, u, r, q_us)]), ("127.0.0.1", PORT))
+        sender.sendto(tel._pack([(FS, r, q_us)]), ("127.0.0.1", PORT))
         time.sleep(EP["period_ms"] / 1e3)
 
 
@@ -121,20 +118,18 @@ def feed(u, r, until, q_us=0):
 FS2 = "sgpu01/vf1>sgpu02/vf1|rdma"
 
 
-def feed2(u, r, until, both=True):
+def feed2(r, until, both=True):
     while time.monotonic() - t0 < until:
-        recs = [(FS, u, r, 0)] + ([(FS2, u, r, 0)] if both else [])
+        recs = [(FS, r, 0)] + ([(FS2, r, 0)] if both else [])
         sender.sendto(tel._pack(recs), ("127.0.0.1", PORT))
         time.sleep(EP["period_ms"] / 1e3)
 
 
-# law=conf reads the 4th field as the virtual queue in us and treats u as
-# the direction bit, so the stimulus is a queue, not a target rate: an empty
-# ledger first (the fence must probe UP), then a sustained queue (it must
-# repay DOWN). Feeding a target rate here is what the v2 law wanted.
-feed2(6e9, 5.7e9, 1.2)        # q = 0: both flow-sets, fence probes up
+# the stimulus is a queue, not a target rate: an empty ledger first (the
+# fence must probe UP), then a sustained queue (it must repay DOWN)
+feed2(5.7e9, 1.2)        # q = 0: both flow-sets, fence probes up
 t_down = time.monotonic() - t0
-feed(6e9, 5.7e9, 2.0, q_us=40000)   # 40 ms of queue: the fence must repay
+feed(5.7e9, 2.0, q_us=40000)   # 40 ms of queue: the fence must repay
 t_off = time.monotonic() - t0
 time.sleep(2.6)                              # telemetry silence
 stop.set()
@@ -163,7 +158,7 @@ check("D1 agent produced log records", len(rows) > 10,
 
 modes = [r["mode"] for r in rows]
 check("D2 only the live modes appear",
-      set(modes) <= {"conf", "track", "frozen", "fail_open"},
+      set(modes) <= {"track", "frozen", "fail_open"},
       "modes seen: %s" % sorted(set(modes)))
 
 # an empty ledger must make the fence climb, and a sustained queue must
@@ -210,10 +205,8 @@ check("D8 RDMA budgets coalesced at ~13 ms",
 vals = []
 for _, line in budgets:
     parts = line.split()
-    # 0xb47c is the three-word batch; the fence design writes 0xb47d, which
-    # carries the executor's trust as a fourth word per entry. Matching only
-    # the old header read every budget as absent.
-    if len(parts) >= 4 and parts[0][:6] in ("0xb47c", "0xb47d"):
+    # 0xb47f|n then n x {set id, budget units}: the first entry's budget
+    if len(parts) >= 3 and parts[0][:6] == "0xb47f":
         vals.append(int(parts[2]))
 check("D9 budget descends without a ramp",
       bool(vals) and min(vals) < max(vals) * 0.7,

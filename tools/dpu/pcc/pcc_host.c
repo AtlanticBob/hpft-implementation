@@ -215,13 +215,11 @@ int main(int argc, char **argv)
 			for (;;) {
 				unsigned long w0 = strtoul(line, NULL, 0);
 
-				/* a budget snapshot is complete in itself, so only the
-				 * newest one is worth a mailbox round: 0xb47c/0xb47d
-				 * (per flow tag, the pre-2026-09 executor) and 0xb47f
-				 * (per flow set). Everything else is a control line
-				 * and is sent in order. */
-				if ((w0 & 0xfffe0000ul) == 0xb47c0000ul ||
-				    (w0 & 0xffff0000ul) == 0xb47f0000ul) {
+				/* a budget snapshot (0xb47f|n, one entry per flow set)
+				 * is complete in itself, so only the newest one is
+				 * worth a mailbox round. Everything else is a control
+				 * line and is sent in order. */
+				if ((w0 & 0xffff0000ul) == 0xb47f0000ul) {
 					if (have_batch)
 						dropped++;
 					memcpy(batch, line, sizeof(batch));
@@ -266,10 +264,10 @@ int main(int argc, char **argv)
 					uint32_t *rsp = NULL;
 
 					if (doca_pcc_mailbox_get_response_buffer(resources.doca_pcc, (void **)&rsp) == DOCA_SUCCESS && rsp != NULL)
-						printf("HPFT_RSP ft=0x%x bud=%u lvl=%u avg16=%u r=%u s16=%u ep=%u evb32=%u"
-						       " w8=%u w9=%u w10=%u\n",
-						       rsp[0], rsp[1], rsp[2], rsp[3], rsp[4], rsp[5], rsp[6], rsp[7],
-						       rsp[8], rsp[9], rsp[10]);
+						/* eight words; the field names are the ones the
+						 * readers (rp_sample.py, quick.sh, probe.sh) parse */
+						printf("HPFT_RSP ft=0x%x bud=%u lvl=%u avg16=%u r=%u s16=%u ep=%u evb32=%u\n",
+						       rsp[0], rsp[1], rsp[2], rsp[3], rsp[4], rsp[5], rsp[6], rsp[7]);
 				}
 				printf("HPFT_SET ft=0x%x rate=%u rc=%d cb=%u t0=%lld.%09ld send_ns=%lld stale_dropped=%lu\n",
 				       ft, rate, (int)result, mb_cb_ret_val,
