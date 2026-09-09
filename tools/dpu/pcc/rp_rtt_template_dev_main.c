@@ -1273,12 +1273,16 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 				 * at the rate it was pacing over it: summed over
 				 * the set that is exactly what it was allowed to
 				 * send, and no QP ever reads another QP's state.
-				 * Charging the whole membership once per period
-				 * from the epoch sweep was tried and is worse -
-				 * the lump drives the pool hard enough that QPs
-				 * fall out of the drawing window and the set
-				 * under-delivers (worst flow-set 0.890 of its
-				 * share against 0.975). */
+				 * Two tighter accountings were tried and both
+				 * cost delivery for no real gain: charging the
+				 * whole membership once per period from the
+				 * epoch sweep (worst flow-set 0.890 of its
+				 * share against 0.975), and settling each
+				 * member's unpaid gap there (V2 worst flow-set
+				 * 0.913 against 0.969, and the wire rate back
+				 * to the divisor law's). The gaps a QP does not
+				 * pay for are the gaps in which it is not on
+				 * the wire either. */
 				dt = (uint32_t)(now - q->tok_ts);
 				if (dt > HPFT_EPOCH_US)
 					dt = HPFT_EPOCH_US;
