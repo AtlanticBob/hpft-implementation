@@ -78,6 +78,8 @@
  * bucket is the only place the device needs an absolute unit. Platform
  * quantity, like HPFT_MIN_RATE - 200 Gb/s on this fabric. */
 #define HPFT_LINE_B_PER_US (25000u)
+/* a QP silent longer than this contributes nothing to its own rate account */
+#define HPFT_PACC_MAX_US   (100000u)
 #define HPFT_EPOCH_US    (1000u)     /* per-QP and per-set housekeeping tick */
 #define HPFT_QSLOTS      (1024)      /* per-QP records */
 #define HPFT_SETS        (32)        /* flow sets this sender serves */
@@ -444,6 +446,18 @@ typedef struct {
 	volatile uint32_t pr_abort;      /* consecutive aborts (timeout doubles) */
 
 	volatile uint32_t paced;     /* last rate written to the wire */
+	/* Time-weighted account of what this QP was really paced at. The
+	 * readback used to report `paced` itself - the last value written,
+	 * sampled once a second - which is an instantaneous sample of a
+	 * quantity that moves every few microseconds: the wire carried 1.7 to
+	 * 24.5 % more than the sum of those samples claimed had been
+	 * programmed, while the receiver's ledger agreed with the wire to
+	 * within 1 % (V1, 2026-09-09). These accumulate rate x time; the
+	 * readback hands the total to the host, which divides by the interval
+	 * between its own two queries. Scaled by 2^14 so four QPs at line rate
+	 * for a second stay inside 32 bits. */
+	volatile uint32_t pacc;      /* sum of paced x us, >> 14 */
+	volatile uint32_t pacc_ts;   /* when the account was last brought up to date */
 	volatile uint32_t tok_ts;    /* token law: when this QP last paid the pool */
 	volatile uint32_t epoch_ts;
 
@@ -613,6 +627,8 @@ static volatile uint32_t g_ev_slot, g_slot_port[2], g_slot_type[4], g_slot_val, 
 static inline void hpft_q_init(volatile hpft_q_t *q, uint32_t now)
 {
 	q->key = 0;
+	q->pacc = 0;
+	q->pacc_ts = now;
 	q->qpn = 0;
 	q->vhca = 0;
 	q->set = 0;
@@ -783,6 +799,24 @@ static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t
 	}
 	s->sum_cc = sum;
 	s->nlive = live;
+}
+
+/* Charge this QP's account for the stretch it has just spent at its current
+ * rate. Called only from the event path: the mailbox handler runs on another
+ * clock, and settling against that one scattered the answer from 0.91 to 1.58
+ * of the wire. What is therefore left out of a readback is the stretch since
+ * the QP's last event, tens of microseconds against a sampling interval of a
+ * second. */
+static inline void hpft_pacc_settle(volatile hpft_q_t *q, uint32_t now)
+{
+	uint32_t d = (uint32_t)(now - q->pacc_ts);
+
+	if (!d)
+		return;
+	if (d > HPFT_PACC_MAX_US)
+		d = HPFT_PACC_MAX_US;      /* the QP was away: do not invent traffic */
+	q->pacc_ts = now;
+	q->pacc += (uint32_t)(((uint64_t)q->paced * d) >> 14);
 }
 
 /* Refill the pool at R and cap it at one control period's worth: a set may
@@ -1215,6 +1249,7 @@ shaped:
 		cx[6] = q->flags;
 		cx[7] = q->rtt_last;
 	}
+	hpft_pacc_settle(q, now);
 	q->paced = r;
 	results->rate = r;
 	results->rtt_req = want_rtt;
@@ -1356,8 +1391,11 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 8) g_sw_rate_srtt = budget > 3u ? 0u : budget;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
-		/* 0xded <slot>: per-flow-set read-back: id, R, sum of paced,
-		 * sum of cc over the whole list, sum of cc over drawing QPs, nlive, nq */
+		/* 0xded <slot>: per-flow-set read-back: id, R, rate x time the
+		 * set was paced at since this was last read (fxp20 us >> 14 -
+		 * NOT a rate: the host divides by the interval between its own
+		 * queries), sum of cc over the whole list, sum of cc over
+		 * drawing QPs, nlive, nq */
 		if (ft == 0xdedu) {
 			volatile hpft_set_t *s = &g_set[budget % HPFT_SETS];
 			volatile uint32_t *rsp = (volatile uint32_t *)response;
@@ -1367,7 +1405,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 				uint32_t si = s->qslot[k];
 
 				if (si < HPFT_QSLOTS) {
-					sum_paced += g_q[si].paced;
+					sum_paced += g_q[si].pacc;
+					g_q[si].pacc = 0;
 					sum_cc += hpft_cc_rate(&g_q[si]);
 				}
 			}

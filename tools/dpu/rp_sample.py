@@ -12,11 +12,19 @@ cost 1.55 s on one sender per run, which skipped a whole second of samples
 every five seconds and broke the executor figure's lines.
 
 The readback (rp_rtt_template_dev_main.c, 0xded) is, per flow set: id, R
-(the ledger's budget), the sum of the paced rates of its QPs, the sum of the
-CC rates over every QP on its list, the sum of the CC rates over the QPs
-that drew tokens in the last millisecond, how many QPs that is, and how many
-QPs are on the list. Rates are converted from the device's 2^20-of-line-rate
-units to Gb/s of a 200 G port.
+(the ledger's budget), RATE x TIME the set was paced at since the last read,
+the sum of the CC rates over every QP on its list, the sum of the CC rates
+over the QPs that drew tokens in the last millisecond, how many QPs that is,
+and how many QPs are on the list. Rates are converted from the device's
+2^20-of-line-rate units to Gb/s of a 200 G port.
+
+The third field is a counter, not a rate, and this is where it becomes one:
+divided by the interval between THIS query of the slot and the previous one.
+The device used to report the last rate it had written, sampled once a second
+- an instantaneous sample of something that moves every few microseconds, and
+the wire carried 1.7 to 24.5 % more than the sum of those samples claimed
+(2026-09-09). The first query of a slot has no interval yet, so it only
+starts the clock and emits nothing.
 
 usage: rp_sample.py <duration_s> <out_jsonl> [interval_s=1.0] [line_gbps=200]
 record: {"ts", "slot", "id", "R", "paced", "cc", "cc_live", "nlive", "nq"}
@@ -32,6 +40,11 @@ RSP = re.compile(r"HPFT_RSP ft=0x([0-9a-f]+) bud=(\d+) lvl=(\d+) avg16=(\d+) r=(
 
 
 def gbps(u): return u * line / (1 << 20)
+
+
+def paced_gbps(pacc, dt_s):
+    """rate x time (fxp20 us >> 14) over an interval -> Gb/s"""
+    return gbps((pacc << 14) / (dt_s * 1e6)) if dt_s > 0 else 0.0
 
 
 def query(slots):
@@ -63,6 +76,7 @@ def query(slots):
 
 t_end = time.time() + dur
 live = set()                 # slots that answered with a flow set
+last_q = {}                  # slot -> when it was last queried, for the interval
 sweep = 0                    # next slot of the round-robin sweep
 # how many idle slots to sweep per pass so the whole table is covered within
 # RESCAN_S; the sweep is what finds a flow set that joins mid-run
@@ -81,8 +95,13 @@ with open(out, "w") as o:
                 live.discard(s)
                 continue
             live.add(s)
+            prev = last_q.get(s)
+            last_q[s] = t
+            if prev is None:
+                continue                 # no interval yet: this query only starts the clock
             rec = {"ts": round(t, 3), "slot": s, "id": "0x%08x" % sid,
-                   "R": round(gbps(int(m.group(2))), 3), "paced": round(gbps(int(m.group(3))), 3),
+                   "R": round(gbps(int(m.group(2))), 3),
+                   "paced": round(paced_gbps(int(m.group(3)), t - prev), 3),
                    "cc": round(gbps(int(m.group(4))), 3), "cc_live": round(gbps(int(m.group(5))), 3),
                    "nlive": int(m.group(6)), "nq": int(m.group(7))}
             o.write(json.dumps(rec) + "\n")
