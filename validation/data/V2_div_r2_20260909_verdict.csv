@@ -4,4 +4,4 @@ criterion,pass,detail
 3 收敛 ≤ 1 s,FAIL,8s rdma x8 1762 ms; 32s tcp x4 1370 ms
 4 不塌,PASS,ok
 5 平台健康,PASS,ok
-6 执行面守约,PASS,ok
+6 执行面守约,FAIL,sgpu01/vf2>sgpu02/vf2|rdma bound only 3 QPs while its peers bound 4 (a QP that never bound is not held by the set's pool); sgpu03/vf0>sgpu02/vf0|rdma bound only 3 QPs while its peers bound 4 (a QP that never bound is not held by the set's pool); sgpu03/vf1>sgpu02/vf1|rdma bound only 3 QPs while its peers bound 4 (a QP that never bound is not held by the set's pool)

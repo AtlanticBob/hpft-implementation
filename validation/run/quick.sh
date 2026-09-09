@@ -14,7 +14,7 @@
 # env:
 #   ALGO=2|3        tenant RDMA CC (2 DCQCN, 3 Swift), default 2
 #   CC_ONLY=0|1     run the tenant CC alone, HyperFront ignored
-#   LAW=0|1|2       0 bucket (default): r_i = c_i min(1, R/sum c_j)
+#   LAW=0|1|2       0 token pool (default): r_i = min(c_i, (R + pool)/N)
 #                   1 equal cap: r_i = min(c_i, R/N)   2 equal split ignoring the CC: R/N
 #   AGENTS=0|1      keep the HyperFront agents running (default 1)
 #   TCP_CC=cubic    TCP congestion control

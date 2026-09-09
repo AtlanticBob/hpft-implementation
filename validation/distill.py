@@ -590,6 +590,21 @@ def main(tag):
                     ex_fail.append(f"{fs_} paced < {EX_FULL:.2f} R in {100*(1-full):.0f}% of the samples where the CCs asked for R")
     if not per and not cc_only and any(r["cls"] == "rdma" for r in rows):
         ex_fail.append("no executor samples")
+    # A flow-set carrying fewer QPs than its peers has one that never bound,
+    # and an unbound QP is not held by its flow-set's pool at all - it runs on
+    # the unknown-flow allowance, so the share is not enforced over it and the
+    # set's own account under-reports (0.481 of its attributed rate when this
+    # was first seen, 2026-09-09). The sampler writes the evidence beside the
+    # samples as qpdump_<host>.txt when it catches it.
+    nqs = {}
+    for t_, host, f, R_, pc, cc, ccl, nl, nq_ in ex_rows:
+        nqs[f] = max(nqs.get(f, 0), nq_)
+    if len(nqs) >= 3:
+        common = max(set(nqs.values()), key=list(nqs.values()).count)
+        for f, n in sorted(nqs.items()):
+            if n < common:
+                ex_fail.append(f"{f} bound only {n} QPs while its peers bound {common} "
+                               f"(a QP that never bound is not held by the set's pool)")
     with open(os.path.join(D, f"{tag}_goodput.csv"), "w") as f:
         f.write("row,fsid,start_s,end_s,goodput_gbps\n")
         for k, r in enumerate(rows):

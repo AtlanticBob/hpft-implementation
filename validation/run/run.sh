@@ -388,6 +388,9 @@ sleep $((T0 - LAUNCHED + WARM + END + 6))
 # ---- collect ------------------------------------------------------------------
 for h in $SENDERS; do
   scp -q "$(dpu_of $h):/tmp/rp_sample.jsonl" "$OUT/rp_$h.jsonl" 2>/dev/null || true
+  # only exists when a flow-set was short of members: every QP record the
+  # executor held at that moment, plus the binding diagnostics
+  scp -q "$(dpu_of $h):/tmp/rp_sample.jsonl.qpdump" "$OUT/qpdump_$h.txt" 2>/dev/null || true
 done
 snap_cnp > "$OUT/cnp_post.txt"
 for h in $RECVS; do scp -q "$(dpu_of $h):/tmp/hpft_rxagent_e.jsonl" "$OUT/rx_$h.jsonl"; done

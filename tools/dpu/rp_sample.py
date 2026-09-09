@@ -47,6 +47,43 @@ def paced_gbps(pacc, dt_s):
     return gbps((pacc << 14) / (dt_s * 1e6)) if dt_s > 0 else 0.0
 
 
+def ask(word, arg):
+    """One mailbox query, answer paired with it by file position. The RP log is
+    flooded with a budget line every few ms while a run is on, so the answer
+    has to be read from where the log ended before the query, not off the
+    tail."""
+    with open(LOG, "rb") as lf:
+        lf.seek(0, os.SEEK_END); pos = lf.tell()
+    fd = os.open(FIFO, os.O_WRONLY)
+    os.write(fd, ("%s %d\n" % (word, arg)).encode()); os.close(fd)
+    for _ in range(30):
+        time.sleep(0.01)
+        with open(LOG, "rb") as lf:
+            lf.seek(pos); new = lf.read().decode(errors="replace")
+        for l in new.splitlines():
+            if "HPFT_RSP" in l:
+                return l.strip()
+    return None
+
+
+def dump_qps(reason, path):
+    """Every QP record the executor holds, plus the binding diagnostics: the
+    evidence for a flow-set that is short of members. Written once per run.
+
+    A QP that never binds is not held by its flow-set's pool at all - it runs
+    on the unknown-flow allowance - so the flow-set's share is not enforced
+    over it and its own account under-reports. It has been seen in about one
+    flow-set in twelve and does not reproduce on demand, so the sampler
+    catches it where it happens instead."""
+    with open(path, "w") as f:
+        f.write(json.dumps({"reason": reason, "ts": round(time.time(), 3)}) + "\n")
+        f.write((ask("0xdf3", 0) or "no answer") + "\n")
+        for slot in range(64):
+            line = ask("0xdee", slot)
+            if line:
+                f.write("slot %d %s\n" % (slot, line))
+
+
 def query(slots):
     """Query the given slots one at a time and wait for each answer, so a
     response is paired with its query by construction: the response carries
@@ -77,6 +114,8 @@ def query(slots):
 t_end = time.time() + dur
 live = set()                 # slots that answered with a flow set
 last_q = {}                  # slot -> when it was last queried, for the interval
+nq_seen = {}                 # slot -> its last reported member count
+dumped = False               # the short-membership evidence is taken once
 sweep = 0                    # next slot of the round-robin sweep
 # how many idle slots to sweep per pass so the whole table is covered within
 # RESCAN_S; the sweep is what finds a flow set that joins mid-run
@@ -105,5 +144,16 @@ with open(out, "w") as o:
                    "cc": round(gbps(int(m.group(4))), 3), "cc_live": round(gbps(int(m.group(5))), 3),
                    "nlive": int(m.group(6)), "nq": int(m.group(7))}
             o.write(json.dumps(rec) + "\n")
+            nq_seen[s] = rec["nq"]
         o.flush()
+        # A flow-set carrying fewer QPs than its peers on this host is the
+        # binding gap; take the evidence once, while it is still there.
+        if not dumped and len(nq_seen) >= 3:
+            common = max(set(nq_seen.values()), key=list(nq_seen.values()).count)
+            short = [k for k, v in nq_seen.items() if v < common]
+            if short:
+                dumped = True
+                dump_qps("slots %s carry %s QPs, the others carry %d"
+                         % (short, [nq_seen[k] for k in short], common),
+                         out + ".qpdump")
         time.sleep(max(0.0, itv - (time.time() - t)))
