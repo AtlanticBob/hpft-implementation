@@ -33,6 +33,7 @@ GAP_S = 3.0                 # longer than this and the flow-set really was gone
 EX_OVER_MEAN, EX_OVER_P95 = 1.03, 1.10      # criterion 6, same as distill.py
 
 series = {}      # (host, fsid, field) -> list of (t, v) over all runs
+per_run = {}     # (tag, host, fsid) -> sample times of that one run, for the coverage check
 summ = {}        # fsid -> list of (mean paced/R, p95 paced/R) over runs
 window = {}      # fsid -> (first, last) second the flow-set was scheduled for
 end = 0.0
@@ -52,6 +53,7 @@ for tag in tags:
             t = float(r["t"]); end = max(end, t)
             for fld in ("R_gbps", "paced_gbps", "cc_live_gbps"):
                 series.setdefault((r["host"], r["fsid"], fld), []).append((t, float(r[fld])))
+            per_run.setdefault((tag, r["host"], r["fsid"]), []).append(t)
     with open(os.path.join(D, f"{tag}_executor_summary.csv")) as f:
         for r in csv.DictReader(f):
             if r["all_live_mean_paced_over_R"]:
@@ -74,31 +76,29 @@ COVER_MIN = 0.80
 # costs more than its nominal second under load. Taking the cadence from the
 # data means the check keeps meaning the same thing when that cost changes,
 # and what it flags is a line that is sparse RELATIVE to the others.
-spacing = {}
-for (h, f, fld), pts in series.items():
-    if fld != "R_gbps" or len(pts) < 3:
-        continue
-    ts = sorted(t for t, _ in pts)
-    spacing.setdefault(h, []).extend(b - a for a, b in zip(ts, ts[1:]))
-# per host: each sender runs its own sampler and they do not keep the same
-# pace (one host measured 1.57 s a pass while its two peers held 1.01 s), so
-# judging every line against the fastest host's cadence would call a line
-# short when the whole host was simply slower. That is a different fault, and
-# the sampler reports it itself in results/<tag>/rp_sample_<host>.err.
-cad = {h: float(np.median(v)) for h, v in spacing.items()}
+# The cadence is measured per run and per host, and the expectation is summed
+# over the runs that went into the figure: pooling the runs' points first and
+# then scaling the expectation by their number counted every run twice.
+cad = {}
+for (tag, h, f), ts in per_run.items():
+    if len(ts) >= 3:
+        ts = sorted(ts); cad.setdefault((tag, h), []).extend(b - a for a, b in zip(ts, ts[1:]))
+cad = {k: float(np.median(v)) for k, v in cad.items()}
 short = []
-for (h, f, fld), pts in sorted(series.items()):
-    if fld != "R_gbps" or f not in window:
-        continue
-    a, b = window[f]
-    want = max(1.0, (min(b, end) - a) / cad.get(h, 1.0)) * len(tags)
-    got = len(pts)
-    if got < COVER_MIN * want:
-        short.append((h, f, got, want))
+for h in hosts:
+    for f in sorted({ff for hh, ff, _ in series if hh == h}):
+        if f not in window:
+            continue
+        a, b = window[f]
+        want = sum(max(1.0, (min(b, end) - a) / cad.get((tag, h), 1.0)) for tag in tags)
+        got = sum(len(per_run.get((tag, h, f), [])) for tag in tags)
+        if got < COVER_MIN * want:
+            short.append((h, f, got, want))
 for h, f, got, want in short:
-    print("COVERAGE %s %s: %d samples over a %.0f s window, expected about %.0f "
-          "at %s's measured %.2f s cadence"
-          % (h, f, got, window[f][1] - window[f][0], want, h, cad.get(h, 1.0)))
+    print("COVERAGE %s %s: %d samples over a %.0f s window, expected about %.0f over %d run(s) "
+          "at %s's measured cadence %s"
+          % (h, f, got, window[f][1] - window[f][0], want, len(tags), h,
+             "/".join("%.2f s" % cad.get((tag, h), 1.0) for tag in tags)))
 
 
 def xy(key):

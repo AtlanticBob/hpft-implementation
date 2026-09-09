@@ -7,7 +7,7 @@
 | 设计 | 实现 |
 |---|---|
 | 接收端（4 节）：物理容量、两次逐级填平分配、出借判定的平均、虚拟队列、只发 $q$ 的反馈 | `tools/dpu/rx_agent.py` 的 `law == "conf"` 分支 |
-| 发送端（5 节）：相减得 $\Delta q$、三因子律、上探与它的上限、起步值；只处理最新一条反馈 | `tools/dpu/tx_agent_e.py` |
+| 发送端（5 节）：相减得 $\Delta q$、三因子律（`v4_step`，缺省 $1+x$ 形式，`e_params.step_form=exp` 换成 $e^{x}$ 对照）、上探与它的上限、起步值；只处理最新一条反馈 | `tools/dpu/tx_agent_e.py` |
 | 发送端自己的上行链路树（5.5 节） | 同一文件里的 `SenderTree` |
 | RDMA 执行面（6 节）：逐 QP 的租户拥塞控制、每流集合一个令牌池 $r_i=\min(c_i,(R+\text{池})/N)$、逐 QP 限速 | `tools/dpu/pcc/rp_rtt_template_dev_main.c`（DPU 上的 PCC，跑在 DPA 上）；流集合的水位与 QP 归属经固件邮箱下发，`tools/dpu/pcc/pcc_host.c` 是 FIFO 到邮箱的转发 |
 | QP 归属（哪个 QP 属于哪个流集合） | 主机侧 `tools/host/qpn_resolver.py` 对每个对端 `rdma res show qp` 做配对，发给本机 DPU 的代理；代理用 `tools/dpu/vhca_of`（DEVX 查固件）把 VF 换算成执行面看到的 vhca_id |
@@ -21,6 +21,8 @@
 **桶有两个节拍**：RDMA 执行面每 1 毫秒数一次最近 1 毫秒发过包的 QP（`HPFT_EPOCH_US`、`HPFT_ACTIVE_US`），TCP 执行面每 10 毫秒由发过包的连接重建 $\sum w_j$（`HPFT_EPOCH_NS`）。两者都是实现量，不是设计参数。
 
 ## 3 设计里的规则在实现里怎么传递
+
+**调速律的形式（5.2 节）**：`e_params.step_form` 选 `linear`（缺省，$1+x$，$x$ 限在 $\pm\tfrac12$）或 `exp`（$e^{x}$）。两者到一阶相同：本平台八万条反馈里每条反馈的因子之差 99 分位不到千分之一，V1、V2、V7 各三遍的闭环结果分不出高下（`validation/STATUS.md` 第七节）；`exp` 保留作对照，改了要重启 `hpft-txagent-e`。
 
 **流集合的水位 $R$（6.2 节）**：发送端代理每 `rdma_push_ms`（5 毫秒）把所有流集合的 $\min(R,U)$ 写成一行 `0xb47f|n {流集合号, 水位}` 进 FIFO；`pcc_host.c` 只把最新的一行送进邮箱（一次邮箱约 16 毫秒，比推送慢，多余的快照丢弃而不排队）。流集合号是注册表里那一对的 flowtag，只当名字用。TCP 的水位走 UDP 到主机的 pace shim，再写 `hpft_pair_cfg`，同一个数每 100 毫秒重发一次。
 
@@ -68,6 +70,8 @@ RDMA 执行面的旋钮都走 FIFO `/tmp/rp_fifo`，`validation/run/quick.sh` �
 - `0xcce <微秒> 24`：一个 QP 多久没发包就不再计入 $N$（消融臂，缺省 1000）。
 - `0xcce <值> 0..19`：DCQCN 参数（0 AI、1 HAI、2 速率定时器、3 F、8 丢包切幅、9 丢包间隔、10 丢包时是否连目标速率一起重置（默认 1，对固件 DCQCN 校准过：丢包型 meter 上 46.8 对固件 47.05）、11 CNP 时钳目标速率的语义（默认 0 每次都钳，1 只在上一次是定时器增速时钳）、16 g、17 alpha 定时器、18 字节计数、19 监视周期）；`0xcd1 <值> 0..8`：Swift 参数（0 基准目标时延、1 流缩放范围、2 alpha、3 beta、4 AI、5 乘性切幅系数、6 最大切幅、7 决策是否用平滑往返、8 窗口换算成速率用哪个往返：0 最新采样、1 平滑、2 两者中较大者（默认）、3 较小者）。Swift 默认值是本 fabric 按论文 3.5/5.1 节的做法调出来的：增量 256 B、流缩放范围 40 µs，其余论文值。
 - 回读：`0xdf4 0`（跑过算法的 DPA 线程序号位图、最大序号、TX 事件数）、`0xdf3 0`（绑定诊断：上下文错配、解绑、绑定、分配、最近一次错配的 QPN 与 vhca）、`0xdef 0`（事件与绑定计数、算法、cc_only）、`0xded <槽>`（流集合：号、水位、逐 QP 限速之和、全部成员拥塞控制速率之和、取令牌 QP 的速率之和、在取的数、在册数）、`0xdee <槽>`（QP：QPN、流集合、拥塞控制速率、所在流集合的成员速率和、限速、往返、CNP 数、vhca_id）。`validation/run/probe.sh` 把这些在一场实验中间读出来。
+
+发送端代理的开关在注册表 `e_params` 里：`step_form`（`linear` 缺省 / `exp`，见第 3 节），改后重启代理。
 
 TCP 执行面没有旋钮：`hpft_pair_cfg` 里速率为零即不整形，`quick.sh` 的 `CC_ONLY=1` 会清空这张表并停掉发送端代理。
 

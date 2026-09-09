@@ -7,8 +7,9 @@ multiplicative step (design v4 §5.2). The record carries the normalised
 virtual queue q and nothing else; the sender differences consecutive q to
 recover dq itself:
 
-    R <- R * exp(alpha * min(m, m_max)) * exp(-kappa * dq)
-           * exp(-(kappa/D) * min(q, D))
+    R <- R * (1 + alpha * min(m, m_max))                    (queue empty)
+    R <- R * (1 - clip(kappa * dq + (kappa/D) * min(q, D), -1/2, 1/2))
+    (step_form = exp applies the same exponent as e^x instead; same to first order)
 
 The three factors do one thing each: probe up while the ledger is empty
 with a step that grows with the silence (§5.3), brake on how fast the
@@ -77,13 +78,15 @@ def parse_telemetry(data):
 
 
 def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
-            keep_silence=False):
-    """Design v4 (§5.2), one feedback: three multiplicative factors.
-    probe   x exp(alpha*m_hat)  m = consecutive feedbacks with an empty
+            keep_silence=False, linear=False):
+    """Design v4 (§5.2), one feedback: three multiplicative factors, written
+    as 1 + x (linear=True, the default) or e^x (linear=False).
+    probe   x (1 + alpha*m_hat) m = consecutive feedbacks with an empty
                                 queue, m_hat = min(m, m_max); the step
                                 grows with the silence and is capped
-    brake   x exp(-kappa dq)    dq = signed queue change since last feedback
-    repay   x exp(-(kappa/D) q) by queue length
+    brake   x (1 - kappa dq)    dq = signed queue change since last feedback
+    repay   x (1 - (kappa/D) q) by queue length; brake and repay share one
+                                exponent, bounded to +-1/2 in the linear form
     q, dq are in periods of expected bytes (dimensionless); no time in here.
 
     Why the step grows with the silence (§5.5): probing too hard only
@@ -125,7 +128,8 @@ def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
         # is already bounded by m_max, so all a long block does is let an
         # app-limited flow resume at the maximum step, which is right - a
         # flow that has been using a fraction of its share IS far from it.
-        R1 = max(R1, min(R1 * math.exp(alpha * min(below, m_max)), cap))
+        step = alpha * min(below, m_max)
+        R1 = max(R1, min(R1 * ((1.0 + step) if linear else math.exp(step)), cap))
     elif not keep_silence:
         below = 0
     # keep_silence: this flow-set has never yet been held by its fence, so a
@@ -142,7 +146,15 @@ def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
     # follow also shows a send rate above the fence, and THAT queue is ours
     # and must reset the silence. The brake and the repayment act on the
     # queue either way - it is real and must be paid.
-    R1 *= math.exp(-kappa * dq) * math.exp(-(kappa / D) * min(q, D))
+    x = kappa * dq + (kappa / D) * min(q, D)
+    if linear:
+        # 1 - x instead of e^-x, bounded to a half either way so the factor
+        # stays positive and one feedback can never do more than halve or add
+        # half (Swift's max_mdf). The bound was never reached in 80k logged
+        # feedbacks; it is the safety rail, not the law.
+        R1 *= 1.0 - max(-0.5, min(0.5, x))
+    else:
+        R1 *= math.exp(-x)
     return max(R1, floor), dq, below
 
 
@@ -768,6 +780,13 @@ def main():
     v4_mmax = float(ep.get("m_max", 100))
     v4_kappa = float(ep.get("kappa", k * period))
     v4_D = float(ep.get("D", vq_repay / period))
+    # The form of the step. "linear" (the default, design v4 5.2) applies the
+    # exponent as 1 + x, bounded to a half; "exp" applies it as e^x, which is
+    # the same to first order (measured: the two factors differ by under 0.1%
+    # in 99% of feedbacks, and three-run A/Bs on V1, V2 and V7 were
+    # indistinguishable) and is kept selectable for reference.
+    v4_linear = str(ep.get("step_form", "linear")).lower() != "exp"
+    print("tx_agent_e: v4 step form = %s" % ("linear (1+x, |x|<=1/2)" if v4_linear else "exp"), flush=True)
     tree_theta = float(ep.get("tree_backlog_theta", 0.85))
     # 5.3 third term; togglable so the tree's contribution to the probe
     # ceiling can be isolated against a control run
@@ -871,7 +890,7 @@ def main():
             st.R, st.dq, st.below = v4_step(st.R, q, st.q_prev, st.below,
                                             v4_alpha, v4_mmax, v4_kappa, v4_D,
                                             v4_floor, min(cap, line),
-                                            not st.enforced)
+                                            not st.enforced, v4_linear)
             st.q_prev, st.b = q, b
             st.last_step = now
             st.T = min(q / v4_D, 1.0)               # queue fraction for the executors' trust
