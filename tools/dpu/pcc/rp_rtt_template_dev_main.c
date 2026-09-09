@@ -106,21 +106,22 @@ static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE >> 6);
 /* 2^20/64 = 3.1 G per QP: design v4 5.4 starts a new flow set at the port's
  * headroom R0 = h*C (16 G here) split over its expected QPs. The old 1/16 of
  * line let four unbound QPs offer 50 G before the agent had bound them. */
-/* 0xcce <n> 22: the law. 0 = the bucket (default); 1 = equal cap,
+/* 0xcce <n> 22: the law. 0 = the token pool (default); 1 = equal cap,
  * r_i = min(c_i, R/N), no sharing inside the set; 2 = equal split ignoring
  * the CC, r_i = R/N. 1 and 2 are the ablation arms. */
-#define HPFT_LAW_BUCKET (0u)
+#define HPFT_LAW_TOKEN  (0u)
 #define HPFT_LAW_CAP    (1u)
 #define HPFT_LAW_EQUAL  (2u)
-/* A real token bucket instead of a division. The flow set owns a pool of
- * bytes refilled at R and drained by the bytes its QPs actually put on the
- * wire; a QP may send at its own CC's rate as long as the pool can pay for
- * it. Nothing here needs sum c_j: the volatile quantity (each QP's rate,
- * which a delay-based CC changes every round trip) never enters an
- * arithmetic that has to be consistent across the set, which is what made
- * the numerator and the denominator disagree in HPFT_LAW_BUCKET. What the
- * grant does need is how MANY QPs are drawing, and that is a count the
- * epoch already keeps and that does not move every round trip.
+/* The flow set owns a pool of bytes refilled at R; a QP may send at its own
+ * CC's rate as long as the pool can pay for it. Nothing here needs sum c_j:
+ * the volatile quantity - each QP's rate, which a delay-based CC changes
+ * every round trip - never enters an arithmetic that has to be consistent
+ * across the set. What the grant does need is how MANY QPs are drawing, and
+ * that is a count the epoch already keeps and that does not move every round
+ * trip. (Until 2026-09-09 the pool was simulated by a division,
+ * r_i = c_i R / sum c_j, whose numerator was read at the event and whose
+ * denominator was a millisecond old; on Swift that cost 2.5 points of the
+ * worst flow-set's share and 2 G of goodput, and it is gone.)
  *   ceiling = (R + whatever the pool has saved up) / nlive
  *   r_i     = min(c_i, ceiling)
  * A QP that wants less than its equal share simply leaves bytes in the
@@ -133,8 +134,7 @@ static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE >> 6);
  * derived from it is a plain integral controller with no gain to choose.
  * The depth, a quarter of one control period's budget, bounds the burst a
  * set may take after an idle stretch. */
-#define HPFT_LAW_TOKEN  (3u)
-static volatile uint32_t g_law = HPFT_LAW_BUCKET;
+static volatile uint32_t g_law = HPFT_LAW_TOKEN;
 /* a QP that sent within this long is drawing tokens (0xcce <us> 24).
  * Ablation arm; 1 ms is the design point. Widening it to 5 ms on V2 left the
  * paced sum unchanged and cost half a second on the join (2026-09-08): a QP
@@ -142,30 +142,6 @@ static volatile uint32_t g_law = HPFT_LAW_BUCKET;
  * others get less than their share until it ages out. */
 static volatile uint32_t g_active_us = 1000u;
 #define HPFT_ACTIVE_US  (g_active_us)
-/* 0xcce <0|1|2> 23: where the two terms of the share come from. Ablation
- * arms; 0 is the design point and the default.
- * 0: c_i as of this event, denominator from the last epoch's sum.
- * 1: both summed at this event over the set's drawing QPs (nq reads per
- *    event).
- * 2: both from the last epoch's snapshot, the live c_i still capping.
- * Measured on V2, 2026-09-08: 0 keeps the paced sum at 1.004 R (95th
- *    percentile 1.016); 1 pushes it to 1.07 R (1.32), because each QP then
- *    divides by a sum taken at its own instant and the shares no longer add
- *    up to R; 2 holds the sum but costs steady-state fit (one flow set 8 %
- *    under its share) since a QP whose quota just fell keeps its old share
- *    for up to an epoch. The join time is 1.55-2.07 s in all three, so the
- *    denominator is not what makes a join slow.
- * 3: arm 2 plus the share its own members could not use. Under arm 2 a QP
- *    is paced at min(its live rate, its share from the snapshot); the two
- *    move independently, so the minimum is biased low and the set paces
- *    under R even though the shares add up to exactly R. What one member
- *    leaves is nobody's until the next epoch, so the epoch measures what
- *    the set actually programmed and carries the shortfall into the next
- *    epoch's denominator (r_eff), capped at 1.10 x R (criterion 6's own
- *    limit on the 95th percentile) so a set can exceed its budget by no
- *    more than that for one epoch if every idle member wakes at once. Only while the bucket binds: if the CCs are not
- *    asking for R there is nothing to redistribute. */
-static volatile uint32_t g_sum_live;
 /* 0xcce <0|1> 25: Swift's per-QP state lives in the framework's algo_ctxt
  * (cx[3..7]: cwnd, rtt_s, last_dec, flags, rtt_last), which travels with
  * the event, instead of in the global slot. Diagnostic: whether the DPA's
@@ -442,7 +418,6 @@ static inline uint32_t hpft_isqrt(uint32_t x)
 typedef struct {
 	volatile uint32_t gen;       /* 0 = free; matched against the context */
 	volatile uint32_t key;       /* hpft_bind_key(vhca, qpn) this record is for */
-	volatile uint32_t c_epoch;   /* this QP's CC rate as summed at its set's last epoch (0 = not in the sum) */
 	volatile uint32_t qpn;
 	volatile uint32_t vhca;      /* the function (VF) this QP belongs to */
 	volatile uint32_t set;       /* flow-set index + 1; 0 = not known yet */
@@ -531,14 +506,10 @@ typedef struct {
 	volatile uint32_t qslot[HPFT_SET_QPS];
 	volatile uint32_t epoch_ts;
 	volatile uint32_t nlive;     /* QPs counted in sum_cc */
-	volatile uint32_t r_eff;     /* arm 3: R plus what the members left unused */
 	volatile int32_t  tok;       /* token law: pool level, bytes; may go negative */
 	volatile uint32_t tok_ts;    /* token law: last refill, us */
 } hpft_set_t;
 
-/* arm 3 may hand out at most this multiple of R in one epoch */
-#define HPFT_REFF_MAX_NUM (11u)
-#define HPFT_REFF_MAX_DEN (10u)
 
 static hpft_set_t g_set[HPFT_SETS];
 
@@ -642,7 +613,6 @@ static volatile uint32_t g_ev_slot, g_slot_port[2], g_slot_type[4], g_slot_val, 
 static inline void hpft_q_init(volatile hpft_q_t *q, uint32_t now)
 {
 	q->key = 0;
-	q->c_epoch = 0;
 	q->qpn = 0;
 	q->vhca = 0;
 	q->set = 0;
@@ -782,7 +752,7 @@ static inline void hpft_q_epoch(volatile hpft_q_t *q, uint32_t now)
  * membership once per millisecond (hpft_q_epoch). */
 static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t sidx)
 {
-	uint32_t sum = 0, live = 0, paced = 0, n = s->nq;
+	uint32_t sum = 0, live = 0, n = s->nq;
 	uint32_t elapsed = (uint32_t)(now - s->epoch_ts);
 
 	if (elapsed < HPFT_EPOCH_US)
@@ -806,33 +776,13 @@ static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t
 			s->qslot[k] = HPFT_SET_EMPTY;
 			continue;
 		}
-		if ((uint32_t)(now - q->last_ts) > HPFT_ACTIVE_US) {
-			q->c_epoch = 0;        /* not drawing: not in the sum */
-			continue;
-		}
-		q->c_epoch = hpft_cc_rate(q);
-		sum += q->c_epoch;
-		paced += q->paced;
+		if ((uint32_t)(now - q->last_ts) > HPFT_ACTIVE_US)
+			continue;              /* not drawing: not counted */
+		sum += hpft_cc_rate(q);
 		live++;
 	}
 	s->sum_cc = sum;
 	s->nlive = live;
-	if (g_sum_live == 3u) {
-		uint32_t R = s->budget, hi;
-
-		if (!R || sum <= R || !paced) {
-			s->r_eff = R;          /* the bucket is not binding */
-		} else {
-			uint64_t v = (uint64_t)(s->r_eff ? s->r_eff : R) * R / paced;
-
-			hi = (uint32_t)(((uint64_t)R * HPFT_REFF_MAX_NUM) / HPFT_REFF_MAX_DEN);
-			if (v < R)
-				v = R;
-			if (v > hi)
-				v = hi;
-			s->r_eff = (uint32_t)v;
-		}
-	}
 }
 
 /* Refill the pool at R and cap it at one control period's worth: a set may
@@ -1205,66 +1155,11 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 
 		if (si >= 0 && si < HPFT_SETS && g_set[si].budget) {
 			volatile hpft_set_t *s = &g_set[si];
-			uint32_t R, S, n;
+			uint32_t R, n;
 
 			hpft_set_epoch(s, now, (uint32_t)si);
 			R = s->budget;
-			if (g_sum_live == 1u) {
-				/* the denominator as of THIS event: sum c_j over the
-				 * set's QPs that drew tokens in the last millisecond,
-				 * read now rather than at the last epoch. With the
-				 * epoch's cached sum a QP's c_i (this instant) and S
-				 * (up to 1 ms old) were out of step; for a CC that
-				 * moves its rate every RTT (Swift) the 1 s snapshot
-				 * of the paced sum wandered 0.77-1.43 x R, and at
-				 * 100 ms the RDMA flow-set's rate had a 5 % scatter
-				 * (validation 2026-09-08). Cost: nq reads of another
-				 * QP's state per event. */
-				uint32_t k, m = s->nq;
-
-				S = 0; n = 0;
-				if (m > HPFT_SET_QPS)
-					m = HPFT_SET_QPS;
-				for (k = 0; k < m; k++) {
-					uint32_t sj = s->qslot[k];
-
-					if (sj < HPFT_QSLOTS && g_q[sj].gen &&
-					    (uint32_t)(now - g_q[sj].last_ts) <= HPFT_ACTIVE_US) {
-						S += hpft_cc_rate(&g_q[sj]);
-						n++;
-					}
-				}
-				if (!n) {
-					S = r;
-					n = 1u;
-				}
-			} else {
-				S = s->sum_cc;
-				n = s->nlive ? s->nlive : (s->nq ? s->nq : 1u);
-			}
-			if (g_sum_live == 3u && g_law == HPFT_LAW_BUCKET && q->c_epoch && S > R) {
-				/* the snapshot's proportion, of the budget plus
-				 * what last epoch's members left unused */
-				uint32_t Re = s->r_eff ? s->r_eff : R;
-				uint64_t v = ((uint64_t)q->c_epoch * Re) / S;
-
-				if (v > Re)
-					v = Re;
-				if ((uint32_t)v < r)
-					r = (uint32_t)v;
-				goto shaped;
-			}
-			if (g_sum_live == 2u && g_law == HPFT_LAW_BUCKET && q->c_epoch && S > R) {
-				/* the share from the epoch's snapshot, capped by the
-				 * QP's live quota */
-				uint64_t v = ((uint64_t)q->c_epoch * R) / S;
-
-				if (v > R)
-					v = R;
-				if ((uint32_t)v < r)
-					r = (uint32_t)v;
-				goto shaped;
-			}
+			n = s->nlive ? s->nlive : (s->nq ? s->nq : 1u);
 			if (g_law == HPFT_LAW_TOKEN) {
 				uint32_t ceil_, dt;
 
@@ -1279,8 +1174,7 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 				 * epoch sweep (worst flow-set 0.890 of its
 				 * share against 0.975), and settling each
 				 * member's unpaid gap there (V2 worst flow-set
-				 * 0.913 against 0.969, and the wire rate back
-				 * to the divisor law's). The gaps a QP does not
+				 * 0.913 against 0.969). The gaps a QP does not
 				 * pay for are the gaps in which it is not on
 				 * the wire either. */
 				dt = (uint32_t)(now - q->tok_ts);
@@ -1300,18 +1194,7 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 				uint32_t share = R / n;
 
 				r = r < share ? r : share;
-			} else if (S > R) {
-				/* the bucket is empty: share R in proportion to
-				 * how fast each QP draws, r_i = c_i * R / S. A QP
-				 * whose c_i is not in S yet (first millisecond)
-				 * can at most get its own c_i. */
-				uint64_t v = ((uint64_t)r * R) / S;
-
-				if (v > R)
-					v = R;
-				r = (uint32_t)v;
 			}
-			/* else the bucket is not binding: r = c_i */
 shaped:
 			;
 		} else {
@@ -1452,10 +1335,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 17) g_dq_alpha_us = budget ? budget : 1u;
 			else if (which == 18) g_dq_bytes = budget ? budget : 1u;
 			else if (which == 19) g_dq_monitor_us = budget;
-			else if (which == 20) g_law = budget ? HPFT_LAW_CAP : HPFT_LAW_BUCKET;   /* legacy NOFLOOR */
 			else if (which == 21) g_unknown_rate = budget ? budget : DOCA_PCC_DEV_MAX_RATE;
-			else if (which == 22) g_law = budget > 3u ? HPFT_LAW_BUCKET : budget;
-			else if (which == 23) g_sum_live = budget > 3u ? 3u : budget;
+			else if (which == 22) g_law = budget > 2u ? HPFT_LAW_TOKEN : budget;
 			else if (which == 24) g_active_us = budget ? budget : 1000u;
 			else if (which == 25) g_sw_ctx = budget ? 1u : 0u;
 			return DOCA_PCC_DEV_STATUS_OK;
@@ -1498,8 +1379,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[5] = s->nlive;
 			rsp[6] = s->nq;
 			rsp[7] = g_ev_slot;
-			rsp[8] = s->r_eff;     /* arm 3: the budget plus the unused share */
-			*response_size = 9 * sizeof(uint32_t);
+			*response_size = 8 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
 		/* 0xdee <slot>: per-QP read-back (qpn, set, cc rate, the set's
@@ -1574,7 +1454,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[4] = g_q_alloc;
 			rsp[5] = g_q_bound;
 			rsp[6] = g_algo;
-			rsp[7] = g_cc_only | (g_law << 8) | (g_sum_live << 16);
+			rsp[7] = g_cc_only | (g_law << 8);
 			*response_size = 8 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}

@@ -210,17 +210,13 @@ echo "$ROWS" | awk '$5=="rdma" && $9 ~ /rdma_cc=swift/' | grep -q . && CCALGO=3
 LAW=${HPFT_LAW:-0}
 CCONLY=${HPFT_CC_ONLY:-0}
 # HPFT_RP_KNOBS: extra executor knobs, semicolon-separated mailbox lines
-#   (e.g. "0xcce 3 23;0xcce 5000 24"), written after the arm. The two the
-#   runner knows (23 = denominator arm, 24 = drawing window in us) are WRITTEN
-#   EVERY RUN, not only when this variable is set, and written to the design
-#   point when it is not: a knob is device state that outlives the run that
-#   set it, so a run that only reads the variable inherits whatever the last
-#   ablation left behind and records "knobs = default" while running on
-#   something else. (The restore used to write arm 1 - the per-event
-#   denominator the ablation showed to be wrong - and only when the variable
-#   was set, so every run after an ablation ran on arm 1 unnoticed.)
+#   (e.g. "0xcce 5000 24"), written after the arm. The one the runner knows
+#   (24 = drawing window in us) is WRITTEN EVERY RUN, not only when this
+#   variable is set, and written to the design point when it is not: a knob is
+#   device state that outlives the run that set it, so a run that only reads
+#   the variable would inherit whatever the last ablation left behind and
+#   record "knobs = default" while running on something else.
 RPKNOBS=${HPFT_RP_KNOBS:-}
-RP_DENOM_DEFAULT="0xcce 0 23"
 RP_WINDOW_DEFAULT="0xcce 1000 24"
 mbox() { # $1 host: write the remaining args, one line each, to its DPU's RP FIFO
   local d; d=$(dpu_of "$1"); shift
@@ -230,13 +226,13 @@ mbox() { # $1 host: write the remaining args, one line each, to its DPU's RP FIF
 cleanup() {
   [ -n "$METER_ROWS" ] && echo "$METER_ROWS" | while read -r _ _ dh dv _; do meter_set "$dh" "$dv" 50000000 >/dev/null 2>&1; done
   for h in $SENDERS; do mbox "$h" "0xccd 2" "0xcce 0 22" "0xcce 0 12"; done
-  for h in $SENDERS; do mbox "$h" "$RP_DENOM_DEFAULT" "$RP_WINDOW_DEFAULT"; done
+  for h in $SENDERS; do mbox "$h" "$RP_WINDOW_DEFAULT"; done
   [ "$CCONLY" = 0 ] || bash tools/lab-infra/roles.sh all >/dev/null 2>&1
   return 0
 }
 trap cleanup EXIT
 for h in $SENDERS; do mbox "$h" "0xccd $CCALGO" "0xcce $LAW 22" "0xcce $CCONLY 12" \
-  "$RP_DENOM_DEFAULT" "$RP_WINDOW_DEFAULT"; done
+  "$RP_WINDOW_DEFAULT"; done
 if [ -n "$RPKNOBS" ]; then
   IFS=';' read -r -a KN <<<"$RPKNOBS"
   for h in $SENDERS; do mbox "$h" "${KN[@]}"; done
@@ -260,16 +256,16 @@ print(\"tcp rate table cleared: %d entries\"%n)
   done
   sleep 2
 fi
-echo "rdma executor: cc algo = $CCALGO (2 DCQCN, 3 Swift); law = $LAW (0 bucket, 1 equal cap, 2 equal split); cc-only arm = $CCONLY; knobs = ${RPKNOBS:-default}" | tee "$OUT/arm.txt"
+echo "rdma executor: cc algo = $CCALGO (2 DCQCN, 3 Swift); law = $LAW (0 token pool, 1 equal cap, 2 equal split); cc-only arm = $CCONLY; knobs = ${RPKNOBS:-default}" | tee "$OUT/arm.txt"
 # What the DEVICE says it is, not what this script asked for: knobs are state
 # that outlives a run, so the arm has to be read back or a run can record one
-# arm and execute another. 0xdef 0 word 8 = cc_only | law<<8 | denominator<<16.
+# arm and execute another. 0xdef 0 word 8 = cc_only | law<<8.
 for h in $SENDERS; do
   d=$(dpu_of "$h")
   w=$(ssh -n -o BatchMode=yes "$d" "timeout 5 bash -c 'echo \"0xdef 0\" > /tmp/rp_fifo'; sleep 0.4
       tail -40 /tmp/pcc_rp.log | grep -a HPFT_RSP | tail -1" </dev/null 2>/dev/null | grep -o 'evb32=[0-9]*' | cut -d= -f2)
   if [ -n "$w" ]; then
-    echo "readback $h: cc_only=$((w & 255)) law=$(((w >> 8) & 255)) denominator=$(((w >> 16) & 255))" | tee -a "$OUT/arm.txt"
+    echo "readback $h: cc_only=$((w & 255)) law=$(((w >> 8) & 255))" | tee -a "$OUT/arm.txt"
   else
     echo "readback $h: FAILED" | tee -a "$OUT/arm.txt"
   fi

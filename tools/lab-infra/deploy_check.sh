@@ -124,8 +124,21 @@ if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
           || echo "  WARN $n: vhca_of build failed (tx agent keys QP bindings by bare qpn)" ;;
       esac
       case " $push " in *" $PCC_SRC "*)
-        ssh -o BatchMode=yes "$n" "cd $PCC_BUILD && meson setup --reconfigure build >/dev/null 2>&1 && ninja -C build pcc/doca_pcc >/dev/null 2>&1" \
-          || echo "  WARN $n: doca_pcc rebuild failed - the RUNNING executor is still the old device code" ;;
+        # The DPA device code is compiled by pcc/build_device_code.sh, which
+        # meson runs at CONFIGURE time - no ninja target depends on it, so
+        # `ninja pcc/doca_pcc` says "no work to do" however stale the device
+        # object is, and `meson setup --reconfigure` exits 0 even when that
+        # script fails. Both of those together once let a device source that
+        # did not compile sit on all four DPUs for hours while this check
+        # reported "repo == 4 DPUs" (2026-09-09). So: reconfigure, keep the
+        # log, fail on the string dpacc actually prints, and then prove the
+        # artefact is newer than the source rather than trusting an exit code.
+        ssh -o BatchMode=yes "$n" "cd $PCC_BUILD
+          meson setup --reconfigure build > /tmp/pcc_build.log 2>&1
+          grep -qiE 'error:|failed with status' /tmp/pcc_build.log && exit 1
+          ninja -C build pcc/doca_pcc >> /tmp/pcc_build.log 2>&1 || exit 1
+          [ build/pcc/doca_pcc -nt $PCC_DEV ] || exit 2" \
+          || echo "  WARN $n: doca_pcc device build FAILED or did not pick up the new source - the RUNNING executor is still the old device code (see $n:/tmp/pcc_build.log)" ;;
       esac
       case " $push " in *" $PCC_HSRC "*)
         case " $push " in *" $PCC_SRC "*) ;; *)
