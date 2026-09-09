@@ -1037,10 +1037,51 @@ def main():
                 vh = vf_vhca.get(sv)
                 key = ((vh & 0xff) << 24) | (qpn & 0xffffff) if vh is not None else qpn
                 seen[key] = ft
+        # Bind on the QP number alone wherever the number names one flow set
+        # on this host. The executor keys a QP by (vhca_id, qpn) and reads
+        # the vhca_id out of the event, and that read is not always right:
+        # dumps from three V2 runs carry records pairing one VF's vhca_id
+        # with another VF's QP number, and the QP that owns the number is
+        # then left with no record, no set and no share. The number itself
+        # always reads correctly, so a second entry keyed on it alone lets
+        # such a record still find its set (the executor already falls back
+        # to the bare number). A number held by two VFs whose flow sets
+        # differ gets set 0 instead, which the executor treats as no answer:
+        # there the pair is the only thing that can tell them apart.
+        by_qpn = {}
+        for k_, ft_ in seen.items():
+            by_qpn.setdefault(k_ & 0xffffff, set()).add(ft_)
+        for qpn_, fts_ in by_qpn.items():
+            seen[qpn_] = fts_.pop() if len(fts_) == 1 else 0
         qp_set.clear()
         qp_set.update(seen)
         for k_ in [k_ for k_ in qp_sent if k_ not in seen]:
             del qp_sent[k_]
+        _publish_qpmap()
+
+    # The agent's side of the binding evidence. The executor's own dump
+    # (rp_sample.dump_qps) says which QP records it holds and which of them
+    # found a set; this file says which QPs the agent believes in, so a QP
+    # that binds to nothing can be placed on one side of the push or the
+    # other in a single artefact taken at one instant.
+    _qpmap_last = [None]
+
+    def _publish_qpmap():
+        cur = sorted((k >> 24, k & 0xffffff, sid, qp_sent.get(k) == sid)
+                     for k, sid in qp_set.items())
+        if cur == _qpmap_last[0]:
+            return
+        _qpmap_last[0] = cur
+        try:
+            with open("/tmp/hpft_txagent_qpmap.txt.new", "w") as f:
+                f.write("agent qpmap n=%d ts=%.3f\n" % (len(cur), time.time()))
+                for vh, qpn, sid, sent in cur:
+                    f.write("vhca %d qpn 0x%x set 0x%x %s\n"
+                            % (vh, qpn, sid, "pushed" if sent else "NOT-PUSHED"))
+            os.replace("/tmp/hpft_txagent_qpmap.txt.new",
+                       "/tmp/hpft_txagent_qpmap.txt")
+        except OSError:
+            pass
 
     stree = SenderTree(reg["policy"], line, ep["headroom"],
                        ep["delta_demand"], floor, tree_theta)
@@ -1446,6 +1487,7 @@ def main():
                 mailbox.write_qpmap(newmap[:60])
                 for q, sid in newmap[:60]:
                     qp_sent[q] = sid
+                _publish_qpmap()
             last_rdma_push = now
         shim.drain_acks()
         if recs_all:

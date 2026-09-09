@@ -82,10 +82,16 @@
 #define HPFT_PACC_MAX_US   (100000u)
 #define HPFT_EPOCH_US    (1000u)     /* per-QP and per-set housekeeping tick */
 #define HPFT_QSLOTS      (1024)      /* per-QP records */
+/* Keyed records are placed in the first HPFT_QHOME of them. A sender holds
+ * tens of QPs against 128 slots, so the table stays sparse and the whole
+ * live set can be read back one slot at a time; the rest of g_q is what the
+ * round-robin fallback hands out, and 0xdf3 reports how far it has gone. */
+#define HPFT_QHOME       (128)
 #define HPFT_SETS        (32)        /* flow sets this sender serves */
 #define HPFT_SET_QPS     (128)       /* QPs listed per flow set */
 #define HPFT_CTX_MAGIC   (0x48505131u)  /* "HP11" in the QP's own context */
 #define HPFT_QP_STALE_US (2000000u)  /* a QP silent this long leaves its set */
+#define HPFT_QP_GONE_US  (8000000u)  /* and this long: its record may be reused */
 #define HPFT_SET_EMPTY   (0xffffffffu) /* a retired entry in a set's member list */
 
 /* which tenant CC the executor runs for every QP (mailbox 0xccd) */
@@ -468,47 +474,32 @@ typedef struct {
 } hpft_q_t;
 
 static hpft_q_t g_q[HPFT_QSLOTS];
-static volatile uint32_t g_q_next;   /* round-robin allocator */
+static volatile uint32_t g_q_next;   /* cursor over the spare slots */
 static volatile uint32_t g_gen = 1;
-/* {(vhca, qpn) -> record slot}. The framework's algo context is the fast
- * path to a QP's record, but it is not one per QP: measured 2026-09-08, two
- * QPs of different VFs (vf1 qpn 578 and vf3 qpn 294 on hpft-dpu) took turns
- * in ONE context, and QPs of equal number on different VFs did the same.
- * Whatever the context is keyed by, the record must be keyed by the QP
- * itself, so a context that turns up with another QP's number is treated
- * as a cache miss and the record is found here instead. */
-#define HPFT_QMAP_SIZE (4096)
-static volatile uint32_t g_qmap_key[HPFT_QMAP_SIZE];
-static volatile uint32_t g_qmap_slot[HPFT_QMAP_SIZE];
-
-static inline int hpft_qmap_find(uint32_t key)
+/* A QP's record lives at a slot derived from its own key, so the record
+ * table is its own index. The framework's algo context is the fast path to
+ * the record, but it is not one per QP: measured 2026-09-08, two QPs of
+ * different VFs (vf1 qpn 578 and vf3 qpn 294 on hpft-dpu) took turns in ONE
+ * context, and QPs of equal number on different VFs did the same. So a
+ * context that turns up with another QP's number is a cache miss and the
+ * record is found here instead.
+ *
+ * Placement is a function of the key rather than of a shared cursor because
+ * the framework fans events over sixteen DPA threads and the DPA offers no
+ * atomic to arbitrate a cursor with. Handing out slots from a shared counter
+ * let two threads take the SAME slot for two different QPs, and two threads
+ * take TWO slots for the same QP: measured 2026-09-09 over six V2 runs, one
+ * QP held two records while another VF's QP held none, so that QP's flow set
+ * was short a member every time. Probing from the key's own home slot makes
+ * the race idempotent - two threads racing on one QP land on one record. */
+static inline uint32_t hpft_q_home(uint32_t key)
 {
-	uint32_t h = ((key + 1u) * 2654435761u) >> 20;   /* top 12 bits */
-
-	for (uint32_t pr = 0; pr < 16u; pr++) {
-		uint32_t i = (h + pr) % HPFT_QMAP_SIZE;
-
-		if (g_qmap_key[i] == key + 1u)
-			return (int)g_qmap_slot[i];
-		if (g_qmap_key[i] == 0)
-			return -1;
-	}
-	return -1;
-}
-
-static inline void hpft_qmap_put(uint32_t key, uint32_t slot)
-{
-	uint32_t h = ((key + 1u) * 2654435761u) >> 20;
-
-	for (uint32_t pr = 0; pr < 16u; pr++) {
-		uint32_t i = (h + pr) % HPFT_QMAP_SIZE;
-
-		if (g_qmap_key[i] == key + 1u || g_qmap_key[i] == 0) {
-			g_qmap_key[i] = key + 1u;
-			g_qmap_slot[i] = slot;
-			return;
-		}
-	}
+	/* the TOP bits of the multiplication, not the low ones: HPFT_QHOME is
+	 * a power of two, so a modulo would keep the low bits, and those
+	 * depend only on the low bits of the key. Keys differing above the
+	 * seventh bit would then all share one home slot - (vhca 26, qpn
+	 * 0x162), (27, 0x262) and (25, 0x1e2) all landed on slot 5. */
+	return ((key + 1u) * 2246822519u) >> 25;
 }
 
 /* ========================= per-flow-set ========================= */
@@ -543,7 +534,8 @@ static volatile uint32_t g_map_set[HPFT_MAP_SIZE];
 
 static inline uint32_t hpft_map_hash(uint32_t key)
 {
-	return ((key + 1u) * 2654435761u) % HPFT_MAP_SIZE;
+	/* top bits, for the reason in hpft_q_home */
+	return ((key + 1u) * 2654435761u) >> 21;
 }
 
 static inline uint32_t hpft_bind_key(uint32_t vhca, uint32_t qpn)
@@ -619,9 +611,9 @@ static inline int hpft_set_of(uint32_t id)
 /* ========================= diagnostics ========================= */
 static volatile uint32_t g_ev_tx, g_ev_cnp, g_ev_nack, g_ev_rtt;
 static volatile uint32_t g_q_alloc, g_q_bound;
-/* record re-inits (QP number changed under a context), stale unbinds, and
- * TX events whose vhca word differs from the record's (diagnostic, 0xdf3) */
-static volatile uint32_t g_q_reinit, g_q_unbind, g_vhca_mis, g_last_qpn_mis, g_last_vhca_mis;
+/* record re-inits (a context turned up holding another QP's number), stale
+ * unbinds, and the last mismatching pair (diagnostic, 0xdf3) */
+static volatile uint32_t g_q_reinit, g_q_unbind, g_last_qpn_mis, g_last_vhca_mis;
 /* the two reasons a QP lets go of its set, counted apart: the map disagreeing
  * with the slot, and the QP having gone quiet. One counter for both could not
  * say which was behind the 9955 unbinds seen on 2026-09-09. */
@@ -662,6 +654,65 @@ static inline void hpft_q_init(volatile hpft_q_t *q, uint32_t now)
 	q->n_nack = 0;
 	q->n_tx = 0;
 	q->avg_b32_x16 = 34 * 16;
+}
+
+/* A slot outside the keyed window, for a record that cannot be placed by key:
+ * an event with no QP number of its own, or the rare key whose eight probes
+ * are all held by live QPs of other keys. */
+static inline uint32_t hpft_q_spare(void)
+{
+	uint32_t i = g_q_next;
+
+	if (i < HPFT_QHOME || i >= HPFT_QSLOTS)
+		i = HPFT_QHOME;
+	g_q_next = (i + 1u >= HPFT_QSLOTS) ? HPFT_QHOME : i + 1u;
+	return i;
+}
+
+/* Find this key's record, or take a slot for it. Only ever called with a
+ * real key; an event carrying no QP number of its own has nothing to key a
+ * record by and takes a spare slot instead. */
+static inline uint32_t hpft_q_claim(uint32_t key, uint32_t qpn, uint32_t vhca,
+				   uint32_t now)
+{
+	uint32_t h = hpft_q_home(key);
+
+	for (uint32_t pr = 0; pr < 8u; pr++) {
+		uint32_t i = (h + pr) % HPFT_QHOME;
+		volatile hpft_q_t *q = &g_q[i];
+
+		if (q->gen && q->key == key)
+			return i;                      /* already ours */
+		/* free, or left by a QP gone far longer than the two seconds
+		 * after which a QP lets go of its set */
+		if (!q->gen || (uint32_t)(now - q->last_ts) > HPFT_QP_GONE_US) {
+			hpft_q_init(q, now);
+			/* who the record is for, written before gen publishes
+			 * it: a thread that loses the slot to another key must
+			 * not be able to stamp its own QP number on the
+			 * winner's record afterwards */
+			q->key = key;
+			q->qpn = qpn;
+			q->vhca = vhca;
+			q->gen = g_gen ? g_gen : 1u;
+			g_gen = q->gen + 1u;
+			g_q_alloc++;
+			return i;
+		}
+	}
+	/* every probe held by a live QP of another key */
+	{
+		uint32_t i = hpft_q_spare();
+
+		hpft_q_init(&g_q[i], now);
+		g_q[i].key = key;
+		g_q[i].qpn = qpn;
+		g_q[i].vhca = vhca;
+		g_q[i].gen = g_gen ? g_gen : 1u;
+		g_gen = g_q[i].gen + 1u;
+		g_q_alloc++;
+		return i;
+	}
 }
 
 /* One Swift step per RTT sample, on this QP's own window. */
@@ -971,14 +1022,13 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 	 * for those the context's record is the QP's record. A TX event does
 	 * carry its QP number, and a context is not strictly one per QP
 	 * (two data QPs of different VFs took turns in one context), so a TX
-	 * event whose number is not the context's is looked up in the
-	 * (vhca, qpn) table and gets its own record; the context then points
-	 * at that record until the other QP's next TX event. */
+	 * event whose number is not the context's is a cache miss and the
+	 * record is claimed from the key's own home slot; the context then
+	 * points at that record until the other QP's next TX event. */
 	{
 		int ctx_ok = (cx[0] == HPFT_CTX_MAGIC && cx[1] < HPFT_QSLOTS && cx[2] &&
 			      g_q[cx[1]].gen == cx[2]);
 		uint32_t key = 0, eq = 0, ev = 0;
-		int found = -1;
 
 		slot = cx[1];
 		if (a.ev_type == DOCA_PCC_DEV_EVNT_ROCE_TX) {
@@ -986,38 +1036,26 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 			ev = hpft_ev_vhca(event);
 			key = hpft_bind_key(ev, eq);
 		}
-		if (ctx_ok && (!key || g_q[slot].key == key || !g_q[slot].key)) {
+		if (ctx_ok && (!key || g_q[slot].key == key)) {
 			q = &g_q[slot];
-			if (key && !q->key) {
-				q->key = key;
-				q->qpn = eq;
-				q->vhca = ev;
-				hpft_qmap_put(key, slot);
-			}
 		} else {
 			if (ctx_ok) {
 				g_q_reinit++;
 				g_last_qpn_mis = (g_q[slot].qpn << 16) | (eq & 0xffffu);
 				g_last_vhca_mis = (g_q[slot].vhca << 16) | (ev & 0xffffu);
 			}
-			if (key)
-				found = hpft_qmap_find(key);
-			if (found >= 0 && g_q[found].gen && g_q[found].key == key) {
-				slot = (uint32_t)found;
+			if (key) {
+				slot = hpft_q_claim(key, eq, ev, now);
 				q = &g_q[slot];
 			} else {
-				slot = g_q_next;
-				g_q_next = (slot + 1u) % HPFT_QSLOTS;
+				/* no QP number of its own and no usable context:
+				 * nothing to key a record by, so it gets the
+				 * round-robin slot and never joins a set */
+				slot = hpft_q_spare();
 				q = &g_q[slot];
 				hpft_q_init(q, now);
 				q->gen = g_gen ? g_gen : 1u;
 				g_gen = q->gen + 1u;
-				if (key) {
-					q->key = key;
-					q->qpn = eq;
-					q->vhca = ev;
-					hpft_qmap_put(key, slot);
-				}
 				g_q_alloc++;
 			}
 			cx[0] = HPFT_CTX_MAGIC;
@@ -1484,7 +1522,9 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 
 			rsp[0] = g_q_reinit;
 			rsp[1] = g_q_unbind;
-			rsp[2] = g_vhca_mis;
+			rsp[2] = g_q_next;          /* the spare-slot cursor: it sits at
+					     * HPFT_QHOME until keyed placement
+					     * has had to give up */
 			rsp[3] = g_q_bound;
 			rsp[4] = g_q_alloc;
 			rsp[5] = g_ev_tx;

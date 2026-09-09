@@ -78,10 +78,19 @@ def dump_qps(reason, path):
     with open(path, "w") as f:
         f.write(json.dumps({"reason": reason, "ts": round(time.time(), 3)}) + "\n")
         f.write((ask("0xdf3", 0) or "no answer") + "\n")
-        for slot in range(64):
+        for slot in range(128):   # the keyed window of the record table
             line = ask("0xdee", slot)
             if line:
                 f.write("slot %d %s\n" % (slot, line))
+        # the agent's side of the same question, taken at the same instant:
+        # which QPs it believes in and which of those it has pushed. A QP
+        # the executor holds a record for but never binds is either absent
+        # here (lost before the agent) or present here (lost after it).
+        try:
+            with open("/tmp/hpft_txagent_qpmap.txt") as g:
+                f.write(g.read())
+        except OSError:
+            f.write("agent qpmap: not published\n")
 
 
 def query(slots):
@@ -165,4 +174,14 @@ with open(out, "w") as o:
                 dump_qps("slots %s carry %s QPs, the others carry %d"
                          % (short, [nq_seen[k] for k in short], common),
                          out + ".qpdump")
+        # One dump per run whether or not a set came up short, so a clean
+        # run leaves the same evidence as a broken one and the two can be
+        # read against each other. Taken while the traffic is still up: the
+        # records survive the load but their bindings do not (a QP silent
+        # for two seconds lets go of its set), so a dump after the flows
+        # stop would show everything unbound and say nothing.
+        if not dumped and time.time() > t_end - 0.3 * dur:
+            dumped = True
+            dump_qps("end of the load window, no set came up short",
+                     out + ".qpdump")
         time.sleep(max(0.0, itv - (time.time() - t)))
