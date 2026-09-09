@@ -42,7 +42,7 @@ V1、V2、V4 是每一版设计必跑的三个；V3、V5、V6 在它们过了之
 | 打流器 | RDMA `~/hyperfront/perftest-enhanced/ib_write_bw`（带 `--start_at`，四台同一份二进制），`-q 4 -m 1024 --report_gbits -D`；TCP 系统 iperf3（3.20 + 本地 `--start-at` 补丁，源码在 `~/hyperfront/iperf320`，四台已装），`-P 4 --start-at <绝对时刻> -J -B <ip>%dpu1vfN`。perftest 的控制连接走管理网（目的主机名），不走 VF：连 VF 的 IP 会让那条空闲连接被接收端算作在场的 TCP 流集合 |
 | 限速的 RDMA 行 | 两端都加 `-s 8192`。硬件限速被 QP 拒绝（PCC 执行面占着 QP 的速率），只能用 perftest 的软件限速，它按 `burst_size` 条消息成批发送再忙等；64 KB 消息一批 8.4 MB、每 6.71 ms 一次，20 ms 的遥测采样窗只装得下三批、量化出 ±33% 的假抖动；8 KB 消息把批间隔压到 0.84 ms。不要改用调小 `burst_size` 的办法：在途消息数太少时新流填不满起步的许可速率 |
 | 起步纪律 | RDMA 不加 `--rate_limit`（V4 的需求限制除外）：第一个 $R$ 到达之前 QP 按起步值放行（设计第 5.4 节，$R_0/$每流集合预期 QP 数），QP 被打死算一次失败。晚加入的行在起点前几秒才启动打流器（TCP 3 s、RDMA 5 s，runner 自动做）：早启动的空闲控制连接会被对端关掉，还会被接收端算作在场的 TCP 流集合 |
-| 时长与计时 | V1 20 s、V2 与 V6 五段各 10 s（RDMA 加入退出、TCP 加入退出各占一段）、V3 90 s、V4 90 s、V5 60 s、V7 90 s、V8 60 s。一次事件只动一类流。t=0 的流先预热 5 s 再开始计时；晚加入的流两类都按绝对时刻准点加入（perftest `--start_at`、iperf3 `--start-at`；后者不在 `--help` 里，查 `strings /usr/local/lib/libiperf.so.0 \| grep start-at`）。图和表只取计时后的部分 |
+| 时长与计时 | V1 20 s、V2 与 V6 五段各 8 s（RDMA 加入退出、TCP 加入退出各占一段）、V3 五段各 8 s、V4 三段各 13 s、V5 30 s、V7 三段 13/14/13 s、V8 三段 13/14/13 s，合计每场 20 到 40 s 的负载。段长的下限是判定要用的稳态窗口：`distill.py` 在每段里跳过前 3 s（最慢的沿实测 1.8 s）、丢掉最后 1 s，8 s 一段还剩 4 s、即每个流集合 40 个 100 ms 格子。一次事件只动一类流。t=0 的流先预热 5 s 再开始计时；晚加入的流两类都按绝对时刻准点加入（perftest `--start_at`、iperf3 `--start-at`；后者不在 `--help` 里，查 `strings /usr/local/lib/libiperf.so.0 \| grep start-at`）。图和表只取计时后的部分 |
 | 重复 | 每个场景每版设计跑 1 遍出结论；作为定版依据的场景跑 3 遍，收敛时间报 min/median/max，图取三遍的逐点平均画成一张 |
 
 ## 三、测量与判据

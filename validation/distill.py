@@ -34,7 +34,12 @@ C_ROOT = 200e9 * 0.92          # C' (headroom 8 %, root only)
 VM_CAP = 50e9                  # every VM sold at 50 G; the VM cap carries no headroom
 DELTA = 0.15                   # demand margin the receiver reserves for a lender
 RDMA_WIRE = 1.073              # wire bytes / application bytes for 1024 B RoCE WRITE (measured V4 2026-08-28)
-STEADY_SKIP, STEADY_TAIL = 5.0, 1.0   # steady window inside a phase
+STEADY_SKIP, STEADY_TAIL = 3.0, 1.0   # steady window inside a phase
+# The phases are 8 to 14 s (2026-09-09: the scenarios were shortened so a
+# run costs 30-40 s of load instead of 50-90). The skip has to clear the
+# transient - the slowest edge measured is 1.8 s - and still leave several
+# seconds of 100 ms bins: 3 s leaves 4 s, or 40 bins per flow-set.
+CONV_WINDOW = 7.0                     # how long after an event to look for it
 FIT_TOL, JAIN_MIN, UTIL_MIN = 0.05, 0.99, 0.95
 Q_MEAN_MAX_MS, Q_CLEAR_MAX_S, Q_ZERO_MS = 1.0, 1.0, 0.05
 # The virtual queue is the receiver's ledger of how much a flow-set has
@@ -432,7 +437,7 @@ def main(tag):
             # the group's convergence is its slowest member
             per = []
             for f in group:
-                raw = [(t, rate(x, f)) for t, x in rxh[fh[f]] if e <= t <= e + 15]
+                raw = [(t, rate(x, f)) for t, x in rxh[fh[f]] if e <= t <= e + CONV_WINDOW]
                 # judged on the 100 ms mean of the attributed rate: a 20 ms
                 # sample is one 10 ms attribution window, whose scatter at
                 # a 4-QP RDMA flow-set is about 10 % of the rate (V2,

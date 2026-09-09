@@ -1,18 +1,18 @@
 # src_host src_vf dst_host dst_vf class count start_s end_s options   (times on the experiment clock, after the 5 s warm-up)
-# 一次事件只动一类流（2026-09-02 起）：RDMA 流集合 10 s 加入、20 s 退出；TCP 流集合 30 s 加入、40 s 退出。
-sgpu01 0 sgpu02 0 rdma 4 0 50 -
-sgpu01 0 sgpu02 0 tcp 4 0 50 -
-sgpu01 1 sgpu02 1 rdma 4 0 50 -
-sgpu01 1 sgpu02 1 tcp 4 0 50 -
-sgpu01 2 sgpu02 2 rdma 4 0 50 -
-sgpu01 2 sgpu02 2 tcp 4 0 50 -
-sgpu01 3 sgpu02 3 rdma 4 0 50 -
-sgpu01 3 sgpu02 3 tcp 4 0 50 -
-sgpu03 0 sgpu02 0 rdma 4 10 20 -
-sgpu03 1 sgpu02 1 rdma 4 10 20 -
-sgpu03 2 sgpu02 2 rdma 4 10 20 -
-sgpu03 3 sgpu02 3 rdma 4 10 20 -
-sgpu03 0 sgpu02 0 tcp 4 30 40 -
-sgpu03 1 sgpu02 1 tcp 4 30 40 -
-sgpu03 2 sgpu02 2 tcp 4 30 40 -
-sgpu03 3 sgpu02 3 tcp 4 30 40 -
+# 一次事件只动一类流（2026-09-02 起）：RDMA 流集合 8 s 加入、16 s 退出；TCP 流集合 24 s 加入、32 s 退出。
+sgpu01 0 sgpu02 0 rdma 4 0 40 -
+sgpu01 0 sgpu02 0 tcp 4 0 40 -
+sgpu01 1 sgpu02 1 rdma 4 0 40 -
+sgpu01 1 sgpu02 1 tcp 4 0 40 -
+sgpu01 2 sgpu02 2 rdma 4 0 40 -
+sgpu01 2 sgpu02 2 tcp 4 0 40 -
+sgpu01 3 sgpu02 3 rdma 4 0 40 -
+sgpu01 3 sgpu02 3 tcp 4 0 40 -
+sgpu03 0 sgpu02 0 rdma 4 8 16 -
+sgpu03 1 sgpu02 1 rdma 4 8 16 -
+sgpu03 2 sgpu02 2 rdma 4 8 16 -
+sgpu03 3 sgpu02 3 rdma 4 8 16 -
+sgpu03 0 sgpu02 0 tcp 4 24 32 -
+sgpu03 1 sgpu02 1 tcp 4 24 32 -
+sgpu03 2 sgpu02 2 tcp 4 24 32 -
+sgpu03 3 sgpu02 3 tcp 4 24 32 -
