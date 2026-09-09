@@ -111,6 +111,15 @@ def query(slots):
     return res
 
 
+# The evidence file lives at a fixed path, so a dump left by an earlier run
+# would be collected again and attributed to this one - three dumps up to
+# twenty minutes apart were once read as if they came from the same run
+# (2026-09-09). Clear it before sampling starts.
+try:
+    os.unlink(out + ".qpdump")
+except OSError:
+    pass
+
 t_end = time.time() + dur
 live = set()                 # slots that answered with a flow set
 last_q = {}                  # slot -> when it was last queried, for the interval

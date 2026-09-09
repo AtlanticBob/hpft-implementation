@@ -582,8 +582,13 @@ static inline void hpft_map_put(uint32_t qpn, uint32_t set_id)
 		uint32_t i = (h + pr) % HPFT_MAP_SIZE;
 
 		if (g_map_qpn[i] == qpn + 1u || g_map_qpn[i] == 0) {
-			g_map_qpn[i] = qpn + 1u;
+			/* value first, key last: the reader matches on the key,
+			 * so publishing the key first lets it pair a new key
+			 * with whatever value the slot held before. Read that
+			 * way, a stale set id makes hpft_q_reassert unbind a
+			 * QP that was bound correctly. */
 			g_map_set[i] = set_id;
+			g_map_qpn[i] = qpn + 1u;
 			return;
 		}
 	}
@@ -617,6 +622,10 @@ static volatile uint32_t g_q_alloc, g_q_bound;
 /* record re-inits (QP number changed under a context), stale unbinds, and
  * TX events whose vhca word differs from the record's (diagnostic, 0xdf3) */
 static volatile uint32_t g_q_reinit, g_q_unbind, g_vhca_mis, g_last_qpn_mis, g_last_vhca_mis;
+/* the two reasons a QP lets go of its set, counted apart: the map disagreeing
+ * with the slot, and the QP having gone quiet. One counter for both could not
+ * say which was behind the 9955 unbinds seen on 2026-09-09. */
+static volatile uint32_t g_unbind_map, g_unbind_quiet;
 /* which DPA threads have run the algorithm (0xdf4): the framework fans events
  * out over doca_pcc's thread pool, so this is a direct read of how much
  * concurrency the executor actually sees. */
@@ -912,6 +921,7 @@ static inline void hpft_q_reassert(volatile hpft_q_t *q, uint32_t slot)
 		if (id && g_set[si].id != id) {
 			q->set = 0;
 			g_q_unbind++;
+			g_unbind_map++;
 			return;
 		}
 		hpft_set_add(&g_set[si], slot);
@@ -1023,6 +1033,7 @@ static void __attribute__((noinline)) hpft_user_algo(doca_pcc_dev_algo_ctxt_t *a
 	if (q->set && (uint32_t)(now - q->last_ts) > HPFT_QP_STALE_US) {
 		q->set = 0;
 		g_q_unbind++;
+		g_unbind_quiet++;
 	}
 	q->last_ts = now;
 	if (g_algo == HPFT_CC_SWIFT && g_sw_ctx) {
@@ -1477,8 +1488,8 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			rsp[3] = g_q_bound;
 			rsp[4] = g_q_alloc;
 			rsp[5] = g_ev_tx;
-			rsp[6] = g_last_qpn_mis;    /* record's qpn << 16 | event's qpn (low 16) */
-			rsp[7] = g_last_vhca_mis;   /* record's vhca << 16 | event's vhca (low 16) */
+			rsp[6] = g_unbind_map;      /* let go because the map disagreed */
+			rsp[7] = g_unbind_quiet;    /* let go because the QP went quiet */
 			*response_size = 8 * sizeof(uint32_t);
 			return DOCA_PCC_DEV_STATUS_OK;
 		}

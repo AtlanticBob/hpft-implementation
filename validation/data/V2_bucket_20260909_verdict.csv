@@ -1,0 +1,7 @@
+criterion,pass,detail
+1 稳态贴合,PASS,ok
+2 队列消得掉,FAIL,0-8s sgpu02 sgpu01/vf3>sgpu02/vf3|rdma went 1.1 s without clearing; 16-24s sgpu02 mean 3.18 ms; sgpu01/vf3>sgpu02/vf3|rdma went 1.1 s without clearing; 32-40s sgpu02 sgpu01/vf2>sgpu02/vf2|rdma went 1.2 s without clearing
+3 收敛 ≤ 1 s,PASS,ok
+4 不塌,PASS,ok
+5 平台健康,PASS,ok
+6 执行面守约,FAIL,sgpu01/vf0>sgpu02/vf0|rdma paced/R mean 1.543 p95 2.001 over the samples with every QP drawing; sgpu01/vf1>sgpu02/vf1|rdma paced/R mean 1.543 p95 2.048 over the samples with every QP drawing; sgpu01/vf2>sgpu02/vf2|rdma paced/R mean 1.518 p95 1.837 over the samples with every QP drawing; sgpu01/vf3>sgpu02/vf3|rdma paced/R mean 1.466 p95 1.910 over the samples with every QP drawing; sgpu03/vf0>sgpu02/vf0|rdma bound only 3 QPs while its peers bound 4 (a QP that never bound is not held by the set's pool); sgpu03/vf2>sgpu02/vf2|rdma bound only 3 QPs while its peers bound 4 (a QP that never bound is not held by the set's pool)

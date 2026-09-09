@@ -1,0 +1,7 @@
+criterion,pass,detail
+1 稳态贴合,PASS,ok
+2 队列消得掉,PASS,ok
+3 收敛 ≤ 1 s,FAIL,13s rdma x6 1142 ms
+4 不塌,PASS,ok
+5 平台健康,PASS,ok
+6 执行面守约,PASS,CC 单独臂，不适用

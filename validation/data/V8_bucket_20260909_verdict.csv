@@ -1,0 +1,7 @@
+criterion,pass,detail
+1 稳态贴合,FAIL,27-40s sgpu03/vf0>sgpu04/vf0|rdma 47.34 vs 50.00
+2 队列消得掉,PASS,ok
+3 收敛 ≤ 1 s,PASS,ok
+4 不塌,PASS,ok
+5 平台健康,PASS,ok
+6 执行面守约,PASS,ok
