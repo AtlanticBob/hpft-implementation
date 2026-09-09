@@ -1,0 +1,7 @@
+criterion,pass,detail
+1 稳态贴合,PASS,ok
+2 队列消得掉,PASS,ok
+3 收敛 ≤ 1 s,PASS,ok
+4 不塌,PASS,ok
+5 平台健康,PASS,ok
+6 执行面守约,FAIL,sgpu01/vf0>sgpu02/vf0|rdma paced < 0.95 R in 31% of the samples where the CCs asked for R; sgpu01/vf2>sgpu02/vf2|rdma paced < 0.95 R in 25% of the samples where the CCs asked for R; sgpu01/vf3>sgpu02/vf3|rdma paced < 0.95 R in 12% of the samples where the CCs asked for R; sgpu03/vf0>sgpu02/vf0|rdma paced/R mean 1.016 p95 1.130 over the samples with every QP drawing; sgpu03/vf0>sgpu02/vf0|rdma paced < 0.95 R in 13% of the samples where the CCs asked for R; sgpu03/vf1>sgpu02/vf1|rdma paced/R mean 0.995 p95 1.141 over the samples with every QP drawing; sgpu03/vf1>sgpu02/vf1|rdma paced < 0.95 R in 20% of the samples where the CCs asked for R; sgpu03/vf2>sgpu02/vf2|rdma paced/R mean 0.996 p95 1.104 over the samples with every QP drawing; sgpu03/vf2>sgpu02/vf2|rdma paced < 0.95 R in 20% of the samples where the CCs asked for R; sgpu03/vf3>sgpu02/vf3|rdma paced < 0.95 R in 15% of the samples where the CCs asked for R; sgpu04/vf0>sgpu02/vf0|rdma paced/R mean 1.007 p95 1.156 over the samples with every QP drawing; sgpu04/vf0>sgpu02/vf0|rdma paced < 0.95 R in 25% of the samples where the CCs asked for R; sgpu04/vf1>sgpu02/vf1|rdma paced/R mean 0.961 p95 1.118 over the samples with every QP drawing; sgpu04/vf3>sgpu02/vf3|rdma paced/R mean 1.004 p95 1.111 over the samples with every QP drawing; sgpu04/vf3>sgpu02/vf3|rdma paced < 0.95 R in 38% of the samples where the CCs asked for R
