@@ -289,7 +289,7 @@ if [ -z "${HPFT_NO_RP_SAMPLE:-}" ]; then
   for h in $SENDERS; do
     d=$(dpu_of $h)
     scp -q "$REPO/tools/dpu/rp_sample.py" "$d:/tmp/rp_sample.py"
-    ssh -n -o BatchMode=yes "$d" "sudo rm -f /tmp/rp_sample.jsonl /tmp/rp_sample.err; setsid nohup python3 /tmp/rp_sample.py $SAMP /tmp/rp_sample.jsonl 1 200 >/tmp/rp_sample.err 2>&1 </dev/null &" </dev/null
+    ssh -n -o BatchMode=yes "$d" "sudo rm -f /tmp/rp_sample.jsonl /tmp/rp_sample.err; setsid nohup python3 /tmp/rp_sample.py $SAMP /tmp/rp_sample.jsonl 1 200 $((END+WARM)) >/tmp/rp_sample.err 2>&1 </dev/null &" </dev/null
   done
 fi
 # listeners, on each row's destination host
@@ -391,6 +391,9 @@ for h in $SENDERS; do
   # only exists when a flow-set was short of members: every QP record the
   # executor held at that moment, plus the binding diagnostics
   scp -q "$(dpu_of $h):/tmp/rp_sample.jsonl.qpdump" "$OUT/qpdump_$h.txt" 2>/dev/null || true
+  # the sampler's own timing: a pass that overran its period is why a line in
+  # the executor figure would come up short, so it travels with the data
+  scp -q "$(dpu_of $h):/tmp/rp_sample.err" "$OUT/rp_sample_$h.err" 2>/dev/null || true
 done
 snap_cnp > "$OUT/cnp_post.txt"
 for h in $RECVS; do scp -q "$(dpu_of $h):/tmp/hpft_rxagent_e.jsonl" "$OUT/rx_$h.jsonl"; done

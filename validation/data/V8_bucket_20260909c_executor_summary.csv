@@ -1,0 +1,7 @@
+fsid,samples,all_live_samples,all_live_mean_paced_over_R,all_live_p95_paced_over_R,full_samples,full_frac,mean_paced_over_R,mean_cc_live_over_R
+sgpu01/vf0>sgpu02/vf0|rdma,24,0,,,16,1.0000,4.993,10.675
+sgpu01/vf1>sgpu02/vf1|rdma,8,0,,,0,,0.563,0.510
+sgpu01/vf2>sgpu02/vf2|rdma,8,0,,,0,,0.588,0.481
+sgpu03/vf0>sgpu04/vf0|rdma,27,0,,,17,1.0000,4.580,9.010
+sgpu03/vf1>sgpu04/vf1|rdma,10,0,,,0,,0.585,0.483
+sgpu03/vf2>sgpu04/vf2|rdma,10,0,,,0,,0.583,0.539
