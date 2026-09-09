@@ -1,0 +1,30 @@
+arm: algo=2 cc_only=0 law=0 agents=1 tcp_cc=cubic
+  sgpu01 readback algo/cc_only = 0 w8=0 w9=0 w10=0
+  sgpu03 readback algo/cc_only = 0 w8=0 w9=0 w10=0
+  sgpu04 readback algo/cc_only = 0 w8=0 w9=0 w10=0
+#    class  flow                       Gb/s
+0    rdma   sgpu01/vf0>sgpu02/vf0      7.02
+1    tcp    sgpu01/vf0>sgpu02/vf0      7.34
+2    rdma   sgpu01/vf1>sgpu02/vf1      7.07
+3    tcp    sgpu01/vf1>sgpu02/vf1      7.35
+4    rdma   sgpu01/vf2>sgpu02/vf2      7.05
+5    tcp    sgpu01/vf2>sgpu02/vf2      7.35
+6    rdma   sgpu01/vf3>sgpu02/vf3      7.07
+7    tcp    sgpu01/vf3>sgpu02/vf3      7.36
+8    rdma   sgpu03/vf0>sgpu02/vf0      7.05
+9    tcp    sgpu03/vf0>sgpu02/vf0      7.35
+10   rdma   sgpu03/vf1>sgpu02/vf1      7.07
+11   tcp    sgpu03/vf1>sgpu02/vf1      7.35
+12   rdma   sgpu03/vf2>sgpu02/vf2      7.04
+13   tcp    sgpu03/vf2>sgpu02/vf2      7.36
+14   rdma   sgpu03/vf3>sgpu02/vf3      7.06
+15   tcp    sgpu03/vf3>sgpu02/vf3      7.35
+16   rdma   sgpu04/vf0>sgpu02/vf0      7.02
+17   tcp    sgpu04/vf0>sgpu02/vf0      7.34
+18   rdma   sgpu04/vf1>sgpu02/vf1      7.07
+19   tcp    sgpu04/vf1>sgpu02/vf1      7.35
+20   rdma   sgpu04/vf2>sgpu02/vf2      7.04
+21   tcp    sgpu04/vf2>sgpu02/vf2      7.35
+22   rdma   sgpu04/vf3>sgpu02/vf3      7.06
+23   tcp    sgpu04/vf3>sgpu02/vf3      7.35
+TOTAL 172.82 Gb/s
