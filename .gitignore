@@ -77,3 +77,4 @@ results/queueing_20260908/results/*/histogram_raw.jsonl
 # queueing experiment: ib_write_lat -H dumps every sample (~700k lines a run);
 # the distilled CDF is in data/queueing.csv
 results/queueing_20260908/results/*/probe.txt
+results/fct_20260909/results/*/probe_*.txt
