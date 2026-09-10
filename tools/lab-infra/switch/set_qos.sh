@@ -3,6 +3,7 @@
 # depth that decides when a congested port starts dropping.
 #
 #   set_qos.sh apply [notc|tc]   write the standing state and show it
+#   set_qos.sh ecn on|off        whether the ports mark at all (2-3 needs off)
 #   set_qos.sh status            show what is set now
 #
 # ECN lives in its own profile hpft_ecn, bound to the six ports of the split
@@ -71,8 +72,9 @@ show() {
       printf "%-9s " $p
       nv show interface $p qos congestion-control 2>/dev/null | grep -i "^ *profile" | tr -s " "
     done
-    echo "== hpft_ecn thresholds (traffic-class, ecn, red, min, max, prob) =="
-    nv show qos congestion-control hpft_ecn 2>/dev/null | grep -E "^ +[0-9]"
+    P=$(nv show interface swp37s0 qos congestion-control 2>/dev/null | grep -i "^ *profile" | tr -s " " | cut -d" " -f2)
+    echo "== $P thresholds (traffic-class, ecn, red, min, max, prob) =="
+    nv show qos congestion-control "$P" 2>/dev/null | grep -E "^ +[0-9]"
     echo "== egress queue quota AS THE HARDWARE SEES IT, swp37s0 =="
     nv show interface swp37s0 qos buffer 2>/dev/null \
       | sed -n "/Buffer - Egress Traffic Class/,/Buffer - Egress Multicast/p" | sed -n "3,7p"
@@ -81,8 +83,30 @@ show() {
   ' 2>&1 | grep -v Welcome || true
 }
 
-case "${1:?apply|status}" in
+case "${1:?apply|ecn|status}" in
 status) show ;;
+ecn)
+  # Whether the receiver port marks at all. Off is what an experiment needs when
+  # the scarcity is meant to be a POLICY quota and nothing else: with ECN on,
+  # the port marks under load and the RDMA side backs off for a reason that has
+  # nothing to do with the quota, so the split stops being a statement about the
+  # quota. Motivation 1-3 ran this way and evaluation 2-3 mirrors it. The
+  # profile disables both marking and RED on both classes; hpft_noecn exists
+  # only for this, and `ecn on` puts hpft_ecn back.
+  case "${2:?on|off}" in
+    on)  PROF=hpft_ecn ;;
+    off) PROF=hpft_noecn ;;
+    *) echo "usage: $0 ecn on|off"; exit 1 ;;
+  esac
+  ssh -o BatchMode=yes sn5600 "
+    for tc in 0 3; do
+      nv set qos congestion-control hpft_noecn traffic-class \$tc ecn disable
+      nv set qos congestion-control hpft_noecn traffic-class \$tc red disable
+    done
+    nv set interface $PORTS qos congestion-control profile $PROF
+    nv config apply -y >/dev/null" 2>&1 | grep -v Welcome || true
+  echo "receiver-port ECN: $2 (profile $PROF)"
+  show ;;
 apply)
   MODE=${2:-notc}
   case "$MODE" in
@@ -107,5 +131,5 @@ apply)
     nv set interface $PORTS qos congestion-control profile hpft_ecn
     nv config apply -y >/dev/null" 2>&1 | grep -v Welcome || true
   show ;;
-*) echo "usage: $0 apply [notc|tc] | status"; exit 1 ;;
+*) echo "usage: $0 apply [notc|tc] | ecn on|off | status"; exit 1 ;;
 esac

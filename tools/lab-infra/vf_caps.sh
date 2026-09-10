@@ -41,7 +41,9 @@
 #   vf_caps.sh sync        devlink caps + meters on all DPUs from the policy
 #   vf_caps.sh clear       release every devlink cap and delete every meter
 #   vf_caps.sh meter-on    meters only (policy rate)
-#   vf_caps.sh meter-off   meters only
+#   vf_caps.sh meter-off   meters only (REMOVES FORWARDING TOO - see meter_bypass)
+#   BYPASS_HOST=<host> BYPASS_VF=<n> vf_caps.sh meter-bypass
+#                          that one VF keeps its forwarding and loses its policer
 #   vf_caps.sh devlink-on  devlink only
 #   vf_caps.sh devlink-off devlink only
 #   vf_caps.sh status      what every DPU is enforcing right now
@@ -85,6 +87,37 @@ $rows
 EOF
     echo \"  $1 ($2): \$(sudo ovs-ofctl -O OpenFlow13 dump-meters $BR | grep -c 'meter=1[1-8]') meters\""
 }
+# One VF's downlink policer removed while its FORWARDING stays. The three rules
+# vf_caps installs are the only path a tunnelled IP packet has to a local VF
+# (overlay.sh writes nothing else for it - anything on a tunnel that no rule
+# claims hits the split-horizon drop at 115), so `meter-off` does not mean "no
+# policer", it means "no connectivity". That is the whole of the 2026-09-10
+# outage: the meters were gone, the rules that referenced them could not be
+# installed, and four machines that all reported healthy could not reach each
+# other.
+#
+# This is what an arm needs when something ELSE is the policer for that VF -
+# the Jakiro arm, where the DHTB is the 50 G drop point and a second drop point
+# behind it would police the same traffic twice. The rules are rewritten
+# without the meter action and the meter itself is deleted; `meter-on` puts
+# both back.
+meter_bypass() {   # $1 host  $2 dpu  $3 vf index
+  local rows; rows=$(vf_rows "$1")
+  ssh -o BatchMode=yes "$2" "while read -r i ip kbps rep; do
+      [ \"\$i\" = \"$3\" ] || continue
+      sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"udp,nw_dst=\$ip,tp_dst=4791\" 2>/dev/null
+      sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"tcp,nw_dst=\$ip\" 2>/dev/null
+      sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"ip,nw_dst=\$ip\" 2>/dev/null
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=122,udp,nw_dst=\$ip,tp_dst=4791,actions=output:\$rep\"
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=121,tcp,nw_dst=\$ip,actions=output:\$rep\"
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=120,ip,nw_dst=\$ip,actions=output:\$rep\"
+      sudo ovs-ofctl -O OpenFlow13 del-meter $BR \"meter=\$((11+i))\" 2>/dev/null
+      echo \"  $1 ($2): vf$3 forwards with no policer\"
+    done <<'EOF'
+$rows
+EOF
+"
+}
 meter_off() {
   ssh -o BatchMode=yes "$2" "for i in 0 1 2 3 4 5 6 7; do
       sudo ovs-ofctl -O OpenFlow13 dump-flows $BR 2>/dev/null | grep -o 'nw_dst=[0-9.]* actions=meter:'\$((11+i)) | cut -d' ' -f1 | sort -u | while read -r m; do
@@ -112,9 +145,11 @@ for n in "${NODES[@]}"; do
     clear)       devlink_off "$1" "$2"; meter_off "$1" "$2" ;;
     meter-on)    meter_on "$1" "$2" ;;
     meter-off)   meter_off "$1" "$2" ;;
+    meter-bypass) [ "$1" = "${BYPASS_HOST:-}" ] && meter_bypass "$1" "$2" "${BYPASS_VF:-0}" ;;
     devlink-on)  devlink_on "$1" "$2" ;;
     devlink-off) devlink_off "$1" "$2" ;;
     status)      status "$1" "$2" ;;
-    *) echo "usage: vf_caps.sh sync|clear|meter-on|meter-off|devlink-on|devlink-off|status"; exit 2 ;;
+    *) echo "usage: vf_caps.sh sync|clear|meter-on|meter-off|devlink-on|devlink-off|status"
+       echo "       BYPASS_HOST=<host> BYPASS_VF=<n> vf_caps.sh meter-bypass   (that VF forwards with no policer)"; exit 2 ;;
   esac
 done

@@ -4,7 +4,7 @@
 # place VF DCQCN parameters follow (bf3-cc-ownership fact); NP side is
 # left untouched. Wraps the generic reader/writer ~/hyperfront/dcqcn.sh.
 #
-#   dcqcn_gear.sh status | gentle | default | fast
+#   dcqcn_gear.sh status | gentle | default | fast   (GEAR_HOST=<host> picks the sender)
 #
 # gears (rpg_time_reset / rpg_ai_rate / rpg_hai_rate):
 #   gentle  1200 / 1  / 10     slow recovery
@@ -14,6 +14,12 @@
 set -eu
 DC=$HOME/hyperfront/dcqcn.sh
 IF=dpu1
+# The firmware gear lives on the SENDER HOST's PF sysfs (VF parameters follow
+# nothing else), and the RDMA sender is not always this machine: 2-3 sends RDMA
+# from sgpu03. GEAR_HOST names it; unset means here.
+if [ -n "${GEAR_HOST:-}" ] && [ "$GEAR_HOST" != "$(hostname)" ]; then
+  exec ssh -n "$GEAR_HOST" "GEAR_HOST= bash /home/zhaoxiang/hyperfront/hpft-implementation/tools/eval/dcqcn_gear.sh ${1:-status}"
+fi
 case "${1:-}" in
   gentle)  sudo "$DC" $IF rpg_time_reset=1200 rpg_ai_rate=1  rpg_hai_rate=10  | grep rpg_ ;;
   default) sudo "$DC" $IF rpg_time_reset=300  rpg_ai_rate=5  rpg_hai_rate=50  | grep rpg_ ;;

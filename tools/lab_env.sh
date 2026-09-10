@@ -105,10 +105,26 @@ status() {
 }
 
 # ------------------------------------------------------------ jakiro ctl ----
+# The Jakiro VF, read from the DHTB's own conf rather than named here: which VF
+# it manages is a property of that configuration.
+jakiro_vf() {
+  local ip
+  ip=$(ssh -o BatchMode=yes hpft-dpu2 "grep -m1 '^OVERLAY_DST_IP=' $JAKIRO_DIR/jakiro_dhtb.conf | cut -d= -f2" 2>/dev/null | tr -d '\r')
+  [ -n "$ip" ] || return 1
+  python3 -c "
+import json,re,sys
+r=json.load(open('$REPO/config/lab-registry.json'))
+for v in r['vnics']:
+    if v['ip']=='$ip':
+        print(v['host'], re.search(r'vf(\d+)\$', v['netdev']).group(1)); break
+"
+}
 jakiro_stop() {
   ssh hpft-dpu2 'pid=$(pgrep -f "build/jakiro_dht[b]" | head -1)
     [ -n "$pid" ] && { sudo kill "$pid" 2>/dev/null; for i in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done; sudo kill -9 "$pid" 2>/dev/null; }
     sudo rm -f '"$JAKIRO_DIR"'/run/jakiro_dhtb.pid; true'
+  # give the VF its ordinary policer back
+  bash "$REPO/tools/lab-infra/vf_caps.sh" meter-on >/dev/null 2>&1 || true
 }
 jakiro_start() {
   # hardened: hugepages -> kill -> wipe stale DPDK runtime (a fast relaunch over
@@ -130,7 +146,23 @@ jakiro_start() {
       sudo -E bash apply_jakiro_dhtb.sh >/dev/null 2>&1 || true
       sleep 3
       pgrep -f "build/jakiro_dht[b]" >/dev/null && grep -aq "DHTB_CFG" run/jakiro_dhtb.log' \
-      && { echo "  jakiro up (attempt $attempt)"; return 0; }
+      && {
+        echo "  jakiro up (attempt $attempt)"
+        # Only one policer on the Jakiro VF. The DHTB IS a policer - it drops
+        # TCP and CE-marks RoCE once the 50 G root is exceeded - and the lab's
+        # standing per-VF OVS meter is a second one at the same rate behind it,
+        # so the arm would police the same traffic twice and the figure would
+        # not be Jakiro's. The VF keeps its forwarding rules and loses the meter
+        # (vf_caps.sh meter_bypass explains why those are not the same thing);
+        # every other VF keeps the ordinary policer, which is what the native
+        # arm is. jakiro_stop puts it back.
+        read -r jh jv <<<"$(jakiro_vf)"
+        if [ -n "${jh:-}" ]; then
+          BYPASS_HOST=$jh BYPASS_VF=$jv bash "$REPO/tools/lab-infra/vf_caps.sh" meter-bypass
+        else
+          echo "  WARN: could not tell which VF the DHTB manages; its OVS meter is still policing" >&2
+        fi
+        return 0; }
     echo "  jakiro start attempt $attempt failed, retrying"; sleep 3
   done
   echo "  jakiro start FAILED" >&2; return 1

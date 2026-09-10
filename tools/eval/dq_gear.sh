@@ -2,7 +2,7 @@
 # Recovery-parameter gears for the software DCQCN that runs underneath
 # HyperFront (the cc_rate term of rate = min(cc_rate, level)).
 #
-#   dq_gear.sh gentle | default | fast
+#   dq_gear.sh gentle | default | fast          (GEAR_HOST=<host> picks the sender)
 #
 # The knobs are the same three a firmware DCQCN RP exposes, written through
 # the PCC mailbox (0xcce <value> <which>; which 0=AI, 1=HAI, 2=rate timer):
@@ -24,5 +24,12 @@ case "${1:-}" in
   fast)    AI=$((MAX/80));   HAI=$((MAX/16));  T=300  ;;
   *) sed -n '2,18p' "$0"; exit 2 ;;
 esac
-ssh hpft-dpu "echo '0xcce $AI 0'  > /tmp/rp_fifo; echo '0xcce $HAI 1' > /tmp/rp_fifo; echo '0xcce $T 2' > /tmp/rp_fifo"
-echo "dq_gear: $1  ai=$AI hai=$HAI rate_timer=${T}us"
+# Which sender's executor. The gear is device state on ONE DPU, and the RDMA
+# sender is not always sgpu01: 2-3 sends RDMA from sgpu03. Name the host, not
+# the DPU - the registry knows which DPU belongs to it.
+GEAR_HOST=${GEAR_HOST:-$(python3 -c "import json;print(json.load(open('/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-registry.json'))['sender_host'])")}
+GEAR_DPU=$(python3 -c "
+import json;r=json.load(open('/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-registry.json'))
+print({n['host']:n['dpu'] for n in r['nodes']}['$GEAR_HOST'])")
+ssh "$GEAR_DPU" "echo '0xcce $AI 0'  > /tmp/rp_fifo; echo '0xcce $HAI 1' > /tmp/rp_fifo; echo '0xcce $T 2' > /tmp/rp_fifo"
+echo "dq_gear: $1 on $GEAR_HOST ($GEAR_DPU)  ai=$AI hai=$HAI rate_timer=${T}us"
