@@ -1,0 +1,17 @@
+row,fsid,start_s,end_s,goodput_gbps
+0,sgpu01/vf0>sgpu02/vf0|rdma,0,40,18.51
+1,sgpu01/vf0>sgpu02/vf0|tcp,0,40,20.84
+2,sgpu01/vf1>sgpu02/vf1|rdma,0,40,18.55
+3,sgpu01/vf1>sgpu02/vf1|tcp,0,40,20.83
+4,sgpu01/vf2>sgpu02/vf2|rdma,0,40,18.59
+5,sgpu01/vf2>sgpu02/vf2|tcp,0,40,20.82
+6,sgpu01/vf3>sgpu02/vf3|rdma,0,40,18.54
+7,sgpu01/vf3>sgpu02/vf3|tcp,0,40,20.85
+8,sgpu03/vf0>sgpu02/vf0|rdma,8,16,11.35
+9,sgpu03/vf1>sgpu02/vf1|rdma,8,16,11.39
+10,sgpu03/vf2>sgpu02/vf2|rdma,8,16,11.41
+11,sgpu03/vf3>sgpu02/vf3|rdma,8,16,11.39
+12,sgpu03/vf0>sgpu02/vf0|tcp,24,32,11.52
+13,sgpu03/vf1>sgpu02/vf1|tcp,24,32,11.52
+14,sgpu03/vf2>sgpu02/vf2|tcp,24,32,11.52
+15,sgpu03/vf3>sgpu02/vf3|tcp,24,32,11.53

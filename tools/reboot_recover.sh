@@ -40,7 +40,7 @@ on_host() { # on_host <host> <command>
   if [ "$1" = "$(hostname)" ]; then bash -c "$2"; else ssh -o BatchMode=yes "$1" "$2"; fi
 }
 
-echo "== 1/6 VFs on ${#NODES[@]} hosts =="
+echo "== 1/7 VFs on ${#NODES[@]} hosts =="
 for n in "${NODES[@]}"; do
   set -- $n
   ( on_host "$1" "bash $REPO/tools/lab-infra/vf_setup.sh >/dev/null 2>&1" \
@@ -51,7 +51,7 @@ wait
 for n in "${NODES[@]}"; do set -- $n; on_host "$1" 'sudo modprobe tcp_bbr 2>/dev/null; true' & done
 wait
 
-echo "== 2/6 TCP EDT (fq + BPF) on every host =="
+echo "== 2/7 TCP EDT (fq + BPF) on every host =="
 for n in "${NODES[@]}"; do
   set -- $n
   ( on_host "$1" "sudo bash $REPO/tools/host/edt_ensure.sh >/dev/null 2>&1 && bash $REPO/tools/host/edt_maps_ensure.sh >/dev/null 2>&1" \
@@ -59,7 +59,7 @@ for n in "${NODES[@]}"; do
 done
 wait
 
-echo "== 3/6 p1 volatile state: ${LINE_GBPS}G, MTU 9000, underlay + telemetry IPs, PFC off =="
+echo "== 3/7 p1 volatile state: ${LINE_GBPS}G, MTU 9000, underlay + telemetry IPs, PFC off =="
 for n in "${NODES[@]}"; do
   set -- $n
   ( ssh -o BatchMode=yes "$2" "
@@ -85,7 +85,7 @@ for a in "${NODES[@]}"; do
 done
 wait
 
-echo "== 4/6 host services + the vport meter =="
+echo "== 4/7 host services + the vport meter =="
 for n in "${NODES[@]}"; do
   set -- $n
   # the shim re-seeds pair_state on startup, so it must follow the EDT re-apply
@@ -104,10 +104,18 @@ wait
 # at 115: the whole lab looks alive, pings between VFs fail, and nothing in the
 # overlay's own output says why (2026-09-10, after a switch to plain). So they
 # are re-asserted here, next to everything else the reset makes volatile.
-echo "== 5/6 per-VF meters (the overlay's rules reference them) =="
+echo "== 5/7 per-VF meters (the overlay's rules reference them) =="
 bash "$REPO/tools/lab-infra/vf_caps.sh" meter-on 2>&1 | sed 's/^/  /'
 
-echo "== 6/6 sanity =="
+# The DPUs have no time source of their own; their clocks are slaved to the
+# hosts by a transient unit that does not survive an Arm reboot. Left alone
+# after a reboot, a DPU drifts by seconds (16 s on hpft-dpu, 2026-09-10) and
+# every analysis that lines its records up against the host's clock reads
+# the wrong window - the run looks like the sender measuring itself at zero.
+echo "== 6/7 DPU clocks (SNTP over tmfifo) =="
+bash "$REPO/tools/lab-infra/dpu_time_sync.sh" apply 2>&1 | sed 's/^/  /' | tail -4
+
+echo "== 7/7 sanity =="
 for n in "${NODES[@]}"; do
   set -- $n
   sp=$(ssh -o BatchMode=yes "$2" 'cat /sys/class/net/p1/speed 2>/dev/null')

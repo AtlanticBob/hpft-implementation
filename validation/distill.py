@@ -543,6 +543,59 @@ def main(tag):
         gp[k] = g
         if g is None or g <= 0:
             health_fail.append(f"row {k} {r['fsid']}: {err or 'zero goodput'}")
+    # ---- health: does each sender see what the receiver sees? ----
+    # The sender's record carries, per flow set, the attribution the receiver
+    # fed back (r) and the sender's own measurement of its sending (As, from
+    # its DPU's vport meter). Both should agree with the receiver's ledger.
+    # When a sender's DPU is wedged (2026-09-10: a vport meter reading zero
+    # after the executor had been killed with -9; a feedback path that had
+    # gone quiet), the sender measures itself at zero, caps its own probe at
+    # the start value, reports "not sending" to the receiver, is judged a
+    # lender, and its share goes to its siblings - and BOTH executor laws then
+    # starve one flow set per VM, which looks exactly like a law defect. The
+    # fingerprint is a flow set the receiver attributes >1 G to while the
+    # sender's own 100 ms average of its sending (As, from its vport meter)
+    # sits below a tenth of it for most of the flow set's OWN scheduled window
+    # (its row's start to end, less the transient). The record's per-feedback
+    # r is not usable for this: for RDMA it reads zero in most samples of a
+    # healthy run too. The window is cut on the sender's clock against the
+    # host's t0, which only works because deploy_check refuses to run the lab
+    # with a DPU more than 0.5 s off the host (a DPU left unsynced after a
+    # reboot sat 16 s off on 2026-09-10 and read as exactly this fingerprint).
+    # Flagged here so the next person does not spend an afternoon on the
+    # executor.
+    set_win = {}
+    for r in rows:
+        if r["cls"] in ("rdma", "tcp"):
+            a0, b0 = r["start"] + STEADY_SKIP, r["end"] - STEADY_TAIL
+            if b0 > a0:
+                set_win.setdefault(r["fsid"], []).append((a0, b0))
+    attr_mean = {}
+    for _ph, _f, _e, _m, _sd in flow_rows:
+        attr_mean[_f] = max(attr_mean.get(_f, 0.0), _m * 1e9)   # the best phase: absent flow sets read 0
+    for sh in sorted({r["host"] for r in rows if r["cls"] in ("rdma", "tcp")}):
+        p = os.path.join(R, f"tx_{sh}.jsonl")
+        if not os.path.exists(p):
+            continue
+        seen = {}
+        for line in open(p):
+            try:
+                x = json.loads(line)
+            except Exception:
+                continue
+            f = x.get("fs"); t = x.get("ts", 0) - z
+            if not f or not any(a0 <= t <= b0 for a0, b0 in set_win.get(f, [])):
+                continue
+            seen.setdefault(f, []).append((float(x.get("r", 0)), float(x.get("As", 0))))
+        for f, v in seen.items():
+            rx_mean = attr_mean.get(f)
+            if rx_mean is None or rx_mean < 1e9 or len(v) < 20:
+                continue
+            low = sum(1 for r_, a_ in v if a_ < 0.1 * rx_mean)
+            if low > 0.5 * len(v):
+                health_fail.append(f"{sh}: {f} receiver attributes {rx_mean/1e9:.2f} G but the sender measures "
+                                   f"itself below a tenth of it in {100*low//len(v)}% of the window "
+                                   f"(wedged DPU: its vport meter reads zero; reboot its Arm)")
     # ---- the RDMA executor's own account (rp_<host>.jsonl, 1 s per flow set) ----
     # Design 6.4, properties 1 and 2, read at the executor: the sum of the
     # paced rates of a flow set's QPs never exceeds its R, and when the CC

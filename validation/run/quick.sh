@@ -14,8 +14,9 @@
 # env:
 #   ALGO=2|3        tenant RDMA CC (2 DCQCN, 3 Swift), default 2
 #   CC_ONLY=0|1     run the tenant CC alone, HyperFront ignored
-#   LAW=0|1|2       0 token pool (default): r_i = min(c_i, (R + pool)/N)
+#   LAW=0|1|2|3     0 proportional pool (default): r_i = min(c_i, c_i (R + pool)/sum c_j)
 #                   1 equal cap: r_i = min(c_i, R/N)   2 equal split ignoring the CC: R/N
+#                   3 equal-cap pool: r_i = min(c_i, (R + pool)/N)  (the default until 2026-09-10)
 #   AGENTS=0|1      keep the HyperFront agents running (default 1)
 #   TCP_CC=cubic    TCP congestion control
 #   RDMA_MTU=4096   perftest -m (4096 is the lab default and needs VF and

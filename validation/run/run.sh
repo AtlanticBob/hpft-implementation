@@ -228,8 +228,8 @@ meter_set() { # $1 = destination host, $2 = destination VF index, $3 = kbps
 #   (default), 3 = Swift. A flow table whose rdma rows carry rdma_cc=swift
 #   selects 3 by itself. Selecting one resets every QP's CC state on the
 #   device, so it is written before any flow starts.
-# HPFT_LAW: the executor's law (0xcce <n> 22): 0 = the token pool (default), 3 = the
-#   proportional pool r_i = min(c_i, c_i (R + pool)/sum c_j) under test (2026-09-10),
+# HPFT_LAW: the executor's law (0xcce <n> 22): 0 = the proportional pool (default,
+#   design 6.1: r_i = min(c_i, c_i (R + pool)/sum c_j)); 3 = the equal-cap pool,
 #   r_i = min(c_i, (R + pool)/N); 1 = equal cap min(c_i, R/N); 2 = equal
 #   split R/N ignoring the CC. 1 and 2 are the ablation arms of design 6.
 # HPFT_CC_ONLY=1: the tenant CC alone, HyperFront out of the picture: the
@@ -311,7 +311,7 @@ if [ "$ARM" = baseline ]; then
   echo "arm: baseline - no HyperFront (agents not started, no budget pushed, executor untouched)" | tee "$OUT/arm.txt"
   [ -n "$TCLASS" ] && echo "rdma traffic class: --tclass=$TCLASS (switch TC3)" | tee -a "$OUT/arm.txt"
 else
-  echo "rdma executor: cc algo = $CCALGO (2 DCQCN, 3 Swift); law = $LAW (0 token pool, 1 equal cap, 2 equal split, 3 proportional pool); cc-only arm = $CCONLY; knobs = ${RPKNOBS:-default}" | tee "$OUT/arm.txt"
+  echo "rdma executor: cc algo = $CCALGO (2 DCQCN, 3 Swift); law = $LAW (0 proportional pool, 1 equal cap, 2 equal split, 3 equal-cap pool); cc-only arm = $CCONLY; knobs = ${RPKNOBS:-default}" | tee "$OUT/arm.txt"
 fi
 # The RoCE path MTU decides the port's goodput ceiling and the ledger's
 # wire-to-application factor, so the run records what it actually asked for

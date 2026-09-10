@@ -16,30 +16,43 @@
  * one class); the sender agent writes the flow set's rate R into
  * hpft_pair_cfg. The tenant's congestion control is per CONNECTION and
  * this program never touches it. The flow set is capped at R and R is
- * split among its connections IN PROPORTION TO THEIR WINDOWS (design v4
- * section 6.1, the TCP rule): a window CC sends at cwnd/RTT, and all
- * connections of a set share one path and one RTT, so
+ * split among its connections by the ONE rule both executors use (design
+ * v4 section 6.1): each connection gets the share of the set's allowance
+ * that its own congestion-control quota is of the sum of the quotas,
  *
- *      r_i = R * w_i / sum_j w_j       (j over connections that sent)
+ *      r_i = c_i * (R + P/T) / sum_j c_j
  *
- * with w_i = snd_cwnd * mss read from the socket on the way past. This is
- * the counterpart of the RDMA executor's token pool; it can use a sum
- * across connections because the pair's spin lock makes the sum
- * consistent, which the DPA cannot offer. A connection never exceeds its
- * own CC (it cannot put more than cwnd in flight), so nothing here raises
- * anyone; HyperFront only caps the set.
+ * where P is the set's pool (bytes; the integral of R minus what the set
+ * was allowed to send, bounded to a quarter of a millisecond of R either
+ * way) and T is one millisecond. All connections of a set share one path
+ * and one RTT, so the quotas are proportional to the windows, and the
+ * windows w_i = snd_cwnd * mss, read from the socket on the way past, are
+ * what stands in for c_i. A connection never exceeds its own CC (it cannot
+ * put more than cwnd in flight), so nothing here raises anyone; HyperFront
+ * only caps the set.
+ *
+ * NOTHING ON THE PACKET PATH TAKES A LOCK. The earlier version summed the
+ * windows under a per-set spin lock, which is a lock every connection of
+ * the set contends for on every packet and does not scale to a VPC's worth
+ * of connections. The sum is now what it is on the DPA: each connection
+ * adds its window into the set's running sum ONCE PER EPOCH (an atomic
+ * add), and the sum an epoch ends with is the divisor for the next one -
+ * so the divisor is up to an epoch stale, and the pool is what makes that
+ * harmless. If the divisor is off by a factor k the set sends R/k, the
+ * pool moves, and it settles exactly where (R + P/T)/sum equals R over the
+ * true sum: the k cancels and every connection lands on c_i R / sum c_j.
+ * The pool itself is a per-packet atomic subtract (the connection pays for
+ * the stretch it has just covered, at the rate it was paced) and a refill
+ * that whichever packet wins a compare-and-swap on the refill clock adds
+ * for the stretch since the last refill. The epoch roll is one
+ * compare-and-swap on the epoch clock, so exactly one packet rolls it and
+ * clamps the pool there. What a lost race can cost is bounded by one
+ * epoch of one connection's charges, and the pool's own bound covers it.
  *
  * Each connection has its own earliest-departure clock. That is what
  * makes r_i a per-connection quantity on the wire, and it is also what
  * keeps one connection's shaping debt from becoming another's delay or
- * loss. The sum over the set is bounded by R by construction (over one
- * epoch; within an epoch the numerators are current and the denominator
- * is the previous epoch's).
- *
- * The denominator is rebuilt every epoch (10 ms, one HyperFront period)
- * from the connections that actually sent in the previous epoch, so a
- * connection that stops sending drops out of the split by itself; there
- * is no member list to maintain and nothing to compact.
+ * loss.
  * ====================================================================== */
 
 #define HPFT_MAX_VNICS 4096
@@ -54,8 +67,12 @@
  * it is per connection, so a deep-debt bulk connection only ever drops its
  * own packets. Design v4 6.3 lists it as the TCP executor's boundary. */
 #define HPFT_DEBT_CAP_NS (200ULL * 1000 * 1000)
-/* One epoch of the flow set's denominator: one HyperFront period. */
-#define HPFT_EPOCH_NS 10000000ULL
+/* One epoch of the flow set's denominator and of its pool bookkeeping: a
+ * millisecond, the same tick the RDMA executor runs on. The pool is bounded
+ * to a quarter of it, so the epoch must not be much longer than the
+ * bound: a refill that arrives once per epoch against a pool a quarter of
+ * an epoch deep would pin the pool at its floor for most of every epoch. */
+#define HPFT_EPOCH_NS 1000000ULL
 /* A connection with no readable socket (no tcp_sock on the skb) has no
  * window to speak of: it is shaped at an equal share of R over the
  * connections seen last epoch, never at R itself. */
@@ -76,28 +93,34 @@ struct hpft_rate_cfg {
     __u32 flags;
 };
 
-/* per flow set: the denominator of the distribution law, rebuilt once per
- * epoch from what the connections reported during the previous one */
+/* per flow set: the divisor of the law, rebuilt once per epoch from what the
+ * connections reported during the previous one, and the pool. No lock: the
+ * two clocks are advanced by compare-and-swap, the sums by atomic add, the
+ * pool by atomic subtract. Layout is mirrored by tcp_shaper_lib.pack_pair_state. */
 struct hpft_pair_state {
-    struct bpf_spin_lock lock;
-    __u32 epoch;        /* epoch counter; a connection reports once per */
-    __u64 epoch_ns;     /* start of the current epoch */
-    __u64 sum_cur;      /* sum of trends reported in this epoch */
-    __u64 sum_prev;     /* sum of trends of the previous epoch: the divisor */
-    __u32 n_cur;        /* connections reported in this epoch */
-    __u32 n_prev;       /* connections in the previous epoch */
+    __u64 epoch_ns;     /* start of the current epoch; CAS-rolled */
+    __u64 tok_ns;       /* when the pool was last refilled; CAS-advanced */
+    __u64 sum_cur;      /* windows reported in this epoch (atomic add) */
+    __u64 sum_prev;     /* windows reported in the previous epoch: the divisor */
+    __s64 tok;          /* the pool, bytes; charged per packet, refilled per packet, clamped per epoch */
     __u64 generation;   /* cfg generation last seen (diag) */
+    __u32 epoch;        /* epoch counter; a connection reports once per */
+    __u32 n_cur;        /* connections reported in this epoch (atomic add) */
+    __u32 n_prev;       /* connections in the previous epoch */
     __u32 shots;        /* packets dropped at a connection's debt cap (diag) */
     __u32 nosock;       /* packets that carried no tcp_sock (diag) */
+    __u32 pad0;
     __u64 reserved;
 };
 
-/* per connection (5-tuple): its own clock and its own trend */
+/* per connection (5-tuple): its own clock, its own window, and the rate it
+ * was last paced at, which is what it pays the pool at */
 struct hpft_flow_state {
     __u64 last_send_ns;
     __u64 next_ns;      /* this connection's earliest-departure clock */
     __u64 win;          /* last window read: snd_cwnd * mss */
     __u64 win_ep;       /* the window this connection reported this epoch */
+    __u64 paced;        /* r_i last written, bit/s */
     __u32 epoch_seen;   /* pair epoch this connection last reported in */
     __u32 pad0;
 };
@@ -201,9 +224,9 @@ int hpft_tcp_edt(struct __sk_buff *skb)
     __u32 src_idx = 0;
     __u32 ifindex;
     __u64 pair_key, flow_key;
-    __u64 now, wire, win = 0, num, sum, R, r_i;
+    __u64 now, wire, win = 0, R, r_i;
     __u64 send_ns, next_ns, burst_ns, min_next_ns, packet_ns;
-    __u32 n_prev, have_tp = 0;
+    __u32 have_tp = 0;
 
     if (!hpft_parse_ipv4_tcp(skb, &iph))
         return TC_ACT_OK;
@@ -279,6 +302,7 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         fs_new.next_ns = now;
         fs_new.win = win;
         fs_new.win_ep = win;
+        fs_new.paced = 0;
         fs_new.epoch_seen = 0xffffffffU;
         fs_new.pad0 = 0;
         bpf_map_update_elem(&hpft_flow_state_map, &flow_key, &fs_new, BPF_ANY);
@@ -286,66 +310,137 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         if (!fs)
             return TC_ACT_OK;
     }
-    fs->last_send_ns = now;
-    if (have_tp)
-        fs->win = win;
-    else
-        win = fs->win;
+    {
+        __u64 prev_send = fs->last_send_ns;
 
-    /* Step 2: the flow set's denominator, and this connection's share of
-     * R. Under the pair's lock: the epoch roll and the per-epoch report. */
-    bpf_spin_lock(&state->lock);
-    if (now - state->epoch_ns >= HPFT_EPOCH_NS) {
-        if (now - state->epoch_ns >= 2 * HPFT_EPOCH_NS) {
-            /* the whole set was quiet for an epoch: nobody reported */
-            state->sum_prev = 0;
-            state->n_prev = 0;
-        } else {
-            state->sum_prev = state->sum_cur;
-            state->n_prev = state->n_cur;
+        fs->last_send_ns = now;
+        if (have_tp)
+            fs->win = win;
+        else
+            win = fs->win;
+
+        R = cfg->rate_bps;
+        {
+            /* Step 2: the set's bookkeeping, all lock-free.
+             *
+             * 2a. The epoch roll: exactly one packet per epoch wins the
+             * compare-and-swap on the epoch clock and does the bookkeeping
+             * of the boundary - the sum this epoch ends with becomes the
+             * divisor, the counters restart, and the pool is clamped to
+             * its bound. */
+            __u64 ep_ns = state->epoch_ns;
+            __s64 depth = (__s64)((R * (HPFT_EPOCH_NS / 4)) / (8ULL * HPFT_NSEC_PER_SEC));
+
+            if (now - ep_ns >= HPFT_EPOCH_NS &&
+                __sync_val_compare_and_swap(&state->epoch_ns, ep_ns, now) == ep_ns) {
+                __s64 t;
+
+                if (now - ep_ns >= 2 * HPFT_EPOCH_NS) {
+                    /* the whole set was quiet for an epoch: nobody reported */
+                    state->sum_prev = 0;
+                    state->n_prev = 0;
+                } else {
+                    state->sum_prev = state->sum_cur;
+                    state->n_prev = state->n_cur;
+                }
+                state->sum_cur = 0;
+                state->n_cur = 0;
+                state->epoch++;
+                t = state->tok;
+                if (t > depth)
+                    state->tok = depth;
+                else if (t < -depth)
+                    state->tok = -depth;
+            }
+            if (!have_tp)
+                __sync_fetch_and_add(&state->nosock, 1);
+            state->generation = cfg->generation;
+
+            /* 2b. Once per epoch, this connection adds its window into the
+             * running sum. One atomic add per connection per epoch, not per
+             * packet. */
+            if (have_tp && fs->epoch_seen != state->epoch) {
+                __u64 t = win ? win : 1;
+
+                fs->win_ep = t;
+                fs->epoch_seen = state->epoch;
+                __sync_fetch_and_add(&state->sum_cur, t);
+                __sync_fetch_and_add(&state->n_cur, 1);
+            }
+
+            /* 2c. The pool. Refill at R for the stretch since the last
+             * refill (whoever wins the swap on the refill clock adds it),
+             * then this connection pays for the stretch since its own last
+             * packet at the rate it was paced over it; a connection that
+             * was away longer than an epoch pays for an epoch, not for the
+             * time it was not on the wire. */
+            {
+                __u64 tk_ns = state->tok_ns;
+                __u64 dt = now - tk_ns;
+
+                if (dt > HPFT_EPOCH_NS)
+                    dt = HPFT_EPOCH_NS;
+                if (now > tk_ns &&
+                    __sync_val_compare_and_swap(&state->tok_ns, tk_ns, now) == tk_ns)
+                    __sync_fetch_and_add(&state->tok, (__s64)((R * dt) / (8ULL * HPFT_NSEC_PER_SEC)));
+            }
+            {
+                __u64 dq = now - prev_send;
+
+                if (dq > HPFT_EPOCH_NS)
+                    dq = HPFT_EPOCH_NS;
+                if (fs->paced)
+                    __sync_fetch_and_sub(&state->tok, (__s64)((fs->paced * dq) / (8ULL * HPFT_NSEC_PER_SEC)));
+            }
+
+            /* 2d. This connection's ceiling: its window's share of the
+             * set's allowance, the allowance being R plus the pool spread
+             * over one epoch. The stored pool may drift past the bound
+             * between two rolls; the bound is applied on the read as well. */
+            {
+                __s64 t = state->tok;
+                __u64 allow, sum, num;
+
+                if (t > depth)
+                    t = depth;
+                else if (t < -depth)
+                    t = -depth;
+                allow = R;
+                if (t >= 0)
+                    allow += ((__u64)t * 8ULL * HPFT_NSEC_PER_SEC) / HPFT_EPOCH_NS;
+                else {
+                    __u64 debt = ((__u64)(-t) * 8ULL * HPFT_NSEC_PER_SEC) / HPFT_EPOCH_NS;
+
+                    allow = allow > debt ? allow - debt : 0;
+                }
+                sum = state->sum_prev;
+                num = fs->win_ep;
+                if (!have_tp || !sum || !num) {
+                    /* no divisor yet (first epoch of the set), or no window
+                     * to read: an equal share over the connections seen
+                     * last epoch */
+                    __u32 n = state->n_prev ? state->n_prev : 1;
+
+                    r_i = allow / n;
+                } else {
+                    /* allow * num / sum without overflow: windows are < 2^32,
+                     * so scale the ratio to 2^20 first; a window that grew
+                     * past the whole previous sum still gets at most the
+                     * whole allowance */
+                    __u64 ratio = (num << 20) / sum;
+
+                    if (ratio > (1ULL << 20))
+                        ratio = 1ULL << 20;
+                    r_i = (allow >> 10) * ratio >> 10;
+                }
+            }
         }
-        state->sum_cur = 0;
-        state->n_cur = 0;
-        state->epoch++;
-        state->epoch_ns = now;
-    }
-    if (!have_tp)
-        state->nosock++;
-    state->generation = cfg->generation;
-    if (have_tp && fs->epoch_seen != state->epoch) {
-        /* once per epoch: report this connection's window into the sum */
-        __u64 t = win ? win : 1;
-
-        fs->win_ep = t;
-        fs->epoch_seen = state->epoch;
-        state->sum_cur += t;
-        state->n_cur++;
-    }
-    sum = state->sum_prev;
-    n_prev = state->n_prev;
-    bpf_spin_unlock(&state->lock);
-
-    R = cfg->rate_bps;
-    num = fs->win_ep;                        /* w_i as reported this epoch */
-    if (!have_tp || !sum || !num) {
-        /* no denominator yet (first epoch of the set), or no window to
-         * read: an equal share over the connections seen last epoch */
-        __u32 n = n_prev ? n_prev : 1;
-
-        r_i = R / n;
-    } else {
-        /* R * num / sum without overflow: windows are < 2^32, so scale
-         * the ratio to 2^20 first */
-        __u64 ratio = (num << 20) / sum;
-
-        if (ratio > (1ULL << 20))
-            ratio = 1ULL << 20;
-        r_i = (R >> 10) * ratio >> 10;
     }
     if (r_i > R)
         r_i = R;
     if (!r_i)
         r_i = 1;
+    fs->paced = r_i;
 
     /* Step 3: shape this connection to r_i on its own clock. A connection
      * that was idle may send burst_bytes at once (its clock is allowed to

@@ -371,6 +371,28 @@ for f in $HOSTS; do
     || { echo "  DIFFERS  $f: $badmtu (want $WANT_MTU)"; bad=1; }
 done
 
+# ---- clocks: a DPU seconds off the host makes every timeline a lie --------
+# Records from the agents and the executor sampler carry the DPU's wall clock
+# and are lined up against the host's t0. The DPUs' clocks are slaved to the
+# hosts over tmfifo by a transient unit (lab-infra/dpu_time_sync.sh) that an
+# Arm reboot kills; a DPU left unsynced drifts by seconds, and a window cut on
+# the host's clock then falls on the wrong stretch of that DPU's records
+# (2026-09-10: 16 s on hpft-dpu, read as "the sender measures itself at zero"
+# for most of a run that was in fact fine).
+echo "== DPU clock offsets (want within 0.5 s of the host) =="
+for n in $NODES; do
+  # bracket each ssh with the host clock and compare against the midpoint,
+  # so the ssh round trip (~0.5 s) is not read as an offset
+  T1=$(date +%s.%N); r=$(ssh -o BatchMode=yes "$n" 'date +%s.%N' 2>/dev/null); T2=$(date +%s.%N)
+  off=$(awk -v a="$T1" -v b="$T2" -v d="$r" 'BEGIN{ if (d=="") exit 1; printf "%.3f", d-(a+b)/2 }')
+  if [ -z "$off" ]; then echo "  UNREACHABLE  $n"; bad=1; continue; fi
+  if awk -v o="$off" 'BEGIN{exit !(o>0.5 || o<-0.5)}'; then
+    echo "  DIFFERS  $n clock is ${off} s off the host (run tools/lab-infra/dpu_time_sync.sh apply)"; bad=1
+  else
+    echo "  ok       $n (${off} s)"
+  fi
+done
+
 if [ $bad -eq 0 ]; then
   if [ $warn -ne 0 ]; then
     echo "deploy_check: code OK on $(echo $NODES | wc -w) nodes, enabled agents healthy; see warnings above"

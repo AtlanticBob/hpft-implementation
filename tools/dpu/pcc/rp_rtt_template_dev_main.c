@@ -44,7 +44,7 @@
  * receiver's ledger set. Each QP pays the pool for the stretch it has just
  * covered at the rate it was pacing, and is then capped at
  *
- *      r_i = min(c_i, (R + pool) / N)
+ *      r_i = min(c_i, c_i * (R + pool) / sum_j c_j)
  *
  * with c_i its own CC's rate, the pool level folded into a rate over one
  * millisecond and bounded to a quarter of a millisecond of R, and N the
@@ -97,46 +97,46 @@ static volatile uint32_t g_cc_only;
  * same number for h = 8 %, four QPs (2^20 / 50 = 4 G on a 200 G port) and
  * only matters between an executor restart and the agent's first push. */
 static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE / 50u);
-/* 0xcce <n> 22: the law. 0 = the token pool (default); 1 = equal cap,
- * r_i = min(c_i, R/N), no sharing inside the set; 2 = equal split ignoring
- * the CC, r_i = R/N. 1 and 2 are the ablation arms. */
-#define HPFT_LAW_TOKEN  (0u)
+/* 0xcce <n> 22: the law. 0 = the proportional pool (the design, default);
+ * 1 = equal cap, r_i = min(c_i, R/N), no sharing inside the set; 2 = equal
+ * split ignoring the CC, r_i = R/N; 3 = the equal-cap pool that was the
+ * default until 2026-09-10, r_i = min(c_i, (R + pool)/N). 1, 2 and 3 are
+ * reference arms. */
+#define HPFT_LAW_POOL   (0u)
 #define HPFT_LAW_CAP    (1u)
 #define HPFT_LAW_EQUAL  (2u)
-/* 3 = the proportional pool (2026-09-10, under test as an arm): the same pool,
- * the same refill and the same payment, but the set's allowance is divided by
- * the SUM of its members' CC rates instead of by their count, and each QP gets
- * its own share of that sum:
- *   r_i = min(c_i, c_i * (R + pool) / sum_cc)
- * sum_cc is the sum the per-set epoch already keeps (sum c_j over the QPs
- * drawing), so no new arithmetic crosses QPs. That sum is up to a millisecond
- * stale, and the pool is what makes that harmless: if the sum is off by a
- * factor k the set sends R/k, the pool moves, and it settles exactly where
- * (R + pool)/sum_cc equals R over the true sum - the k cancels and every QP
- * ends at c_i * R / sum c_j, which is the design's formula. The pool depth
- * bounds how far a stale sum can be corrected (a quarter of a period of R,
- * so +-25 % of R); beyond that the correction saturates. */
-#define HPFT_LAW_PROP   (3u)
-/* The flow set owns a pool of bytes refilled at R; a QP may send at its own
- * CC's rate as long as the pool can pay for it. Nothing here needs sum c_j:
- * the volatile quantity - each QP's rate, which a delay-based CC changes
- * every round trip - never enters an arithmetic that has to be consistent
- * across the set. What the grant does need is how MANY QPs are drawing, and
- * that is a count the epoch already keeps and that does not move every round
- * trip.
- *   ceiling = (R + whatever the pool has saved up) / nlive
- *   r_i     = min(c_i, ceiling)
- * A QP that wants less than its equal share simply leaves bytes in the
- * pool, and every QP's ceiling rises by its share of them - the
- * redistribution happens inside the same millisecond instead of one epoch
- * later. The pool is refilled at R and charged by what was ALLOWED: each
- * QP pays the pool for the interval it has just covered at the rate it was
- * pacing, so the pool holds the integral of R minus what the set was
- * allowed to send, and a ceiling
- * derived from it is a plain integral controller with no gain to choose.
- * The depth, a quarter of a millisecond of R, bounds the burst a set may
- * take after an idle stretch. */
-static volatile uint32_t g_law = HPFT_LAW_TOKEN;
+#define HPFT_LAW_EQPOOL (3u)
+/* The flow set owns a pool of bytes refilled at R and charged by what was
+ * ALLOWED: each QP pays the pool for the interval it has just covered at the
+ * rate it was pacing, so the pool holds the integral of R minus what the set
+ * was allowed to send, bounded to a quarter of a period of R either way. The
+ * set's allowance in any millisecond is R plus the pool, and design 6.1
+ * divides it among the members in proportion to their own CC rates:
+ *
+ *   r_i = min(c_i, c_i * (R + pool) / sum_j c_j)
+ *
+ * sum_j c_j is the sum the per-set epoch already keeps (sum_cc, over the QPs
+ * drawing in the last millisecond), so nothing here needs a sum that is
+ * consistent at an instant: the sum is up to a millisecond stale, and the
+ * pool is what makes that harmless. If the sum is off by a factor k the set
+ * sends R/k, the pool moves, and it settles exactly where (R + pool)/sum_cc
+ * equals R over the true sum - the k cancels and every QP ends at
+ * c_i R / sum c_j, the design's formula. The pool depth bounds how far a
+ * stale sum can be corrected (+-25 % of R); beyond that the correction
+ * saturates and the shaped sum wanders by the rest until the sum catches
+ * up, which is the scatter criterion 6 measures.
+ *
+ * Why the sum is safe to use here when the division law of 2026-09-09 was
+ * not: that law had no pool. It divided by the same stale sum and had
+ * nothing to correct the error, so the error stayed for as long as the sum
+ * did. A ceiling derived from the pool is a plain integral controller with
+ * no gain to choose; the sum only sets where it starts.
+ *
+ * On a managed port every QP's CC rate sits at line rate (the port is kept
+ * below the point where the CC sees anything), so the proportional split
+ * and the equal split coincide there; they differ where the CC rates do,
+ * which is exactly where the design wants the CC's own division kept. */
+static volatile uint32_t g_law = HPFT_LAW_POOL;
 /* a QP that sent within this long is drawing tokens (0xcce <us> 24);
  * ablation knob, 1 ms is the design point */
 static volatile uint32_t g_active_us = 1000u;
@@ -930,8 +930,8 @@ static inline void hpft_pool_refill(volatile hpft_set_t *s, uint32_t now)
 	s->tok = (int32_t)v;
 }
 
-/* What one QP may send: its equal share of R, plus whatever the pool has
- * spare. The pool carries the outstanding reservations of every QP in the
+/* The equal-cap pool (reference arm 3): what one QP may send is its equal
+ * share of R, plus whatever the pool has spare. The pool carries the outstanding reservations of every QP in the
  * set (each reserves the bytes its current rate will send before its next
  * event, and gets refunded what the wire did not carry), so "spare" means
  * the set as a whole is under its budget - which is the only condition under
@@ -1255,7 +1255,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			hpft_set_epoch(s, now, (uint32_t)si);
 			R = s->budget;
 			n = s->nlive ? s->nlive : (s->nq ? s->nq : 1u);
-			if (g_law == HPFT_LAW_TOKEN || g_law == HPFT_LAW_PROP) {
+			if (g_law == HPFT_LAW_POOL || g_law == HPFT_LAW_EQPOOL) {
 				uint32_t ceil_, dt;
 
 				hpft_pool_refill(s, now);
@@ -1278,7 +1278,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				q->tok_ts = now;
 				s->tok -= (int32_t)(((int64_t)q->paced *
 						     HPFT_LINE_B_PER_US * dt) >> 20);
-				if (g_law == HPFT_LAW_PROP) {
+				if (g_law == HPFT_LAW_POOL) {
 					/* this QP's share of the set's allowance,
 					 * in proportion to its own CC rate */
 					int64_t bonus = ((int64_t)s->tok << 20) /
@@ -1415,7 +1415,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 18) g_dq_bytes = budget ? budget : 1u;
 			else if (which == 19) g_dq_monitor_us = budget;
 			else if (which == 21) g_unknown_rate = budget ? budget : DOCA_PCC_DEV_MAX_RATE;
-			else if (which == 22) g_law = budget > 3u ? HPFT_LAW_TOKEN : budget;
+			else if (which == 22) g_law = budget > 3u ? HPFT_LAW_POOL : budget;
 			else if (which == 24) g_active_us = budget ? budget : 1000u;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
