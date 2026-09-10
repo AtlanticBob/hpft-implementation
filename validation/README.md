@@ -23,7 +23,7 @@ V1、V2、V4 是每一版设计必跑的三个；V3、V5、V6 在它们过了之
 
 ## 二、共同环境（除非某个场景明确覆盖）
 
-四台主机经 sn5600 互打，四台的 p1 都是 200 G，任何一台都能收也能发（`roles.sh all`），每行打流自带目的主机；V1–V7 是三台打 sgpu02，接收端口 `swp37s0` 是 3:1 超订的瓶颈。sn5600 的常设形态是一台交换机（四个主机口都在 VLAN 100，回环口关着）；V8 需要时按 `run/campaign.sh` 里的步骤把它切成两台逻辑交换机，跑完切回：交换机 A（VLAN 101）接 sgpu01（`swp37s1`）和 sgpu03（`swp3s1`），交换机 B（VLAN 102）接 sgpu02（`swp37s0`）和 sgpu04（`swp4s1`），两台之间只有 `swp21`↔`swp25` 这一根线（出口整形 200 G，`split_core_speed.sh 200|400`，无 PFC）。A 侧打 B 侧的流量都过这根线：单接收端时它与接收端口等粗、不绑定；B 侧两台都收时（V8）它是唯一的瓶颈，是接收端账本管不到的核心链路（设计第 8 节）；端口表、配置脚本与备份在 `tools/lab-infra/switch/`。六个口的 QoS 统一（`set_qos.sh`）：ECN 配置 `hpft_ecn`，K_min 800 KB、K_max 3200 KB、P_max 20%；出向队列门限 `alpha_1`，一个拥塞队列最多占 70.47 MB 共享池的一半、35.2 MB。全部流量走 traffic-class 0，RDMA 和 TCP 落在同一个出向队列、共享同一块缓冲。数据面是常驻 VxLAN overlay、静态全网状：每台 DPU 到其它三台各一条隧道，转发规则由注册表生成，`tos=inherit`；底层是 DPU 的 p1（172.16.1.x，MTU 9000）。租户 = 接收主机的一个 VF；流集合 = (源 VM, 目的 VM, 类)。
+四台主机经 sn5600 互打，四台的 p1 都是 200 G，任何一台都能收也能发（`roles.sh all`），每行打流自带目的主机；V1–V7 是三台打 sgpu02，接收端口 `swp37s0` 是 3:1 超订的瓶颈。sn5600 的常设形态是一台交换机（四个主机口都在 VLAN 100，回环口关着）；V8 需要时按 `run/campaign.sh` 里的步骤把它切成两台逻辑交换机，跑完切回：交换机 A（VLAN 101）接 sgpu01（`swp37s1`）和 sgpu03（`swp3s1`），交换机 B（VLAN 102）接 sgpu02（`swp37s0`）和 sgpu04（`swp4s1`），两台之间只有 `swp21`↔`swp25` 这一根线（出口整形 200 G，`split_core_speed.sh 200|400`，无 PFC）。A 侧打 B 侧的流量都过这根线：单接收端时它与接收端口等粗、不绑定；B 侧两台都收时（V8）它是唯一的瓶颈，是接收端账本管不到的核心链路（设计第 8 节）；端口表、配置脚本与备份在 `tools/lab-infra/switch/`。六个口的 QoS 统一（`set_qos.sh`）：ECN 配置 `hpft_ecn`，K_min 800 KB、K_max 3200 KB、P_max 20%；出向队列是**固定字节数**而不是动态阈值（`set_qos.sh apply notc|tc`）：不开流量类时 TC0 拿 32 MB，开的时候 TC0 与 TC3 各拿 16 MB，一个拥塞端口两种形态下拿到的总量相同。验证套件全部流量走 traffic-class 0，RDMA 和 TCP 落在同一个出向队列、共享同一块缓冲。数据面是常驻 VxLAN overlay、静态全网状：每台 DPU 到其它三台各一条隧道，转发规则由注册表生成，`tos=inherit`；底层是 DPU 的 p1（172.16.1.x，MTU 9000）。租户 = 接收主机的一个 VF；流集合 = (源 VM, 目的 VM, 类)。
 
 | 项 | 取值 |
 |---|---|
@@ -32,14 +32,14 @@ V1、V2、V4 是每一版设计必跑的三个；V3、V5、V6 在它们过了之
 | 每 VF 带宽上限 | 每台 8 个 VF、每个 VF 50 G（发送端 devlink tx_max + 接收端 OVS drop meter，`vf_caps.sh sync`） |
 | HyperFront | 四台都在 `lab_env.sh hpft` 态：UPCC=1，四台 DPU 跑本仓库的 PCC 执行面（`tools/dpu/pcc/rp_rtt_template_dev_main.c`）；TCP 执行面 host fq+EDT，每个 VF 恰好挂一份当前程序（`tools/host/edt_reinstall.sh`） |
 | 被测对象 | 账本：`config/lab-registry.json` 的 `e_params`，每次运行原样记入报告。执行面：令牌池（`0xcce 0 22`，缺省）；消融臂 `HPFT_LAW=1`（等额封顶）、`HPFT_LAW=2`（等分）、`HPFT_CC_ONLY=1`（拥塞控制单独，发送端代理停掉、TCP 速率表清空），当次的臂记在 `results/<tag>/arm.txt` |
-| 政策 | 每个 VM 权重 1、`max_rate_bps` 50 G、类权重 tcp:rdma = 1:1、per-sender 权重全 1；headroom 8% 只作用在根上：根容量 C′ = 200 × 0.92 = 184 G，每 VM 上限就是 50 G（四个 VM 同时满发时根先绑定，各得 46 G） |
+| 政策 | 每个 VM 权重 1、`max_rate_bps` 50 G、类权重 tcp:rdma = 1:1、per-sender 权重全 1；余量 6% 只作用在根上：根容量 C′ = 200 × 0.94 = 188 G，每 VM 上限就是 50 G（四个 VM 同时满发时根先绑定，各得 47 G） |
 | RDMA 拥塞控制 | 执行面里逐 QP 运行的租户拥塞控制，邮箱 `0xccd` 选：**2 = DCQCN**（固件参数，丢包后重置目标速率）、**3 = Swift**（目标 25 µs，参数见 `tools/dpu/pcc/README.md`）；缺省 2，`HPFT_RDMA_CC_ALGO=3` 或打流表里的 `rdma_cc=swift` 选 Swift。这是 PCC 里 DCQCN 与 Swift 的唯一版本；原厂二进制是固件拥塞控制，不用 |
 | RDMA 重传 | SR，所有 HPFT 实验一律如此。机制是 ROCE_ACCL 寄存器 `selective_repeat_forced_en=1`，`cc_mode.sh sr` 秒切，易失（fw reset 或 Arm 重启后归零）。`run.sh` 开跑前逐台读这个寄存器，不是 1 就中止，并把实测值写进 `results/<tag>/retrans_mode.txt`。不要看状态行里的 `SR current=`：那读的是 mlxconfig 的另一个开关，本 lab 永远是 0 |
 | TCP 拥塞控制 | Cubic，不开 ECN（`tcp_ecn=2`）；V6 换 BBR |
-| MTU | VF 1500，p1 9000；RoCE 路径 MTU 1024（perftest 两端 `-m 1024`）。1024 B 报文的头部开销让 RDMA 净荷 = 内层线上字节 ÷ 1.073；VxLAN 再加 5%，所以 200 G 端口上受管流量的净荷上限约 177 G |
+| MTU | VF、representor 与 overlay 桥都是 4200（注册表 `vf_mtu`），p1 9000；RoCE 路径 MTU 4096（perftest 两端 `-m 4096`，`RDMA_MTU` 可改）。4096 B 报文的头部开销让 RDMA 净荷 = 内层线上字节 ÷ 1.017；VxLAN 再加约 1.2%，所以 200 G 端口上受管流量的净荷上限约 190 G |
 | 交换机 ECN | 六个口都绑 `hpft_ecn`（TC0 K_min 800 KB / K_max 3.2 MB / P_max 20%）；标记数记入报告作旁证，读法见 §三 |
 | 交换机 PFC 与 pause | lossy：四个 host 口绑 `motiv-nopfc`，pause 关 |
-| 打流器 | RDMA `~/hyperfront/perftest-enhanced/ib_write_bw`（带 `--start_at`，四台同一份二进制），`-q 4 -m 1024 --report_gbits -D`；TCP 系统 iperf3（3.20 + 本地 `--start-at` 补丁，源码在 `~/hyperfront/iperf320`，四台已装），`-P 4 --start-at <绝对时刻> -J -B <ip>%dpu1vfN`。perftest 的控制连接走管理网（目的主机名），不走 VF：连 VF 的 IP 会让那条空闲连接被接收端算作在场的 TCP 流集合 |
+| 打流器 | RDMA `~/hyperfront/perftest-enhanced/ib_write_bw`（带 `--start_at`，四台同一份二进制），`-q 4 -m 4096 --report_gbits -D`；TCP 系统 iperf3（3.20 + 本地 `--start-at` 补丁，源码在 `~/hyperfront/iperf320`，四台已装），`-P 4 --start-at <绝对时刻> -J -B <ip>%dpu1vfN`。perftest 的控制连接走管理网（目的主机名），不走 VF：连 VF 的 IP 会让那条空闲连接被接收端算作在场的 TCP 流集合 |
 | 限速的 RDMA 行 | 两端都加 `-s 8192`。硬件限速被 QP 拒绝（PCC 执行面占着 QP 的速率），只能用 perftest 的软件限速，它按 `burst_size` 条消息成批发送再忙等；64 KB 消息一批 8.4 MB、每 6.71 ms 一次，20 ms 的遥测采样窗只装得下三批、量化出 ±33% 的假抖动；8 KB 消息把批间隔压到 0.84 ms。不要改用调小 `burst_size` 的办法：在途消息数太少时新流填不满起步的许可速率 |
 | 起步纪律 | RDMA 不加 `--rate_limit`（V4 的需求限制除外）：第一个 $R$ 到达之前 QP 按起步值放行（设计第 5.4 节，$R_0/$每流集合预期 QP 数），QP 被打死算一次失败。晚加入的行在起点前几秒才启动打流器（TCP 3 s、RDMA 5 s，runner 自动做）：早启动的空闲控制连接会被对端关掉，还会被接收端算作在场的 TCP 流集合 |
 | 时长与计时 | V1 20 s、V2 与 V6 五段各 8 s（RDMA 加入退出、TCP 加入退出各占一段）、V3 五段各 8 s、V4 三段各 13 s、V5 30 s、V7 三段 13/14/13 s、V8 三段 13/14/13 s，合计每场 20 到 40 s 的负载。段长的下限是判定要用的稳态窗口：`distill.py` 在每段里跳过前 3 s（最慢的沿实测 1.8 s）、丢掉最后 1 s，8 s 一段还剩 4 s、即每个流集合 40 个 100 ms 格子。一次事件只动一类流。t=0 的流先预热 5 s 再开始计时；晚加入的流两类都按绝对时刻准点加入（perftest `--start_at`、iperf3 `--start-at`；后者不在 `--help` 里，查 `strings /usr/local/lib/libiperf.so.0 \| grep start-at`）。图和表只取计时后的部分 |
@@ -75,7 +75,7 @@ V1、V2、V4 是每一版设计必跑的三个；V3、V5、V6 在它们过了之
 
 ### V1 稳态 incast（20 s，DCQCN 与 Swift 各一遍）
 
-三台发送端各 4 个 VM、每个 VM 两类，24 个流集合同时打 sgpu02 的 4 个 VM。四个 VM 各应得 184/4 = 46 G（根先绑定，VM 上限 50 G 不绑定），每个 VM 上 6 个流集合各应得 46/6 = 7.67 G。跑两遍：RDMA 拥塞控制用 DCQCN（缺省）和 Swift（`HPFT_RDMA_CC_ALGO=3`），结果应当相同。
+三台发送端各 4 个 VM、每个 VM 两类，24 个流集合同时打 sgpu02 的 4 个 VM。四个 VM 各应得 188/4 = 47 G（根先绑定，VM 上限 50 G 不绑定），每个 VM 上 6 个流集合各应得 47/6 = 7.83 G。跑两遍：RDMA 拥塞控制用 DCQCN（缺省）和 Swift（`HPFT_RDMA_CC_ALGO=3`），结果应当相同。
 
 | 行 | 源 VM | 目的 VM | 类型 | 数量 | 起 (s) | 止 (s) | 备注 |
 |---|---|---|---|---|---|---|---|
@@ -104,7 +104,7 @@ V1、V2、V4 是每一版设计必跑的三个；V3、V5、V6 在它们过了之
 | 23 | sgpu04/vf3 (10.1.3.4) | sgpu02/vf3 (10.1.3.2) | RDMA WRITE | 4 QP | 0 | 20 |  |
 | 24 | sgpu04/vf3 (10.1.3.4) | sgpu02/vf3 (10.1.3.2) | TCP iperf3 | 4 流 | 0 | 20 |  |
 
-**预期。** 3–19 s 每个流集合 7.67 G ± 5%，Jain ≥ 0.99，合计 ≥ 175 G，账本清得掉。两类之间允许有百分之几的差：RDMA 在 1024 字节 MTU 下头部开销大、且在交换机的 ECN 标记下退让一两个百分点。**图**：`fig/V1_timeline.png`、`fig/V1_executor.png`（Swift 那遍是 `fig/V1swift_*.png`）。
+**预期。** 3–19 s 每个流集合 7.83 G ± 5%，Jain ≥ 0.99，合计 ≥ 179 G，账本清得掉。两类之间允许有百分之几的差：RDMA 在交换机的 ECN 标记下退让一两个百分点。**图**：`fig/V1_timeline.png`、`fig/V1_executor.png`（Swift 那遍是 `fig/V1swift_*.png`）。
 
 ### V2 流集合加入/退出（40 s）
 
@@ -129,11 +129,11 @@ sgpu01 的 4 个 VM 两类共 8 个流集合常驻；sgpu03 的 4 个 VM 在 8 s
 | 15 | sgpu03/vf2 (10.1.2.3) | sgpu02/vf2 (10.1.2.2) | TCP iperf3 | 4 流 | 24 | 32 |  |
 | 16 | sgpu03/vf3 (10.1.3.3) | sgpu02/vf3 (10.1.3.2) | TCP iperf3 | 4 流 | 24 | 32 |  |
 
-**预期。** 每类各自：在位者 23 → 11.5 → 23 G，加入者从零到 11.5 G，另一类全程不动；四个阶跃的收敛时间都 ≤ 1 s；整场没有塌陷；16–24 s、32–40 s 与 0–8 s 的数字一致。**图**：`fig/V2_timeline.png`、`fig/V2_executor.png`。
+**预期。** 每类各自：在位者 23.5 → 11.75 → 23.5 G，加入者从零到 11.75 G，另一类全程不动；四个阶跃的收敛时间都 ≤ 1 s；整场没有塌陷；16–24 s、32–40 s 与 0–8 s 的数字一致。**图**：`fig/V2_timeline.png`、`fig/V2_executor.png`。
 
 ### V3 租户加入/退出（40 s）
 
-sgpu01 打 sgpu02 的 vf0–vf3 四个租户常驻，四个租户各拿 46 G 把 184 G 的根恰好用满；sgpu03 给 vf4–vf7 四个新租户打流，一次事件只动一类流：新租户的 RDMA 在 8 s 加入、TCP 在 16 s 加入，TCP 在 24 s 退出、RDMA 在 32 s 退出。根层按租户权重重划：新租户一出现（8 s，只有 RDMA 一类）就拿到 23 G 的租户份额，那 23 G 先全给它的 RDMA；16 s TCP 加入后租户内两类各 11.5 G；24 s TCP 退出 RDMA 回到 23 G；32 s RDMA 退出租户消失。在位租户 46 → 23（8 s）→ 46（32 s）G，租户内两类各 23 → 11.5 → 23。新租户 sgpu02/vf4–vf7 在注册表里没有 flowtag，流集合号用 (源, 目的) 字符串的 CRC32，这条路径也在这里被检验。
+sgpu01 打 sgpu02 的 vf0–vf3 四个租户常驻，四个租户各拿 47 G 把 188 G 的根恰好用满；sgpu03 给 vf4–vf7 四个新租户打流，一次事件只动一类流：新租户的 RDMA 在 8 s 加入、TCP 在 16 s 加入，TCP 在 24 s 退出、RDMA 在 32 s 退出。根层按租户权重重划：新租户一出现（8 s，只有 RDMA 一类）就拿到 23.5 G 的租户份额，那 23.5 G 先全给它的 RDMA；16 s TCP 加入后租户内两类各 11.75 G；24 s TCP 退出 RDMA 回到 23.5 G；32 s RDMA 退出租户消失。在位租户 47 → 23.5（8 s）→ 47（32 s）G，租户内两类各 23.5 → 11.75 → 23.5。新租户 sgpu02/vf4–vf7 在注册表里没有 flowtag，流集合号用 (源, 目的) 字符串的 CRC32，这条路径也在这里被检验。
 
 | 行 | 源 VM | 目的 VM | 类型 | 数量 | 起 (s) | 止 (s) | 备注 |
 |---|---|---|---|---|---|---|---|
@@ -154,7 +154,7 @@ sgpu01 打 sgpu02 的 vf0–vf3 四个租户常驻，四个租户各拿 46 G 把
 | 15 | sgpu03/vf6 (10.1.6.3) | sgpu02/vf6 (10.1.6.2) | TCP iperf3 | 4 流 | 16 | 24 |  |
 | 16 | sgpu03/vf7 (10.1.7.3) | sgpu02/vf7 (10.1.7.2) | TCP iperf3 | 4 流 | 16 | 24 |  |
 
-**预期。** 每个在位租户 46 → 23 → 46 G（只在 8 s 与 32 s 动），每个新租户 0 → 23 → 23 → 23 → 0 G（8 s 起 RDMA 独占，16–24 s 两类各 11.5 G），四个事件的收敛都 ≤ 1 s，无塌陷。**图**：`fig/V3_timeline.png`、`fig/V3_executor.png`。
+**预期。** 每个在位租户 47 → 23.5 → 47 G（只在 8 s 与 32 s 动），每个新租户 0 → 23.5 → 23.5 → 23.5 → 0 G（8 s 起 RDMA 独占，16–24 s 两类各 11.75 G），四个事件的收敛都 ≤ 1 s，无塌陷。**图**：`fig/V3_timeline.png`、`fig/V3_executor.png`。
 
 ### V4 需求变化与借用（39 s，单租户）
 
@@ -207,11 +207,11 @@ sgpu01 打 sgpu02 的 vf0–vf3 四个租户常驻，四个租户各拿 46 G 把
 | 15 | sgpu03/vf2 (10.1.2.3) | sgpu02/vf2 (10.1.2.2) | TCP iperf3 | 4 流 | 24 | 32 | iperf3 `-C bbr` |
 | 16 | sgpu03/vf3 (10.1.3.3) | sgpu02/vf3 (10.1.3.2) | TCP iperf3 | 4 流 | 24 | 32 | iperf3 `-C bbr` |
 
-**预期。** 稳态与 V2 相同：每类各自 23 → 11.5 → 23 G，差异超过 5% 就说明份额依赖具体的拥塞控制。**动态不作同样要求**：达到份额的快慢由租户 CC 自己决定，整形器只设上限、不替它抬速率，所以 Swift 的新来者与 BBR 的在位者比 DCQCN 与 Cubic 慢是预期之中，这一场的收敛数字只记录不判优劣。**图**：`fig/V6_timeline.png`、`fig/V6_executor.png`。
+**预期。** 稳态与 V2 相同：每类各自 23.5 → 11.75 → 23.5 G，差异超过 5% 就说明份额依赖具体的拥塞控制。**动态不作同样要求**：达到份额的快慢由租户 CC 自己决定，整形器只设上限、不替它抬速率，所以 Swift 的新来者与 BBR 的在位者比 DCQCN 与 Cubic 慢是预期之中，这一场的收敛数字只记录不判优劣。**图**：`fig/V6_timeline.png`、`fig/V6_executor.png`。
 
 ### V7 与不受管流量共处：接收端口被 HyperFront 看不见的流量压住（40 s，边界）
 
-打流与 V1 相同（24 个流集合把根用满），另加一股 HyperFront 既不调度也不整形的背景 UDP：13–27 s 从 sgpu04/vf7 往 sgpu02/vf7 打 40 G（接收端归为 ip_other，不进分配；发送端只对 TCP 和 RDMA 整形）。这 14 秒里端口上有 184 + 40 > 200 G 的需求，交换机队列真的积起来：RoCE 包被打 ECN、DCQCN 减速，TCP 丢包减窗。账本把根缩到 (200 − 40) × 0.92 = 147 G 发许可速率，池让拥塞控制在许可速率之下退让，退让在账本的容差 $\delta$ 之内就仍按份额记账。
+打流与 V1 相同（24 个流集合把根用满），另加一股 HyperFront 既不调度也不整形的背景 UDP：13–27 s 从 sgpu04/vf7 往 sgpu02/vf7 打 40 G（接收端归为 ip_other，不进分配；发送端只对 TCP 和 RDMA 整形）。这 14 秒里端口上有 188 + 40 > 200 G 的需求，交换机队列真的积起来：RoCE 包被打 ECN、DCQCN 减速，TCP 丢包减窗。账本把根缩到 (200 − 40) × 0.94 = 150.4 G 发许可速率，池让拥塞控制在许可速率之下退让，退让在账本的容差 $\delta$ 之内就仍按份额记账。
 
 | 行 | 源 VM | 目的 VM | 类型 | 数量 | 起 (s) | 止 (s) | 备注 |
 |---|---|---|---|---|---|---|---|
@@ -241,11 +241,11 @@ sgpu01 打 sgpu02 的 vf0–vf3 四个租户常驻，四个租户各拿 46 G 把
 | 24 | sgpu04/vf3 (10.1.3.4) | sgpu02/vf3 (10.1.3.2) | TCP iperf3 | 4 流 | 0 | 40 |  |
 | 25 | sgpu04/vf7 (10.1.7.4) | sgpu02/vf7 (10.1.7.2) | UDP 背景（udp_blast） | — | 13 | 27 | 40 G，HyperFront 不调度也不整形的流量 |
 
-**预期。** 0–13 s 与 V1 相同。13–27 s：四个 VM 各 36.8 G，两类各 18.4 G，24 个流集合应得 6.13 G；RDMA 类在 ECN 标记下退让几个百分点，TCP 类在丢包下退让，都不该低于应得的 $(1-\delta)$ = 85%（低于它账本会把这个流集合判成出借方，份额借给别人）；端口总载荷（租户 + UDP）≈ 190 G，没有流集合低于 3 G。27 s 背景停掉，根回到 184 G，1 s 内回到 V1 的份额。**判据**：通用六条照用、应得值按物理根 147 G 算，判据 1 在 13–27 s 只报数字；这一节的通过条件是"没有流集合被饿死、两类都不低于应得的 85%"。V7 是设计第 8 节的边界，不是论文的主线。**图**：`fig/V7_timeline.png`、`fig/V7_executor.png`。
+**预期。** 0–13 s 与 V1 相同。13–27 s：四个 VM 各 37.6 G，两类各 18.8 G，24 个流集合应得 6.27 G；RDMA 类在 ECN 标记下退让几个百分点，TCP 类在丢包下退让，都不该低于应得的 $(1-\delta)$ = 85%（低于它账本会把这个流集合判成出借方，份额借给别人）；端口总载荷（租户 + UDP）≈ 190 G，没有流集合低于 3 G。27 s 背景停掉，根回到 188 G，1 s 内回到 V1 的份额。**判据**：通用六条照用、应得值按物理根 150.4 G 算，判据 1 在 13–27 s 只报数字；这一节的通过条件是"没有流集合被饿死、两类都不低于应得的 85%"。V7 是设计第 8 节的边界，不是论文的主线。**图**：`fig/V7_timeline.png`、`fig/V7_executor.png`。
 
 ### V8 账本管不到的核心瓶颈（40 s，令牌池对拥塞控制单独两个臂）
 
-两个接收端 sgpu02、sgpu04 都在 B 侧，两个发送端 sgpu01、sgpu03 都在 A 侧，所有流量都过那根 200 G 的核心线，而两个接收端各自只看得见自己的 200 G 端口，谁都不知道核心存在。0–13 s 每个接收端只有一个 VM 在收（核心上 100 G，不绑定）；13–27 s 每侧再加两个 VM，需求 300 G 撞 200 G 的核心；27 s 退出。表里最后一行 `class=core` 不是流，只告诉 `distill.py` 核心的容量（内层字节口径 184 G），应得值先按每个接收端算、再把过核心的流集合按这个容量重新逐级填平；runner 对它什么都不做，核心的档位由 `tools/lab-infra/switch/split_core_speed.sh` 设、每次运行记进 `results/<tag>/core_speed.txt`。
+两个接收端 sgpu02、sgpu04 都在 B 侧，两个发送端 sgpu01、sgpu03 都在 A 侧，所有流量都过那根 200 G 的核心线，而两个接收端各自只看得见自己的 200 G 端口，谁都不知道核心存在。0–13 s 每个接收端只有一个 VM 在收（核心上 100 G，不绑定）；13–27 s 每侧再加两个 VM，需求 300 G 撞 200 G 的核心；27 s 退出。表里最后一行 `class=core` 不是流，只告诉 `distill.py` 核心的容量（内层字节口径 188 G），应得值先按每个接收端算、再把过核心的流集合按这个容量重新逐级填平；runner 对它什么都不做，核心的档位由 `tools/lab-infra/switch/split_core_speed.sh` 设、每次运行记进 `results/<tag>/core_speed.txt`。
 
 每个流集合 24 个 QP，让核心口的队列能够积到丢包门限：RoCE 每个 QP 最多约 512 KB 未确认数据在网络里，核心口队列的物理上限就是 QP 总数乘 512 KB，与发送端被允许发多快无关；核心口的出向门限是 35.2 MB，六个流集合 144 个 QP 合起来约 74 MB，是门限的两倍。队列在 ECN 下走不走到门限是拥塞控制自己的事（DCQCN 不会）。
 
@@ -257,7 +257,7 @@ sgpu01 打 sgpu02 的 vf0–vf3 四个租户常驻，四个租户各拿 46 G 把
 | 4 | sgpu01/vf2 (10.1.2.1) | sgpu02/vf2 (10.1.2.2) | RDMA WRITE | 24 QP | 13 | 27 |  |
 | 5 | sgpu03/vf1 (10.1.1.3) | sgpu04/vf1 (10.1.1.4) | RDMA WRITE | 24 QP | 13 | 27 |  |
 | 6 | sgpu03/vf2 (10.1.2.3) | sgpu04/vf2 (10.1.2.4) | RDMA WRITE | 24 QP | 13 | 27 |  |
-| 7 | —（交换机内部） | —（A 侧到 B 侧的核心链路 swp21↔swp25） | 核心链路容量 | — | 0 | 40 | 184 G（内层字节口径；链路整形 200G，`split_core_speed.sh`），两个接收端的账本都看不见它 |
+| 7 | —（交换机内部） | —（A 侧到 B 侧的核心链路 swp21↔swp25） | 核心链路容量 | — | 0 | 40 | 188 G（内层字节口径；链路整形 200G，`split_core_speed.sh`），两个接收端的账本都看不见它 |
 
 设计对这种瓶颈的回答（第 6.3、8.1 节）是：它由两边的拥塞控制在 $R$ 以下处理，流集合的许可速率不因它而变。所以这个场景跑两个臂——令牌池（缺省）和拥塞控制单独（`HPFT_CC_ONLY=1`）——比的是两者之间。
 

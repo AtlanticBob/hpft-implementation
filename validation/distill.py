@@ -30,10 +30,21 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(BASE, "..", "..", "hpft-paper", "paper", "common"))
 import vpm
 
-C_ROOT = 200e9 * 0.92          # C' (headroom 8 %, root only)
+# The receiver's own parameters, read from the registry rather than restated:
+# what a flow-set is owed follows the headroom and the link rate, and a copy of
+# either here is a second place for them to drift (h moved 0.08 -> 0.06 with the
+# MTU on 2026-09-10 and this file kept computing the old share).
+_REG = json.load(open(os.path.join(BASE, "..", "config", "lab-registry.json")))
+LINE = float(_REG["line_rate_bps"])
+HEADROOM = float(_REG["e_params"]["headroom"])
+CAP_FLOOR = 0.05               # capacity the receiver keeps whatever the unscheduled load
 VM_CAP = 50e9                  # every VM sold at 50 G; the VM cap carries no headroom
-DELTA = 0.15                   # demand margin the receiver reserves for a lender
-RDMA_WIRE = 1.073              # wire bytes / application bytes for 1024 B RoCE WRITE (measured V4 2026-08-28)
+DELTA = float(_REG["e_params"]["delta_demand"])   # margin the receiver reserves for a lender
+# Wire bytes per application byte for a RoCE WRITE, which is how a rate_limit
+# option (an application rate) becomes a demand on the ledger (a wire rate).
+# Measured, not derived: 7.75 G attributed against 7.61-7.65 G reported by
+# perftest at MTU 4096 (V1_mtu4096_20260910). It was 1.073 at MTU 1024.
+RDMA_WIRE = 1.017 if int(_REG["vf_mtu"]) >= 4200 else 1.073
 STEADY_SKIP, STEADY_TAIL = 3.0, 1.0   # steady window inside a phase
 # The phases are 8 to 14 s (2026-09-09: the scenarios were shortened so a
 # run costs 30-40 s of load instead of 50-90). The skip has to clear the
@@ -220,8 +231,9 @@ def meter_at(rows, t):
 
 def root_at(rows, t, dhost):
     """The receiver's physical root: its port minus traffic the scheduler does
-    not control (udp rows), then the headroom (receiver rule since 2026-08-28)."""
-    return (200e9 - external_at(rows, t, dhost) * 1e9) * 0.92
+    not control (udp rows), then the headroom, and never less than the floor the
+    receiver keeps whatever the unscheduled load (rx_agent's c_root rule)."""
+    return max((LINE - external_at(rows, t, dhost) * 1e9) * (1 - HEADROOM), CAP_FLOOR * LINE)
 
 
 def expected_at(rows, t):

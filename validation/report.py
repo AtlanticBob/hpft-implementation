@@ -26,7 +26,14 @@ def txt(name):
 
 reg = json.load(open(os.path.join(R, "registry.json")))
 ep = reg["e_params"]
+# Everything the report states about the policy comes from the registry THIS
+# RUN carried, never from the repo's current one: a report is a record of what
+# happened, and the two differ the moment a parameter moves.
+LINE = float(reg["line_rate_bps"])
+HEADROOM = float(ep["headroom"])
 env = txt("env_status.txt")
+_m = re.search(r"rdma mtu: (\d+)", txt("arm.txt"))
+MTU = _m.group(1) if _m else ("4096" if int(reg.get("vf_mtu", 1500)) >= 4200 else "1024")
 env_lines = [l for l in env.splitlines() if re.search(r"UPCC|ECN profile|environment:|^HOST|^sgpu0[1-4]\s", l)]
 flows_tbl = subprocess.check_output([sys.executable, os.path.join(BASE, "scenarios", "render_table.py"), os.path.join(R, "flows.txt")]).decode()
 verdict = rd("verdict"); flow_rows = rd("flowsets"); events = rd("events"); gp = rd("goodput"); exs = rd("executor_summary")
@@ -73,10 +80,10 @@ md = [f"# {tag}", "",
       f"**判定：{'通过' if overall else '不通过'}**（六条判据见下）。执行面臂：`{arm}`；账本参数 `{json.dumps(keyp, ensure_ascii=False)}`。", "",
       "## 环境（运行时实际读到的）", "",
       "| 项 | 取值 |", "|---|---|",
-      "| 政策 | 每 VM 权重 1、max_rate 50 G、类 tcp:rdma 1:1、per-sender 全 1（runner 已校验）；C′ = 184 G，每 VM 46 G |",
+      f"| 政策 | 每 VM 权重 1、max_rate 50 G、类 tcp:rdma 1:1、per-sender 全 1（runner 已校验）；C′ = {LINE*(1-HEADROOM)/1e9:.0f} G（余量 {HEADROOM:.0%}），每 VM {LINE*(1-HEADROOM)/4e9:.0f} G |",
       "| lab_env 状态 | " + "；".join(env_lines).replace("|", "/") + " |",
       "| 重传 | " + (txt("retrans_mode.txt").splitlines()[-1].replace("|", "/") if txt("retrans_mode.txt") else "未记录") + " |",
-      "| 打流器 | RDMA ib_write_bw（perftest-enhanced，`--start_at`，`-m 1024 --report_gbits`）；TCP iperf3 `-P n -J --start-at`，`-B ip%dpu1vfN` |",
+      f"| 打流器 | RDMA ib_write_bw（perftest-enhanced，`--start_at`，`-m {MTU} --report_gbits`）；TCP iperf3 `-P n -J --start-at`，`-B ip%dpu1vfN` |",
       "| 计时 | T0 = " + txt("t0.txt") + "，预热 " + txt("warm.txt") + " s，实验时钟 = T0 + 预热 |", "",
       "## 打流表", "", flows_tbl,
       "## 预期与实测（每阶段稳态窗口 = 阶段起 +5 s 到阶段止 −1 s，接收端归因速率）", "",

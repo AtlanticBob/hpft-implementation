@@ -148,6 +148,9 @@ t_end = t_start + dur
 last_q = {}                  # slot -> when it was last queried, for the interval
 nq_seen = {}                 # slot -> its last reported member count
 dumped = False               # the short-membership evidence is taken once
+first_seen = {}              # slot -> when it first carried a flow set
+short_prev = set()           # slots that were short on the previous pass
+SETTLE = 3.0                 # how long a slot must have carried its set before it is judged
 dump_todo, dump_lines, dump_why = [], [], ""
 passes, slow, worst = 0, 0, 0.0
 # When a slot first carries a flow set, the previous pass is a usable start
@@ -205,13 +208,32 @@ with open(out, "w") as o:
         # a QP's record and its binding do not move while it keeps sending, so
         # a dump smeared over some seconds still answers the question it is
         # there for.
-        if not dumped and len(nq_seen) >= 3:
-            common = max(set(nq_seen.values()), key=list(nq_seen.values()).count)
-            short = [k for k, v in nq_seen.items() if v < common]
+        # A slot is only judged once its own flow-set has had time to bind its
+        # QPs. Every set is short in the first seconds - the QPs of one
+        # perftest come up over a few hundred milliseconds, and a scenario with
+        # a joiner brings a whole set up mid-run - so a check that fires on the
+        # first sighting fires during the ramp every time and dumps a table
+        # that is still filling. The dump then reads as evidence of a binding
+        # fault when it is a picture of startup (2026-09-10, V1 at MTU 4096:
+        # the trigger fired 1.3 s in and the table held 10 of 16 records).
+        # Two conditions, both about persistence rather than about the ramp's
+        # length: the slot has been carrying its set for SETTLE seconds, and it
+        # came up short on this pass AND the one before.
+        for k in nq_seen:
+            first_seen.setdefault(k, t)
+        for k in list(first_seen):
+            if k not in nq_seen:
+                first_seen.pop(k, None)
+        settled = {k: v for k, v in nq_seen.items() if t - first_seen.get(k, t) >= SETTLE}
+        if not dumped and len(settled) >= 3:
+            common = max(set(settled.values()), key=list(settled.values()).count)
+            short = [k for k, v in settled.items() if v < common]
+            short = [k for k in short if k in short_prev]
+            short_prev = {k for k, v in settled.items() if v < common}
             if short:
                 dumped = True
                 dump_why = ("slots %s carry %s QPs, the others carry %d"
-                            % (short, [nq_seen[k] for k in short], common))
+                            % (short, [settled[k] for k in short], common))
                 dump_todo = list(range(QHOME))
                 # a partial sweep is still evidence if the run ends first
                 write_qpdump([json.dumps({"reason": dump_why, "ts": round(time.time(), 3)}),

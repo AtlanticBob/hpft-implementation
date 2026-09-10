@@ -339,6 +339,38 @@ for h in $HOSTS; do
     echo "           rm -rf /sys/fs/bpf/hpft_tcp_edt, then re-apply (see README)"; bad=1; }
 done
 
+# ---- MTU: one wrong netdev and a whole class silently loses its big packets
+# The tenant path is VF -> representor -> bridge, and all three must carry the
+# same MTU. A VF larger than its representor drops every large segment of a TCP
+# connection that has been idle (2026-08-26), and a representor smaller than the
+# VF caps the RoCE path MTU below what perftest was told to negotiate, so the
+# run looks healthy and delivers a different experiment. The value lives in the
+# registry (vf_mtu); nothing here restates it.
+WANT_MTU=$(python3 -c "import json;print(json.load(open('$CFG_FILE'))['vf_mtu'])")
+echo "== MTU (registry vf_mtu = $WANT_MTU) =="
+for n in $NODES; do
+  ( ssh -o BatchMode=yes "$n" 'for d in /sys/class/net/pf1vf* /sys/class/net/ovsbr-p1; do
+        [ -e "$d/mtu" ] && echo "$(basename $d) $(cat $d/mtu)"; done' > "$TMP/$n.mtu" 2>/dev/null ) &
+done
+for h in $HOSTS; do
+  if [ "$h" = "$(hostname)" ]; then
+    ( for d in /sys/class/net/dpu1vf*; do echo "$(basename $d) $(cat $d/mtu)"; done > "$TMP/$h.hmtu" 2>/dev/null ) &
+  else
+    ( ssh -o BatchMode=yes "$h" 'for d in /sys/class/net/dpu1vf*; do echo "$(basename $d) $(cat $d/mtu)"; done' > "$TMP/$h.hmtu" 2>/dev/null ) &
+  fi
+done
+wait
+for f in $NODES; do
+  badmtu=$(awk -v w="$WANT_MTU" '$2!=w{printf "%s=%s ", $1, $2}' "$TMP/$f.mtu" 2>/dev/null)
+  [ -z "$badmtu" ] && echo "  ok       $f (representors + bridge)" \
+    || { echo "  DIFFERS  $f: $badmtu (want $WANT_MTU)"; bad=1; }
+done
+for f in $HOSTS; do
+  badmtu=$(awk -v w="$WANT_MTU" '$2!=w{printf "%s=%s ", $1, $2}' "$TMP/$f.hmtu" 2>/dev/null)
+  [ -z "$badmtu" ] && echo "  ok       $f (VFs)" \
+    || { echo "  DIFFERS  $f: $badmtu (want $WANT_MTU)"; bad=1; }
+done
+
 if [ $bad -eq 0 ]; then
   if [ $warn -ne 0 ]; then
     echo "deploy_check: code OK on $(echo $NODES | wc -w) nodes, enabled agents healthy; see warnings above"

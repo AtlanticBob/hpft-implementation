@@ -111,10 +111,18 @@ jakiro_stop() {
     sudo rm -f '"$JAKIRO_DIR"'/run/jakiro_dhtb.pid; true'
 }
 jakiro_start() {
-  # hardened: kill -> wipe stale DPDK runtime (a fast relaunch over the old
-  # instance shared memory fails EAL init "Cannot init memzone") -> apply
+  # hardened: hugepages -> kill -> wipe stale DPDK runtime (a fast relaunch over
+  # the old instance shared memory fails EAL init "Cannot init memzone") -> apply
+  #
+  # Hugepages are not persistent: an Arm reboot leaves nr_hugepages at 0 and the
+  # DHTB dies in EAL with "No free 2048 kB hugepages", which the retry loop then
+  # repeats three times and reports as a plain start failure. 4096 x 2 MB is what
+  # it takes - 1024 gets past EAL and then fails to allocate the mbuf pool,
+  # because the underlay runs jumbo and the pool is sized for 9800-byte mbufs.
   for attempt in 1 2 3; do
     timeout 90 ssh -n hpft-dpu2 'cd '"$JAKIRO_DIR"'
+      [ "$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)" -ge 4096 ] \
+        || echo 4096 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages >/dev/null
       pid=$(pgrep -f "build/jakiro_dht[b]" | head -1)
       [ -n "$pid" ] && { sudo kill -9 "$pid" 2>/dev/null; sleep 1; }
       sudo rm -f run/jakiro_dhtb.pid; sudo rm -rf /var/run/dpdk/rte; sudo rm -f /dev/hugepages/rtemap_*

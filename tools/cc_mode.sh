@@ -34,7 +34,7 @@ set -u
 REPO=/home/zhaoxiang/hyperfront/hpft-implementation
 cd "$REPO"
 MST=/dev/mst/mt41692_pciconf0
-VF_MTU=${VF_MTU:-1500}
+VF_MTU=${VF_MTU:-$(python3 -c "import json;print(json.load(open('$REPO/config/lab-registry.json'))['vf_mtu'])")}
 
 mapfile -t NODES < <(python3 -c "
 import json
@@ -100,7 +100,9 @@ post_recover() {
   for n in "${NODES[@]}"; do
     set -- $n
     on_host "$1" "for d in /sys/class/net/dpu1vf*; do sudo ip link set \$(basename \$d) mtu $VF_MTU 2>/dev/null; done" &
-    ssh -o BatchMode=yes "$2" 'for p in p0 p1; do sudo ethtool -A $p rx off tx off 2>/dev/null; sudo mlnx_qos -i $p --pfc 0,0,0,0,0,0,0,0 >/dev/null 2>&1; done' &
+    ssh -o BatchMode=yes "$2" "for p in p0 p1; do sudo ethtool -A \$p rx off tx off 2>/dev/null; sudo mlnx_qos -i \$p --pfc 0,0,0,0,0,0,0,0 >/dev/null 2>&1; done
+      for i in \$(seq 0 7); do sudo ip link set pf1vf\$i mtu $VF_MTU 2>/dev/null; done
+      sudo ip link set ovsbr-p1 mtu $VF_MTU 2>/dev/null" &
   done
   wait
 }

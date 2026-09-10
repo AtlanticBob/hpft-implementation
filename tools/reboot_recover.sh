@@ -40,7 +40,7 @@ on_host() { # on_host <host> <command>
   if [ "$1" = "$(hostname)" ]; then bash -c "$2"; else ssh -o BatchMode=yes "$1" "$2"; fi
 }
 
-echo "== 1/5 VFs on ${#NODES[@]} hosts =="
+echo "== 1/6 VFs on ${#NODES[@]} hosts =="
 for n in "${NODES[@]}"; do
   set -- $n
   ( on_host "$1" "bash $REPO/tools/lab-infra/vf_setup.sh >/dev/null 2>&1" \
@@ -51,7 +51,7 @@ wait
 for n in "${NODES[@]}"; do set -- $n; on_host "$1" 'sudo modprobe tcp_bbr 2>/dev/null; true' & done
 wait
 
-echo "== 2/5 TCP EDT (fq + BPF) on every host =="
+echo "== 2/6 TCP EDT (fq + BPF) on every host =="
 for n in "${NODES[@]}"; do
   set -- $n
   ( on_host "$1" "sudo bash $REPO/tools/host/edt_ensure.sh >/dev/null 2>&1 && bash $REPO/tools/host/edt_maps_ensure.sh >/dev/null 2>&1" \
@@ -59,7 +59,7 @@ for n in "${NODES[@]}"; do
 done
 wait
 
-echo "== 3/5 p1 volatile state: ${LINE_GBPS}G, MTU 9000, underlay + telemetry IPs, PFC off =="
+echo "== 3/6 p1 volatile state: ${LINE_GBPS}G, MTU 9000, underlay + telemetry IPs, PFC off =="
 for n in "${NODES[@]}"; do
   set -- $n
   ( ssh -o BatchMode=yes "$2" "
@@ -85,7 +85,7 @@ for a in "${NODES[@]}"; do
 done
 wait
 
-echo "== 4/5 host services + the meter =="
+echo "== 4/6 host services + the vport meter =="
 for n in "${NODES[@]}"; do
   set -- $n
   # the shim re-seeds pair_state on startup, so it must follow the EDT re-apply
@@ -96,7 +96,18 @@ for n in "${NODES[@]}"; do
 done
 wait
 
-echo "== 5/5 sanity =="
+# The per-VF OVS drop-band meters are runtime state of the DPU's vswitch, so a
+# firmware reset or an Arm reboot takes them with it - and the overlay's
+# forwarding rules REFERENCE them (priority 122/121/120 send a local VF's
+# traffic through its meter). With the meters gone those rules cannot be
+# installed and every tunnelled frame falls through to the split-horizon drop
+# at 115: the whole lab looks alive, pings between VFs fail, and nothing in the
+# overlay's own output says why (2026-09-10, after a switch to plain). So they
+# are re-asserted here, next to everything else the reset makes volatile.
+echo "== 5/6 per-VF meters (the overlay's rules reference them) =="
+bash "$REPO/tools/lab-infra/vf_caps.sh" meter-on 2>&1 | sed 's/^/  /'
+
+echo "== 6/6 sanity =="
 for n in "${NODES[@]}"; do
   set -- $n
   sp=$(ssh -o BatchMode=yes "$2" 'cat /sys/class/net/p1/speed 2>/dev/null')

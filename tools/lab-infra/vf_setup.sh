@@ -23,6 +23,7 @@ if not v:
 print(v[0]["pf_bdf"], len([x for x in r["vnics"] if x["host"] == me]))
 PY
 )" || exit 1
+VF_MTU=$(python3 -c "import json;print(json.load(open('$REPO/config/lab-registry.json'))['vf_mtu'])")
 
 echo 0 | sudo tee /sys/bus/pci/devices/$PF/sriov_numvfs >/dev/null; sleep 2
 echo $NVF | sudo tee /sys/bus/pci/devices/$PF/sriov_numvfs >/dev/null; sleep 3
@@ -73,9 +74,10 @@ PY
     fi
     sudo ip addr flush dev "$want" 2>/dev/null
     sudo ip addr add "$ip/24" dev "$want"
-    # 1500 = the lab baseline (and the DPU representor/bridge MTU; a bigger
-    # VF MTU silently breaks idle TCP connections, see cc_mode.sh post_recover)
-    sudo ip link set "$want" mtu 1500 up
+    # The VF, its representor and the overlay bridge all carry registry
+    # vf_mtu; a VF larger than its representor silently breaks idle TCP
+    # connections (see cc_mode.sh post_recover and lab-infra/overlay.sh).
+    sudo ip link set "$want" mtu "$VF_MTU" up
     i=$((i+1))
 done
 

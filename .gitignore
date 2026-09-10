@@ -79,3 +79,4 @@ results/queueing_20260908/results/*/histogram_raw.jsonl
 results/queueing_20260908/results/*/probe.txt
 results/fct_20260909/results/*/probe_*.txt
 results/headroom_20260909/results/*/probe_*.txt
+results/mtu4096_headroom_20260910/results/*/probe_*.txt

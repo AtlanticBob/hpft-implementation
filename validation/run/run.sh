@@ -23,10 +23,22 @@
 set -u
 DIR=$(cd "$(dirname "$0")" && pwd); VAL=$(cd "$DIR/.." && pwd); REPO=$(cd "$VAL/.." && pwd)
 SCN=${1:?scenario}; TAG=${2:?tag}
-FLOWS="$VAL/scenarios/$SCN.flows"; [ -f "$FLOWS" ] || { echo "no such scenario: $FLOWS"; exit 1; }
-OUT="$VAL/results/$TAG"; mkdir -p "$OUT"
+# A scenario is a name under validation/scenarios, or a path to a flow table
+# anywhere - the evaluation bundles keep their own tables next to the rest of
+# the bundle rather than in the validation suite, which is a different thing
+# with a different lifetime.
+case "$SCN" in
+  */*|*.flows) FLOWS="$SCN" ;;
+  *)           FLOWS="$VAL/scenarios/$SCN.flows" ;;
+esac
+[ -f "$FLOWS" ] || { echo "no such scenario: $FLOWS"; exit 1; }
+# HPFT_OUT: where the run's raw output goes. Validation keeps it under
+# validation/results/<tag>; an evaluation bundle owns its own results/
+# directory (BUNDLE_LAYOUT.md) and points this at it, so the bundle is
+# self-contained and nothing has to be copied afterwards.
+OUT="${HPFT_OUT:-$VAL/results/$TAG}"; mkdir -p "$OUT"
 PT=$HOME/hyperfront/perftest-enhanced/ib_write_bw
-WARM=5; QMTU=1024
+WARM=5; QMTU=${RDMA_MTU:-4096}
 cd "$REPO"
 
 reg() { python3 -c "import json,sys;r=json.load(open('config/lab-registry.json'));print($1)"; }
@@ -105,10 +117,25 @@ print({v['host']: v['pf_bdf'] for v in tcp['vnics']}.get('$h','0000:38:00.1').re
   [ "$v" = "0x00000001" ] || { echo "ABORT: $h is not on selective repeat (ROCE_ACCL=$v). Run: bash tools/cc_mode.sh sr"; exit 1; }
 done
 echo "retransmission: SR (ROCE_ACCL selective_repeat_forced_en=1 on $HOSTS)" | tee -a "$OUT/retrans_mode.txt"
+# Cross-subnet rows. Every VF pair lives in its own /24, so a row whose source
+# VF index differs from its destination VF index would egress through the VF
+# that owns the DESTINATION's subnet - the wrong sender - and be attributed to
+# a pair nobody asked for, while every number still looks normal. Per-source
+# policy routing fixes it (tools/cross_pair_net.sh), and perftest must stay off
+# the rdma_cm path, which it already is. Applied only when the table needs it,
+# and left in place afterwards: it is idempotent and harmless for same-subnet
+# rows. Every validation scenario is same-subnet; the evaluation tables that
+# mirror the motivation experiments are not.
+if echo "$ROWS" | awk 'NF>3 && $2!=$4' | grep -q .; then
+  echo "cross-subnet rows present: applying per-source routing on $HOSTS"
+  for h in $HOSTS; do on_host "$h" "bash $REPO/tools/cross_pair_net.sh apply" >/dev/null 2>&1; done
+fi
 # every node runs both planes (roles.sh all, 2026-09-04); who receives is
 # decided by the flow table, not by the role assignment
-bash tools/lab-infra/roles.sh all >/dev/null
-sleep 4
+if [ "${HPFT_ARM:-hpft}" = hpft ]; then
+  bash tools/lab-infra/roles.sh all >/dev/null
+  sleep 4
+fi
 # A sink left from an earlier run keeps its port, the new sink's bind then
 # fails and the client sees "Connection refused" - 7.6 of the 40 G background
 # reached the receiver and the run looked like a fairness result (V7,
@@ -210,6 +237,22 @@ meter_set() { # $1 = destination host, $2 = destination VF index, $3 = kbps
 #   (an entry left from an earlier run keeps shaping - measured 14.7 G on a
 #   "CC alone" arm, 2026-09-06). The receiver agents keep running, so the
 #   ledger's view of the run is still recorded and distilled.
+# HPFT_ARM: which system is under test.
+#   hpft      (default) HyperFront: the agents run and the executor is armed
+#   baseline  no HyperFront at all - the agents are not started, no budget is
+#             pushed, the executor is left alone and the executor sampler does
+#             not run. This is what the native, with-TC and Jakiro arms need:
+#             the same flow table, the same listeners, the same start_at
+#             discipline, the same switch and application measurements, and
+#             nothing of ours in the path. It does NOT put the lab in the plain
+#             environment - lab_env.sh does that, and this script refuses to
+#             pretend otherwise, so run it only once the environment matches.
+# HPFT_TCLASS: when set (106 for the with-TC arm), every RDMA row carries
+#   --tclass on BOTH ends, which is what puts those frames in switch TC3.
+ARM=${HPFT_ARM:-hpft}
+case "$ARM" in hpft|baseline) ;; *) echo "HPFT_ARM must be hpft or baseline"; exit 1 ;; esac
+TCLASS=${HPFT_TCLASS:-}
+RDMA_TC=${TCLASS:+--tclass=$TCLASS}
 CCALGO=${HPFT_RDMA_CC_ALGO:-2}
 echo "$ROWS" | awk '$5=="rdma" && $9 ~ /rdma_cc=swift/' | grep -q . && CCALGO=3
 LAW=${HPFT_LAW:-0}
@@ -230,13 +273,15 @@ mbox() { # $1 host: write the remaining args, one line each, to its DPU's RP FIF
 }
 cleanup() {
   [ -n "$METER_ROWS" ] && echo "$METER_ROWS" | while read -r _ _ dh dv _; do meter_set "$dh" "$dv" 50000000 >/dev/null 2>&1; done
-  for h in $SENDERS; do mbox "$h" "0xccd 2" "0xcce 0 22" "0xcce 0 12"; done
-  for h in $SENDERS; do mbox "$h" "$RP_WINDOW_DEFAULT"; done
-  [ "$CCONLY" = 0 ] || bash tools/lab-infra/roles.sh all >/dev/null 2>&1
+  if [ "$ARM" = hpft ]; then
+    for h in $SENDERS; do mbox "$h" "0xccd 2" "0xcce 0 22" "0xcce 0 12"; done
+    for h in $SENDERS; do mbox "$h" "$RP_WINDOW_DEFAULT"; done
+    [ "$CCONLY" = 0 ] || bash tools/lab-infra/roles.sh all >/dev/null 2>&1
+  fi
   return 0
 }
 trap cleanup EXIT
-for h in $SENDERS; do mbox "$h" "0xccd $CCALGO" "0xcce $LAW 22" "0xcce $CCONLY 12" \
+[ "$ARM" = hpft ] && for h in $SENDERS; do mbox "$h" "0xccd $CCALGO" "0xcce $LAW 22" "0xcce $CCONLY 12" \
   "$RP_WINDOW_DEFAULT"; done
 if [ -n "$RPKNOBS" ]; then
   IFS=';' read -r -a KN <<<"$RPKNOBS"
@@ -261,11 +306,21 @@ print(\"tcp rate table cleared: %d entries\"%n)
   done
   sleep 2
 fi
-echo "rdma executor: cc algo = $CCALGO (2 DCQCN, 3 Swift); law = $LAW (0 token pool, 1 equal cap, 2 equal split); cc-only arm = $CCONLY; knobs = ${RPKNOBS:-default}" | tee "$OUT/arm.txt"
+if [ "$ARM" = baseline ]; then
+  echo "arm: baseline - no HyperFront (agents not started, no budget pushed, executor untouched)" | tee "$OUT/arm.txt"
+  [ -n "$TCLASS" ] && echo "rdma traffic class: --tclass=$TCLASS (switch TC3)" | tee -a "$OUT/arm.txt"
+else
+  echo "rdma executor: cc algo = $CCALGO (2 DCQCN, 3 Swift); law = $LAW (0 token pool, 1 equal cap, 2 equal split); cc-only arm = $CCONLY; knobs = ${RPKNOBS:-default}" | tee "$OUT/arm.txt"
+fi
+# The RoCE path MTU decides the port's goodput ceiling and the ledger's
+# wire-to-application factor, so the run records what it actually asked for
+# rather than leaving the reader to infer it from the registry.
+echo "rdma mtu: $QMTU" | tee -a "$OUT/arm.txt"
 # What the DEVICE says it is, not what this script asked for: knobs are state
 # that outlives a run, so the arm has to be read back or a run can record one
 # arm and execute another. 0xdef 0 word 8 = cc_only | law<<8.
 for h in $SENDERS; do
+  [ "$ARM" = hpft ] || break
   d=$(dpu_of "$h")
   w=$(ssh -n -o BatchMode=yes "$d" "timeout 5 bash -c 'echo \"0xdef 0\" > /tmp/rp_fifo'; sleep 0.4
       tail -40 /tmp/pcc_rp.log | grep -a HPFT_RSP | tail -1" </dev/null 2>/dev/null | grep -o 'evb32=[0-9]*' | cut -d= -f2)
@@ -290,7 +345,7 @@ fi
 # mailbox for one round (about 16 ms), so it is a small perturbation of the
 # budget push, not a passive tap; HPFT_NO_RP_SAMPLE=1 runs without it.
 SAMP=$((END+WARM+30))
-if [ -z "${HPFT_NO_RP_SAMPLE:-}" ]; then
+if [ -z "${HPFT_NO_RP_SAMPLE:-}" ] && [ "$ARM" = hpft ]; then
   for h in $SENDERS; do
     d=$(dpu_of $h)
     scp -q "$REPO/tools/dpu/rp_sample.py" "$d:/tmp/rp_sample.py"
@@ -304,7 +359,7 @@ while read -r sh sv dh dv cls n st en opt; do
   case "$cls" in meter|core) k=$((k+1)); continue ;; esac
   dur=$((en-st)); off=$((WARM+st)); [ "$st" -eq 0 ] && { dur=$((en+WARM)); off=0; }
   if [ "$cls" = rdma ]; then
-    SRV[$dh]+="setsid nohup $PT -d $(dev_of $dh $dv) -q $n -m $QMTU $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) >/tmp/val_s$k.log 2>&1 </dev/null & "
+    SRV[$dh]+="setsid nohup $PT -d $(dev_of $dh $dv) -q $n -m $QMTU $RDMA_TC $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) >/tmp/val_s$k.log 2>&1 </dev/null & "
   elif [ "$cls" = udp ]; then
     SRV[$dh]+="setsid nohup /tmp/udp_blast -r -p $((5900+k)) -B $(ip_of $dh $dv) >/tmp/val_s$k.log 2>&1 </dev/null & "
   else
@@ -371,9 +426,9 @@ while read -r sh sv dh dv cls n st en opt; do
     # otherwise count as a live TCP flow-set at the receiver for the whole
     # wait (V9, 2026-09-02).
     if [ "$st" -gt 0 ]; then
-      cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-5-time.time()))\"; $PT -d $(dev_of $sh $sv) -q $n -m $QMTU $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) $extra $rctl' >/tmp/val_c$k.log 2>&1 </dev/null & "
+      cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-5-time.time()))\"; $PT -d $(dev_of $sh $sv) -q $n -m $QMTU $RDMA_TC $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) $extra $rctl' >/tmp/val_c$k.log 2>&1 </dev/null & "
     else
-      cmd="setsid nohup $PT -d $(dev_of $sh $sv) -q $n -m $QMTU $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) $extra $rctl >/tmp/val_c$k.log 2>&1 </dev/null & "
+      cmd="setsid nohup $PT -d $(dev_of $sh $sv) -q $n -m $QMTU $RDMA_TC $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) $extra $rctl >/tmp/val_c$k.log 2>&1 </dev/null & "
     fi
   elif [ "$cls" = udp ]; then
     cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-time.time()))\"; /tmp/udp_blast -c $dip -p $((5900+k)) -B $sip -G $extra -t $dur' >/tmp/val_c$k.log 2>&1 </dev/null & "
@@ -410,7 +465,7 @@ for h in $SENDERS; do
   scp -q "$(dpu_of $h):/tmp/rp_sample.err" "$OUT/rp_sample_$h.err" 2>/dev/null || true
 done
 snap_cnp > "$OUT/cnp_post.txt"
-for h in $RECVS; do scp -q "$(dpu_of $h):/tmp/hpft_rxagent_e.jsonl" "$OUT/rx_$h.jsonl"; done
+for h in $RECVS; do scp -q "$(dpu_of $h):/tmp/hpft_rxagent_e.jsonl" "$OUT/rx_$h.jsonl" 2>/dev/null || true; done
 for h in $SENDERS; do scp -q "$(dpu_of $h):/tmp/hpft_txagent_e.jsonl" "$OUT/tx_$h.jsonl" 2>/dev/null || true; done
 k=0
 while read -r sh sv dh dv cls n st en opt; do

@@ -18,13 +18,14 @@
 #                   1 equal cap: r_i = min(c_i, R/N)   2 equal split ignoring the CC: R/N
 #   AGENTS=0|1      keep the HyperFront agents running (default 1)
 #   TCP_CC=cubic    TCP congestion control
-#   RDMA_MTU=1024   perftest -m (4096 needs VF and representor MTU >= 4200)
+#   RDMA_MTU=4096   perftest -m (4096 is the lab default and needs VF and
+#                   representor MTU >= 4200, set by lab-infra/set_mtu.sh)
 #   RP_BIN=<path>   run another PCC binary on the sender DPUs (diagnostics only; knobs are ignored)
 set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd); cd "$REPO"
 NAME=${1:?name}; DUR=${2:?secs}; SPEC=${3:?spec file}
 ALGO=${ALGO:-2}; CC_ONLY=${CC_ONLY:-0}; LAW=${LAW:-0}
-AGENTS=${AGENTS:-1}; TCP_CC=${TCP_CC:-cubic}; RDMA_MTU=${RDMA_MTU:-1024}
+AGENTS=${AGENTS:-1}; TCP_CC=${TCP_CC:-cubic}; RDMA_MTU=${RDMA_MTU:-4096}
 # CC alone means no HyperFront at all: the RDMA executor is told to ignore
 # its budgets, the sender agents are stopped so nothing keeps writing TCP
 # rates, and the TCP rate table is emptied (an entry left from a previous

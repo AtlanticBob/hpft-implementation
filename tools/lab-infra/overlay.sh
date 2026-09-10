@@ -53,6 +53,10 @@ REPO=/home/zhaoxiang/hyperfront/hpft-implementation
 cd "$REPO"
 REG=config/lab-registry.json
 BR=ovsbr-p1
+# Every tenant netdev on the overlay carries the same MTU: the VF on the host
+# (vf_setup.sh), its representor here, and the bridge. p1 keeps 9000 for the
+# outer frame. See the registry's vf_mtu_comment.
+VF_MTU=$(python3 -c "import json;print(json.load(open('$REG'))['vf_mtu'])")
 COOKIE=0x4d45
 HUB=""; MODE=mesh
 while [ $# -gt 0 ]; do
@@ -171,8 +175,9 @@ for n in "${NODES[@]}"; do
         sudo ovs-vsctl --if-exists del-port underlay-p1 pf1vf\$i 2>/dev/null
         sudo ovs-vsctl --if-exists del-port ovsbr2 pf1vf\$i 2>/dev/null
         sudo ovs-vsctl --may-exist add-port $BR pf1vf\$i
+        sudo ip link set pf1vf\$i mtu $VF_MTU
       done
-      sudo ip link set $BR up"
+      sudo ip link set $BR up mtu $VF_MTU"
   ) &
 done
 wait

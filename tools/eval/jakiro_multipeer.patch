@@ -1,0 +1,91 @@
+--- jakiro_dhtb_flow.c.orig_singlepeer	2026-09-10 11:05:03.088788614 +0000
++++ jakiro_dhtb_flow.c	2026-09-10 11:05:03.707192563 +0000
+@@ -1081,33 +1081,77 @@
+ 	return DOCA_SUCCESS;
+ }
+ 
++/* HyperFront testbed adaptation (2026-09-10). UNDERLAY_SRC_IP may name several
++ * peers, comma separated, and one gate entry is installed per peer. As written
++ * the gate matched exactly one underlay source, which is all a two-machine
++ * testbed needs; this one has three senders reaching the same receiver, and the
++ * traffic of the other two would miss the gate and therefore bypass the DHTB
++ * entirely - the arm would silently measure no policing at all. Nothing about
++ * the match changes: each entry is the same exact match on (ingress port, outer
++ * source, outer destination, VxLAN destination port, VNI) the original built,
++ * repeated once per peer. The DHTB decision logic is untouched.
++ */
+ static doca_error_t add_outer_vxlan_gate_entry(struct doca_flow_pipe *root_pipe,
+ 					       const struct jakiro_dhtb_config *cfg,
+ 					       struct doca_flow_pipe *next_pipe,
+ 					       struct entries_status *status)
+ {
++	/* the counter table keeps the pointer, so these have to outlive the call */
++	static const char *const gate_names[] = {
++		"vxlan_gate_outer_to_decap",
++		"vxlan_gate_outer_to_decap_2",
++		"vxlan_gate_outer_to_decap_3",
++		"vxlan_gate_outer_to_decap_4",
++	};
+ 	struct doca_flow_match match;
+ 	struct doca_flow_match mask;
+ 	doca_be32_t underlay_src;
+ 	doca_be32_t underlay_dst;
+ 	doca_error_t result;
++	char srcs[256];
++	char *save = NULL;
++	char *tok;
++	size_t n = 0;
+ 
+-	result = ipv4_to_be32(cfg->underlay_src_ip, &underlay_src);
+-	if (result != DOCA_SUCCESS)
+-		return result;
+ 	result = ipv4_to_be32(cfg->underlay_dst_ip, &underlay_dst);
+ 	if (result != DOCA_SUCCESS)
+ 		return result;
+ 
+-	fill_outer_vxlan_match(&match, &mask, cfg, underlay_src, underlay_dst);
++	if (strlen(cfg->underlay_src_ip) >= sizeof(srcs)) {
++		DOCA_LOG_ERR("UNDERLAY_SRC_IP is too long");
++		return DOCA_ERROR_INVALID_VALUE;
++	}
++	strcpy(srcs, cfg->underlay_src_ip);
+ 
+-	return add_vxlan_gate_control_entry(root_pipe,
+-					    0,
+-					    "vxlan_gate_outer_to_decap",
+-					    &match,
+-					    &mask,
+-					    next_pipe,
+-					    status);
++	for (tok = strtok_r(srcs, ",", &save); tok != NULL; tok = strtok_r(NULL, ",", &save)) {
++		while (*tok == ' ')
++			tok++;
++		if (*tok == '\0')
++			continue;
++		if (n >= sizeof(gate_names) / sizeof(gate_names[0])) {
++			DOCA_LOG_ERR("UNDERLAY_SRC_IP names more peers than the gate can hold");
++			return DOCA_ERROR_INVALID_VALUE;
++		}
++		result = ipv4_to_be32(tok, &underlay_src);
++		if (result != DOCA_SUCCESS)
++			return result;
++		fill_outer_vxlan_match(&match, &mask, cfg, underlay_src, underlay_dst);
++		result = add_vxlan_gate_control_entry(root_pipe,
++						      0,
++						      gate_names[n],
++						      &match,
++						      &mask,
++						      next_pipe,
++						      status);
++		if (result != DOCA_SUCCESS)
++			return result;
++		n++;
++	}
++	if (n == 0) {
++		DOCA_LOG_ERR("UNDERLAY_SRC_IP is empty");
++		return DOCA_ERROR_INVALID_VALUE;
++	}
++	return DOCA_SUCCESS;
+ }
+ 
+ static doca_error_t configure_shared_meter(uint32_t meter_id,
