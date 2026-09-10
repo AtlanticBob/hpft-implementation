@@ -556,26 +556,79 @@ static inline void hpft_map_put(uint32_t qpn, uint32_t set_id)
 	}
 }
 
-static inline int hpft_set_of(uint32_t id)
+/* A flow set's slot is a function of its id, for the same reason a QP's
+ * record is a function of its key (hpft_q_home): the framework runs the
+ * algorithm on sixteen DPA threads at once and the DPA has no atomic to
+ * arbitrate a shared allocator with. Taking "the first free slot" lets two
+ * threads claiming two DIFFERENT ids pick the SAME slot; one id is then
+ * lost, and its QPs sit in a slot carrying another set's id and budget
+ * until the next millisecond's re-assert unbinds them and they claim a
+ * slot further along - by which time the id can hold two slots, the second
+ * one with no budget, and the QPs in it run at the unknown-flow allowance
+ * for the rest of the run (measured on V8, four runs of four: one 24-QP
+ * flow set held 22 or 23 of its QPs). Placing by the id makes the race
+ * idempotent: every thread claiming one id walks the same probe order and
+ * lands on the same slot. */
+static inline uint32_t hpft_set_home(uint32_t id)
 {
-	int free_i = -1;
+	/* the TOP bits of the multiplication, as in hpft_q_home: HPFT_SETS is
+	 * a power of two, so a modulo would keep only the low bits of the id */
+	return (((id + 1u) * 2246822519u) >> 27) % HPFT_SETS;
+}
+
+/* Where a set id lives, or -1. Lookup only: it never claims, and it stops
+ * at the first empty slot the way any open-addressed lookup does. */
+static inline int hpft_set_find(uint32_t id)
+{
+	uint32_t h;
 
 	if (!id)
 		return -1;
-	for (int i = 0; i < HPFT_SETS; i++) {
+	h = hpft_set_home(id);
+	for (uint32_t pr = 0; pr < HPFT_SETS; pr++) {
+		uint32_t i = (h + pr) % HPFT_SETS;
+
 		if (g_set[i].id == id)
-			return i;
-		if (free_i < 0 && g_set[i].id == 0)
-			free_i = i;
+			return (int)i;
+		if (!g_set[i].id)
+			return -1;
 	}
-	if (free_i >= 0) {
-		g_set[free_i].id = id;
-		g_set[free_i].budget = 0;
-		g_set[free_i].sum_cc = 0;
-		g_set[free_i].nq = 0;
-		g_set[free_i].nlive = 0;
+	return -1;
+}
+
+static inline int hpft_set_of(uint32_t id)
+{
+	uint32_t h;
+
+	if (!id)
+		return -1;
+	h = hpft_set_home(id);
+	/* the whole table, starting at the id's own home: a set never has to
+	 * give up while a slot is free anywhere */
+	for (uint32_t pr = 0; pr < HPFT_SETS; pr++) {
+		uint32_t i = (h + pr) % HPFT_SETS;
+		volatile hpft_set_t *s = &g_set[i];
+
+		if (s->id == id)
+			return (int)i;
+		if (!s->id) {
+			/* the slot is emptied before the id publishes it, so a
+			 * thread that sees the id sees a slot that is ready:
+			 * publishing first lets this initialiser wipe the
+			 * budget the mailbox has just written, or the members
+			 * another thread has just added */
+			s->budget = 0;
+			s->sum_cc = 0;
+			s->nq = 0;
+			s->nlive = 0;
+			s->tok = 0;
+			s->tok_ts = 0;
+			s->epoch_ts = 0;
+			s->id = id;
+			return (int)i;
+		}
 	}
-	return free_i;
+	return -1;
 }
 
 /* ========================= diagnostics ========================= */
@@ -912,17 +965,20 @@ static inline void hpft_q_reassert(volatile hpft_q_t *q, uint32_t slot)
 	int si = (int)q->set - 1;
 
 	if (si >= 0 && si < HPFT_SETS) {
-		/* The agent may correct a binding after the fact (the
+		/* Once a millisecond, follow the map: a QP sitting anywhere
+		 * other than the slot its set id actually lives in lets go
+		 * and is bound again on its next TX event. That covers both
+		 * the agent correcting a binding after the fact (the
 		 * resolver's first answer for a QP can be a stale pairing
-		 * from the previous run: one vf2 QP listed under vf1's set,
-		 * 2026-09-08). Once a millisecond, follow the map: a QP
-		 * whose set id no longer matches lets go and is bound again
-		 * on its next TX event. */
+		 * from the previous run) and a slot claimed out from under
+		 * this QP by another id - and, because the surviving slot is
+		 * always the one nearest the id's home, it also empties a
+		 * slot two threads made for one id. */
 		uint32_t id = hpft_map_get(q->key);
 
 		if (!id)
 			id = hpft_map_get(q->qpn);
-		if (id && g_set[si].id != id) {
+		if (id && hpft_set_find(id) != si) {
 			q->set = 0;
 			g_q_unbind++;
 			g_unbind_map++;
@@ -1287,9 +1343,14 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 				if (si < 0)
 					continue;
 				if (!bud) {
-					g_set[si].id = 0;
-					g_set[si].nq = 0;
+					/* retire: empty the slot before letting
+					 * go of the id, or a thread claiming it
+					 * meanwhile inherits this set's members
+					 * and pool level */
 					g_set[si].budget = 0;
+					g_set[si].nq = 0;
+					g_set[si].tok = 0;
+					g_set[si].id = 0;
 				} else {
 					g_set[si].budget =
 						bud > DOCA_PCC_DEV_MAX_RATE
