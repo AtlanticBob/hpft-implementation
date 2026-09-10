@@ -382,9 +382,20 @@ done
 echo "== DPU clock offsets (want within 0.5 s of the host) =="
 for n in $NODES; do
   # bracket each ssh with the host clock and compare against the midpoint,
-  # so the ssh round trip (~0.5 s) is not read as an offset
-  T1=$(date +%s.%N); r=$(ssh -o BatchMode=yes "$n" 'date +%s.%N' 2>/dev/null); T2=$(date +%s.%N)
-  off=$(awk -v a="$T1" -v b="$T2" -v d="$r" 'BEGIN{ if (d=="") exit 1; printf "%.3f", d-(a+b)/2 }')
+  # so the ssh round trip is not read as an offset. The DPU's `date` runs
+  # somewhere inside that round trip, not at its midpoint, so one sample
+  # carries up to half the round trip (0.3 s on a slow ssh setup) of error
+  # either way and flapped across the 0.5 s line on a synced clock
+  # (2026-09-10). Three samples, keep the one with the shortest round trip.
+  off=""; best=""
+  for _ in 1 2 3; do
+    T1=$(date +%s.%N); r=$(ssh -o BatchMode=yes "$n" 'date +%s.%N' 2>/dev/null); T2=$(date +%s.%N)
+    [ -n "$r" ] || continue
+    rtt=$(awk -v a="$T1" -v b="$T2" 'BEGIN{ printf "%.3f", b-a }')
+    if [ -z "$best" ] || awk -v x="$rtt" -v y="$best" 'BEGIN{exit !(x<y)}'; then
+      best=$rtt; off=$(awk -v a="$T1" -v b="$T2" -v d="$r" 'BEGIN{ printf "%.3f", d-(a+b)/2 }')
+    fi
+  done
   if [ -z "$off" ]; then echo "  UNREACHABLE  $n"; bad=1; continue; fi
   if awk -v o="$off" 'BEGIN{exit !(o>0.5 || o<-0.5)}'; then
     echo "  DIFFERS  $n clock is ${off} s off the host (run tools/lab-infra/dpu_time_sync.sh apply)"; bad=1

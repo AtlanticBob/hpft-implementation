@@ -79,7 +79,9 @@ cp "$FLOWS" "$OUT/flows.txt"; echo "$WARM" > "$OUT/warm.txt"
 LOCK=/tmp/hpft_run.lock; exec 9>"$LOCK"
 flock -n 9 || { echo "ABORT: another run holds $LOCK"; exit 1; }
 echo "$TAG $$" >&9
-bash tools/lab-infra/deploy_check.sh >/dev/null || { bash tools/lab-infra/deploy_check.sh; echo "ABORT: lab does not match the repo"; exit 1; }
+# one run of the check, its output shown only when it fails: a second run
+# for the printout can pass where the first failed and hide the reason
+DC=$(bash tools/lab-infra/deploy_check.sh 2>&1) || { echo "$DC"; echo "ABORT: lab does not match the repo"; exit 1; }
 python3 - <<'EOF' || { echo "ABORT: standing registry is not the standard validation policy"; exit 1; }
 import json, sys
 r = json.load(open("config/lab-registry.json"))
