@@ -12,7 +12,13 @@ start)
     sudo pkill -9 -x doca_pcc 2>/dev/null
     pkill -9 -f "sleep infinity" 2>/dev/null
     sleep 1
-    rm -f $FIFO; mkfifo $FIFO
+    # Both files live in the sticky /tmp and are recreated here. If either was
+    # last created by root (a start run under sudo), this user can neither
+    # remove nor open it - Ubuntu's protected_regular refuses root the reverse
+    # case too - and the RP silently never launches (2026-09-10, dpu2: three
+    # 'starts' in a row, no process, no error anywhere but a redirect line).
+    sudo rm -f $FIFO $LOG
+    mkfifo $FIFO
     setsid bash -c "sleep infinity > $FIFO" </dev/null >/dev/null 2>&1 &
     # no --remote-sw-handler: CCMAD RTT probes are answered by the REMOTE
     # NIC's HW handler (no NP process runs on the far DPU; with the flag

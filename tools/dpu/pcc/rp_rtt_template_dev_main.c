@@ -103,6 +103,20 @@ static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE / 50u);
 #define HPFT_LAW_TOKEN  (0u)
 #define HPFT_LAW_CAP    (1u)
 #define HPFT_LAW_EQUAL  (2u)
+/* 3 = the proportional pool (2026-09-10, under test as an arm): the same pool,
+ * the same refill and the same payment, but the set's allowance is divided by
+ * the SUM of its members' CC rates instead of by their count, and each QP gets
+ * its own share of that sum:
+ *   r_i = min(c_i, c_i * (R + pool) / sum_cc)
+ * sum_cc is the sum the per-set epoch already keeps (sum c_j over the QPs
+ * drawing), so no new arithmetic crosses QPs. That sum is up to a millisecond
+ * stale, and the pool is what makes that harmless: if the sum is off by a
+ * factor k the set sends R/k, the pool moves, and it settles exactly where
+ * (R + pool)/sum_cc equals R over the true sum - the k cancels and every QP
+ * ends at c_i * R / sum c_j, which is the design's formula. The pool depth
+ * bounds how far a stale sum can be corrected (a quarter of a period of R,
+ * so +-25 % of R); beyond that the correction saturates. */
+#define HPFT_LAW_PROP   (3u)
 /* The flow set owns a pool of bytes refilled at R; a QP may send at its own
  * CC's rate as long as the pool can pay for it. Nothing here needs sum c_j:
  * the volatile quantity - each QP's rate, which a delay-based CC changes
@@ -1241,7 +1255,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			hpft_set_epoch(s, now, (uint32_t)si);
 			R = s->budget;
 			n = s->nlive ? s->nlive : (s->nq ? s->nq : 1u);
-			if (g_law == HPFT_LAW_TOKEN) {
+			if (g_law == HPFT_LAW_TOKEN || g_law == HPFT_LAW_PROP) {
 				uint32_t ceil_, dt;
 
 				hpft_pool_refill(s, now);
@@ -1264,7 +1278,24 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				q->tok_ts = now;
 				s->tok -= (int32_t)(((int64_t)q->paced *
 						     HPFT_LINE_B_PER_US * dt) >> 20);
-				ceil_ = hpft_pool_ceiling(s);
+				if (g_law == HPFT_LAW_PROP) {
+					/* this QP's share of the set's allowance,
+					 * in proportion to its own CC rate */
+					int64_t bonus = ((int64_t)s->tok << 20) /
+							((int64_t)HPFT_EPOCH_US * HPFT_LINE_B_PER_US);
+					int64_t allow = (int64_t)s->budget + bonus;
+					uint32_t den = s->sum_cc ? s->sum_cc : 1u;
+					int64_t p;
+
+					if (allow < 0)
+						allow = 0;
+					p = ((int64_t)r * allow) / den;
+					if (p > (int64_t)s->budget)
+						p = s->budget;
+					ceil_ = (uint32_t)p;
+				} else {
+					ceil_ = hpft_pool_ceiling(s);
+				}
 				if (ceil_ < r)
 					r = ceil_;
 				goto shaped;
@@ -1384,7 +1415,7 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			else if (which == 18) g_dq_bytes = budget ? budget : 1u;
 			else if (which == 19) g_dq_monitor_us = budget;
 			else if (which == 21) g_unknown_rate = budget ? budget : DOCA_PCC_DEV_MAX_RATE;
-			else if (which == 22) g_law = budget > 2u ? HPFT_LAW_TOKEN : budget;
+			else if (which == 22) g_law = budget > 3u ? HPFT_LAW_TOKEN : budget;
 			else if (which == 24) g_active_us = budget ? budget : 1000u;
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
