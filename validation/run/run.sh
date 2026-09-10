@@ -109,10 +109,15 @@ echo "retransmission: SR (ROCE_ACCL selective_repeat_forced_en=1 on $HOSTS)" | t
 # decided by the flow table, not by the role assignment
 bash tools/lab-infra/roles.sh all >/dev/null
 sleep 4
-# udp_blast too: a sink left from an earlier run keeps its port, the new
-# sink's bind then fails and the client sees "Connection refused" (V7,
-# 2026-09-08: 6.8 G of the 40 G background reached the receiver)
-for h in $HOSTS; do on_host "$h" 'pkill -f "ib_write_b[w]" 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x udp_blast 2>/dev/null; true'; done
+# A sink left from an earlier run keeps its port, the new sink's bind then
+# fails and the client sees "Connection refused" - 7.6 of the 40 G background
+# reached the receiver and the run looked like a fairness result (V7,
+# 2026-09-09). udp_blast prints a summary on SIGTERM, so it does not exit at
+# once; wait for the name to be gone and only then start listeners, and kill
+# what is left rather than racing it.
+for h in $HOSTS; do on_host "$h" 'pkill -f "ib_write_b[w]" 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x udp_blast 2>/dev/null
+  for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x "udp_blast|iperf3" >/dev/null 2>&1 || break; sleep 0.5; done
+  pkill -9 -x udp_blast 2>/dev/null; pkill -9 -x iperf3 2>/dev/null; true'; done
 sleep 1
 
 snap_cnp() {
@@ -309,6 +314,15 @@ while read -r sh sv dh dv cls n st en opt; do
 done <<<"$ROWS"
 for h in $RECVS; do on_host "$h" "${SRV[$h]} true"; done
 sleep 2
+# Every listener must really be listening. A sink that failed to bind is
+# invisible otherwise: the run completes, the flow reports a rate, and only
+# the arithmetic of the expected values gives it away.
+while read -r sh sv dh dv cls n st en opt; do
+  [ "$cls" = udp ] || continue
+  k2=0; while read -r a b c d e f g i j; do [ "$a $b $c $d $e" = "$sh $sv $dh $dv $cls" ] && break; k2=$((k2+1)); done <<<"$ROWS"
+  on_host "$dh" "ss -lun | grep -q ':$((5900+k2))\b'" \
+    || { echo "ABORT: $dh is not listening on udp port $((5900+k2)) - a sink from an earlier run still holds it"; exit 1; }
+done <<<"$(echo "$ROWS" | awk '$5=="udp"')"
 # one vport-meter sampler per receiving DPU (the meter runs on every DPU)
 for h in $RECVS; do
   d=$(dpu_of $h)
