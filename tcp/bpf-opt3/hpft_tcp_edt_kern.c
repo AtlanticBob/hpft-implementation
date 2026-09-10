@@ -15,25 +15,26 @@
  * HyperFront's unit is the FLOW SET (one source VM, one destination VM,
  * one class); the sender agent writes the flow set's rate R into
  * hpft_pair_cfg. The tenant's congestion control is per CONNECTION and
- * this program never touches it. HyperFront here is ONE TOKEN BUCKET PER
- * FLOW SET filled at R (design v4 section 6): the connections draw at the
- * rate their own CC produces, and when the set asks for more than R the
- * bucket is shared in proportion to how fast each one draws. A window CC
- * draws at cwnd/RTT, and all connections of a set share one path, so the
- * proportion is the proportion of windows:
+ * this program never touches it. The flow set is capped at R and R is
+ * split among its connections IN PROPORTION TO THEIR WINDOWS (design v4
+ * section 6.1, the TCP rule): a window CC sends at cwnd/RTT, and all
+ * connections of a set share one path and one RTT, so
  *
  *      r_i = R * w_i / sum_j w_j       (j over connections that sent)
  *
- * with w_i = snd_cwnd * mss read from the socket on the way past. A
- * connection never exceeds its own CC (it cannot put more than cwnd in
- * flight), so nothing here raises anyone; HyperFront only caps the set.
+ * with w_i = snd_cwnd * mss read from the socket on the way past. This is
+ * the counterpart of the RDMA executor's token pool; it can use a sum
+ * across connections because the pair's spin lock makes the sum
+ * consistent, which the DPA cannot offer. A connection never exceeds its
+ * own CC (it cannot put more than cwnd in flight), so nothing here raises
+ * anyone; HyperFront only caps the set.
  *
  * Each connection has its own earliest-departure clock. That is what
  * makes r_i a per-connection quantity on the wire, and it is also what
  * keeps one connection's shaping debt from becoming another's delay or
- * loss: with one clock per flow set a bulk connection's backlog delayed a
- * request/response connection's packets and dropped them at the debt cap
- * in its stead. The sum over the set is bounded by R by construction.
+ * loss. The sum over the set is bounded by R by construction (over one
+ * epoch; within an epoch the numerators are current and the denominator
+ * is the previous epoch's).
  *
  * The denominator is rebuilt every epoch (10 ms, one HyperFront period)
  * from the connections that actually sent in the previous epoch, so a
@@ -50,8 +51,8 @@
 /* Max shaping debt one connection may carry, as future-stamp distance.
  * Beyond it, packets are dropped (policer tail on the EDT shaper). The
  * drop is a backstop against unbounded debt from a CC that never yields;
- * it is now per connection, so a deep-debt bulk connection only ever drops
- * its own packets. */
+ * it is per connection, so a deep-debt bulk connection only ever drops its
+ * own packets. Design v4 6.3 lists it as the TCP executor's boundary. */
 #define HPFT_DEBT_CAP_NS (200ULL * 1000 * 1000)
 /* One epoch of the flow set's denominator: one HyperFront period. */
 #define HPFT_EPOCH_NS 10000000ULL

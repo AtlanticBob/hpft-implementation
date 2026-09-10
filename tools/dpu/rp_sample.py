@@ -11,19 +11,17 @@ record dump is the one thing too big to do in a pass, so it is spread over the
 passes that follow it.
 
 The readback (rp_rtt_template_dev_main.c, 0xded) is, per flow set: id, R
-(the ledger's budget), RATE x TIME the set was paced at since the last read,
+(the permitted rate min(R, U) the sender agent wrote), RATE x TIME the set was paced at since the last read,
 the sum of the CC rates over every QP on its list, the sum of the CC rates
 over the QPs that drew tokens in the last millisecond, how many QPs that is,
 and how many QPs are on the list. Rates are converted from the device's
 2^20-of-line-rate units to Gb/s of a 200 G port.
 
-The third field is a counter, not a rate, and this is where it becomes one:
-divided by the interval between THIS query of the slot and the previous one.
-The device used to report the last rate it had written, sampled once a second
-- an instantaneous sample of something that moves every few microseconds, and
-the wire carried 1.7 to 24.5 % more than the sum of those samples claimed
-(2026-09-09). The first query of a slot has no interval yet, so it only
-starts the clock and emits nothing.
+The third field is a counter (rate x time), not a rate, and this is where it
+becomes one: divided by the interval between THIS query of the slot and the
+previous one. A once-a-second sample of the instantaneous rate would not do:
+that quantity moves every few microseconds. The first query of a slot has no
+interval yet, so it only starts the clock and emits nothing.
 
 usage: rp_sample.py <duration_s> <out_jsonl> [interval_s=1.0] [line_gbps=200]
 record: {"ts", "slot", "id", "R", "paced", "cc", "cc_live", "nlive", "nq"}

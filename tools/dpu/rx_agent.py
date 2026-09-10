@@ -15,10 +15,13 @@ Pipeline per control period T:
           second gives lenders a finite demand and yields the ENTITLEMENT
           E_f (§4.4)
   ledger  Q_f <- clip(Q_f + A_f - E_f, 0, D*E_f);  q_f = Q_f / E_f (§4.5)
-  telem   one UDP datagram per sender DPU per tick: the normalised queue
-          q_f and nothing that can be turned back into a rate (principle
-          two). A record every tick even when q = 0 - the record IS the
-          freshness permit, and its absence triggers the sender's fail-open.
+  telem   one UDP datagram per sender DPU per tick with one record per
+          present flow-set: the virtual queue (microseconds of expected
+          bytes; the sender divides by the period to get q) and the
+          attributed arrival r (read by the sender's uplink tree as demand,
+          not by the law - IMPLEMENTATION.md section 4 item 1). A record
+          every tick even when q = 0 - the record IS the freshness permit,
+          and its absence triggers the sender's fail-open.
 
 E_f, the share and the ceiling stay local: they are what the ledger is
 computed from, kept in the jsonl log for offline analysis but never on the
@@ -442,7 +445,7 @@ class HybridRates:
         self.unattributed = 0.0
         self.young_active = set()         # partially-visible newcomers
         self.liveness = None              # SenderLiveness (advisory)
-        self.attr_tol = 0.15              # how far a pool may exceed the senders'
+        self.attr_tol = 0.15              # set from delta_demand in main(): how far a pool may exceed the senders'
                                           # own reports before the excess is read
                                           # as an undiscovered sender's traffic
 
@@ -917,6 +920,7 @@ def main():
         rate_window_s=ep.get("rate_window_s", 0.006),
         meter=vpm)
     hybrid.liveness = liveness
+    hybrid.attr_tol = float(ep["delta_demand"])   # the one tolerance, 2 of the design
     sched = Scheduler(reg["policy"], line, ep["headroom"], ep["delta_demand"])
     last_seen = {}
     ctl = reg["control"]
@@ -956,29 +960,12 @@ def main():
     conf_other, conf_other_vm = 0.0, {}   # smoothed unscheduled arrival: total, per dst VM
     conf_other_tau = float(ep.get("other_tau_s", 0.1))
     conf_aavg, conf_avg_tau = {}, float(ep.get("decision_avg_s", 0.1))   # averaged arrival for the lender decision
-    # A flow-set that has just STARTED SENDING is not judged to be lending for
-    # this long: "I am not using my share" and "I have not finished ramping"
-    # look the same to a 100 ms average of the arrival, and reading a newcomer
-    # as a lender hands its share to the incumbents through the fill while the
-    # newcomer keeps that same share, so the entitlements add up to more than
-    # the root for as long as the ramp lasts.
-    # Armed by the first arrival, never by membership: a flow-set appears in
-    # the table when its sender connects, which is well before its scheduled
-    # start (iperf3's control connection, perftest's QP exchange), and a
-    # not-yet-sending flow-set that is exempt from the lender test holds a
-    # full share it cannot use - measured on V2, 2026-09-08: the four TCP
-    # flow-sets of the next phase cost the running ones 8 % of the port.
-    # The arm is remembered for n3_evict_s after the flow-set goes quiet, so
-    # one that blips in and out is not re-armed on every reappearance.
-    conf_first, conf_settle = {}, float(ep.get("lender_settle_s", ep.get("fs_grace_s", 0.5)))
-    conf_first_keep = float(ep.get("n3_evict_s", 30))
-    conf_start_floor = float(ep.get("r_floor_bps", 1e9))
     conf_croot = sched.c_root
     # the ledger's cap D in seconds: D periods of expected bytes (4.5)
     conf_dr = float(ep.get("D", 30)) * period
     delays, ents, ceils = {}, {}, {}
-    print("rx_agent: ledger cap D=%.0f periods (%.0f ms), lender settle %.2fs"
-          % (conf_dr / period, conf_dr * 1e3, conf_settle), flush=True)
+    print("rx_agent: ledger cap D=%.0f periods (%.0f ms)"
+          % (conf_dr / period, conf_dr * 1e3), flush=True)
     last_speed = c_link
     sched.set_downlink(c_link)
 
@@ -1089,7 +1076,10 @@ def main():
             conf_other_vm[d_] = conf_other_vm.get(d_, 0.0) + (other_vm_now.get(d_, 0.0) - conf_other_vm.get(d_, 0.0)) * a_
         link_ = sched.c_root / (1.0 - sched.headroom)
         root_nominal = sched.c_root
-        sched.c_root = max(link_ - conf_other, 0.05 * link_) * (1.0 - sched.headroom)
+        # 4.3: (port - unscheduled) x (1-h), never below the floor of a few
+        # percent of the port; the floor is on the result, so it is the 5 %
+        # of the parameter table and not 5 % less the headroom
+        sched.c_root = max((link_ - conf_other) * (1.0 - sched.headroom), 0.05 * link_)
         conf_croot = sched.c_root
         vm_minus = {d_: v_ for d_, v_ in conf_other_vm.items() if v_ > 0}
         big = 10.0 * root_nominal
@@ -1104,30 +1094,15 @@ def main():
             conf_aavg[f] = conf_aavg.get(f, active[f]) + (max(active.get(f, 0.0), 0.0) - conf_aavg.get(f, active[f])) * a_
         for f in [f for f in conf_aavg if f not in active]:
             del conf_aavg[f]
-        for f in active:
-            if active.get(f, 0.0) >= conf_start_floor:
-                w = conf_first.get(f)
-                if w is None or now - w[1] > conf_first_keep:
-                    conf_first[f] = [now, now]
-                else:
-                    w[1] = now
-        for f in [f for f in conf_first if now - conf_first[f][1] > conf_first_keep]:
-            del conf_first[f]
-        # A flow-set still ramping asks for everything: its averaged
-        # arrival is climbing, so the lender test would read it as
-        # lending capacity it has not had the chance to use, and the
-        # incumbents would be granted that capacity on top of the
-        # share the newcomer keeps. Over the 2026-09-08 runs that
-        # double count put the entitlements 13 to 44 % above the root
-        # for 0.2 to 1.3 s after every join, which is what fills the
-        # ledger and buys the 1.5 s repayment that follows.
+        # 4.4: a flow-set whose averaged arrival, with the growth margin, is
+        # still under its share is a lender; it keeps E = share and lends the
+        # rest through the fill. Nothing exempts a newcomer: reading it as a
+        # lender while it ramps is the join-edge cost design 8.1 accepts.
         demand = {}
         lenders = set()
         for f in active:
             want = conf_aavg[f] * (1.0 + ep["delta_demand"])
-            w = conf_first.get(f)
-            ramping = w is not None and now - w[0] < conf_settle
-            if want < share.get(f, 0.0) and not ramping:
+            if want < share.get(f, 0.0):
                 demand[f] = want
                 lenders.add(f)
             else:

@@ -74,9 +74,10 @@ representor 加 3 条 vxlan 隧道（每台到其它三台各一条；`tos=inher
   `hpft-pace-shim` 写 BPF map）；同时把本机每个 VF 每类的发送速率报给所有其它节点，供接收端拆分。
   同 host 还要跑 `hpft-qpn-resolver`，它把 `{qpn → 流对}` 喂给代理再到执行面；**没有它执行面不知道
   哪些 QP 属于同一个流集合，每个 QP 都按未知流集合的放行额度跑**。
-- **执行面只读租户 CC、不改它：每个流集合一个令牌池**（设计 6 节）。池按许可速率 $R$ 续满，
-  流集合里的每个 QP 或每条 TCP 连接按自己的 CC 速率 $c_i$ 取令牌，每条流的上限是
-  $r_i=\min(c_i,(R+P)/N)$，$P$ 是池上一个四分之一毫秒攒下的存量、$N$ 是最近一毫秒在发的流数。
+- **执行面只读租户 CC、不改它，把流集合封顶在许可速率 $R$**（设计 6 节）。RDMA 侧是每流集合一个令牌池：
+  池按 $R$ 续满，每个 QP 按自己的 CC 速率 $c_i$ 取令牌，上限 $r_i=\min(c_i,(R+P)/N)$，$P$ 是池上一个
+  四分之一毫秒攒下的存量、$N$ 是最近一毫秒在发的 QP 数，流集合内部接近等分。TCP 侧是按窗口比例分，
+  流集合内部要得多的连接拿得多；两条规则分开是因为 DPA 上读不到跨 QP 一致的和（设计 6.1、6.3 节）。
   RDMA 侧是 `tools/dpu/pcc/rp_rtt_template_dev_main.c`
   （DOCA PCC device 码，跑在 DPA 上）：四张卡都设了 `ROCE_CC_SHAPER_COALESCE_P2=SOURCE_QP`，
   一个 QP 就是一条 PCC 流，租户 CC（DCQCN 缺省、Swift、ZTR）逐 QP 运行、事件准确归属；QP 记录
@@ -166,7 +167,7 @@ registry 的 `sender_host`/`receiver_host`。评估战役的 runner 用环境变
   选中）。判据是接收端按 MAC 的归属：`-R` 给 vf1>vf1，`-x 3` 给 vf0>vf1。
 - **流集合号只是名字**：注册表里有 flowtag 的用 flowtag，没有的（sgpu02 以外的主机的 vf4–vf7）
   用 (源, 目的) 字符串的 CRC32；代理与 `validation/distill.py` 用同一条规则。没有集合号的流集合既收不到
-  预算也绑不上 QP，整场按未知额度跑。
+  许可速率也绑不上 QP，整场按未知额度跑。
 - **PCC device 码改完要在每一台 DPU 上重编**
   （`meson setup --reconfigure build && ninja -C build pcc/doca_pcc`）。`ninja`
   单独不重编设备码，dpacc 是 configure 步。`deploy_check.sh --deploy` 会替源码

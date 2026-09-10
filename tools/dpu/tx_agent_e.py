@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sender-side agent: the fence law of design v4 (§5). Runs on the sender
+"""Sender-side agent: the rate law of design v4 (§5). Runs on the sender
 DPU Arm.
 
 Per telemetry record from the owner (receiver DPU) the fence takes one
@@ -48,7 +48,7 @@ import mmap
 import fastfill
 import hw_maxrate
 
-FIFO = "/tmp/rp_fifo"   # PCC RP mailbox (batched: 0xb47c000N ft bud rate ...)
+FIFO = "/tmp/rp_fifo"   # RDMA executor mailbox: 0xb47f|n {set id, rate}, 0xb48e|n {key, set id}
 
 # binary telemetry - MUST match rx_agent.Telemetry.REC exactly; the two
 # agents are deployed and restarted together or the loop parses garbage.
@@ -617,13 +617,15 @@ def main():
     # in 99% of feedbacks, and three-run A/Bs on V1, V2 and V7 were
     # indistinguishable) and is kept selectable for reference.
     v4_linear = str(ep.get("step_form", "linear")).lower() != "exp"
-    print("tx_agent_e: v4 step form = %s" % ("linear (1+x, |x|<=1/2)" if v4_linear else "exp"), flush=True)
+    print("tx_agent_e: v4 step form = %s" % ("linear (1+am, 1-x with |x|<=1/2)" if v4_linear else "exp"), flush=True)
     tree_theta = float(ep.get("tree_backlog_theta", 0.85))
-    # 5.3 third term; togglable so the tree's contribution to the probe
-    # ceiling can be isolated against a control run
-    probe_cap_tree = bool(ep.get("probe_cap_tree", True))
     tree_period_s = float(ep.get("tree_period_ms", 100)) / 1e3
-    v4_cap_mult = float(ep.get("r_cap_mult", 2.0))
+    # 5.3: the probe may not pass twice the flow-set's own send rate; the 2
+    # is the meaning of the rule (how much an application may amplify on
+    # its return), not a tuning object. The send rate is averaged over the
+    # observation window the receiver's decisions use.
+    v4_cap_mult = 2.0
+    as_avg_s = float(ep.get("decision_avg_s", 0.1))
     # §5.4: a flow-set starts at the port's headroom h*C - the capacity the
     # receiver keeps free for transients - so a newcomer can never push the
     # port past line rate even when everyone else is at their share, and it
@@ -645,7 +647,7 @@ def main():
         src, cls = fsid.split(">")[0], fsid.rsplit("|", 1)[1]
         a_s = live.rate.get("%s|%s" % (src, cls)) if live is not None else None
         if a_s is not None:
-            st.as_avg += (float(a_s) - st.as_avg) * min(1.0, (now - st.last_step) / 0.1) if st.as_avg > 0 else float(a_s) - st.as_avg
+            st.as_avg += (float(a_s) - st.as_avg) * min(1.0, (now - st.last_step) / as_avg_s) if st.as_avg > 0 else float(a_s) - st.as_avg
         # 5.3: the probe may not climb into rates the flow-set could
         # never use. pace = min(R, Tree), so a fence above the local
         # tree buys nothing and only lengthens the fall when the share
@@ -658,8 +660,7 @@ def main():
         # the tree could never grow again. One delta of headroom keeps
         # the demand above the tree and the growth path open.
         cap = line if a_s is None else max(v4_cap_mult * st.as_avg, v4_start)
-        if probe_cap_tree:
-            cap = min(cap, tree_of(fsid) * (1.0 + ep["delta_demand"]))
+        cap = min(cap, tree_of(fsid) * (1.0 + ep["delta_demand"]))
         if st.mode == "fresh":
             # §5.4: start at the port's headroom (bounded by the local
             # tree), not at a floor. The silence starts at its cap, not
@@ -961,7 +962,9 @@ def main():
             print("tx_agent_e: policy reload failed: %s" % e, flush=True)
 
     def tree_of(f):
-        return tree_applied.get(f, trees.get(f, ctl["tree_stub_bps"]))
+        # the tree is recomputed the moment a flow-set appears, so the last
+        # fallback (the whole uplink share) is only ever read before that
+        return tree_applied.get(f, trees.get(f, stree.cap))
 
     def apply_trees(now_):
         """Let Tree_f rise freely, limit how fast it may fall."""

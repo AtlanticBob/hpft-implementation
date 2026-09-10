@@ -24,29 +24,10 @@ sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-implementation/tools/tcp_sha
 from tcp_shaper_lib import (  # noqa: E402
     DirectBpfMapWriter,
     build_pair_cfg_update,
-    make_generation,
     pack_pair_state,
     vnic_index,
 )
 
-
-_GEN_CACHE = {}   # pair -> (rate_bps, generation)
-
-def _gen_for(pair, rate_bps):
-    """Stable generation per pair: a new generation tells the BPF side to
-    (bounded-)forgive debt, so mint one only on first install or a large
-    (>25%) rate step -- NOT on every push. Minting per push amnestied the
-    debt every ~100 ms and let deep-debt senders (BBR) run past the pace
-    (2-1-2 expM escape)."""
-    prev = _GEN_CACHE.get(pair)
-    if prev is not None:
-        prev_rate, gen = prev
-        if prev_rate > 0 and abs(rate_bps - prev_rate) <= 0.25 * prev_rate:
-            _GEN_CACHE[pair] = (rate_bps, gen)
-            return gen
-    gen = make_generation()
-    _GEN_CACHE[pair] = (rate_bps, gen)
-    return gen
 
 TCP_PIN_DIR = Path("/sys/fs/bpf/hpft_tcp_edt")
 TCP_REGISTRY = "/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-tcp-registry.json"
@@ -119,10 +100,10 @@ def main():
                 rate_bps=int(msg["rate_bps"]),
                 burst_bytes=BURST_BYTES,
                 # the BPF program reads only rate_bps (the flow set's R)
-                # and burst_bytes (per connection); flags are unused
+                # and burst_bytes (per connection); flags and generation
+                # are stored, never acted on
                 flags=0,
-                generation=_gen_for((msg["src_vnic"], msg["dst_vnic"]),
-                                    int(msg["rate_bps"])))
+                generation=0)
             writer.update(upd)
             n += 1
             reply = {"ok": True,

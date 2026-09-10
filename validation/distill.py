@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""results/<tag>/ -> data/<tag>_*.csv, and the five verdicts of README §三.
+"""results/<tag>/ -> data/<tag>_*.csv, and the six verdicts of README §三.
 
 Reads (the only script that reads raw results/):
   flows.txt        the flow table the run used (one row per flow-set); every
@@ -21,7 +21,7 @@ Writes:
   data/<tag>_flowsets.csv   one row per (phase, flow-set): expected, attributed
                             mean/sd, goodput over the whole run
   data/<tag>_events.csv     one row per event: convergence time per group
-  data/<tag>_verdict.csv    the five criteria, pass/fail, detail
+  data/<tag>_verdict.csv    the six criteria, pass/fail, detail
 usage: distill.py <tag>
 """
 import csv, json, os, re, sys, zlib
@@ -53,11 +53,11 @@ Q_MEAN_MAX_MS, Q_CLEAR_MAX_S, Q_ZERO_MS = 1.0, 1.0, 0.05
 # at least once per Q_CLEAR_MAX_S - plus a bound on the mean. Counting how
 # OFTEN it is non-empty is the wrong test for this control: the steady state
 # is a sawtooth by construction (probe up, cross the share, repay), so
-# demanding an empty ledger 95 % of the time is demanding the fence sit
+# demanding an empty ledger 95 % of the time is demanding the permitted rate sit
 # below the share 95 % of the time, which buys a clean ledger with
 # throughput. Q_ZERO_MS is float tolerance, not a budget.
 CONV_TOL, CONV_HOLD, CONV_MAX = 0.10, 1.0, 1.0
-# criterion 6, the executor's account of itself (design 6.4 properties 1, 2):
+# criterion 6, the executor's account of itself (design 6.3 properties 1, 2):
 # over the steady samples in which every listed QP is drawing (see the note at
 # the check), paced/R has mean <= EX_OVER_MEAN and 95th percentile <=
 # EX_OVER_P95 (R itself is a 20 ms sawtooth and paced lags it by one event,

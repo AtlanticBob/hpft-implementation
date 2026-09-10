@@ -1,6 +1,6 @@
 # src_host src_vf dst_host dst_vf class count start_s end_s options   (times on the experiment clock, after the 5 s warm-up)
 # V8 核心链路版的 TCP 配置：13–27 s 加入的四个 VM 跑 TCP 而不是 RDMA，其余与 V8_core 相同。
-# 检验 TCP 执行面在一条只丢包（TCP 不开 ECN）的真核心链路上的置信度边界（design v4 §8.1）。
+# 检验 TCP 执行面在一条只丢包（TCP 不开 ECN）的真核心链路上的边界（design v4 §8.1）。
 # 两个 RDMA 流集合各 24 个 QP，与 V8_core 一致。RDMA 和 TCP 现在同在一个 70.47 MB 的出向池里，
 # 两个类都排队时每个类的门限是池的三分之一，约 23.5 MB，两边都会丢包。
 sgpu01 0 sgpu02 0 rdma 24 0 40 -

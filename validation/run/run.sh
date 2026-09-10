@@ -12,8 +12,8 @@
 # so that its first packet lands at T0 + warm-up + start (RDMA: perftest
 # --start_at on both ends; TCP: iperf3 --start-at); collects the three
 # data paths (vport-meter series, per-flow application logs, agent jsonl)
-# plus the executor/CNP/switch snapshots; restores nothing because it changed
-# nothing standing. A flow-table row names its destination host, so a run
+# plus the executor/CNP/switch snapshots; on exit writes the executor knobs
+# back to their defaults and, on the CC-only arm, restarts the sender agents. A flow-table row names its destination host, so a run
 # may have several receivers (2026-09-04): each gets its own listeners,
 # sampler and agent log (rx_<host>.jsonl, vpm_series_<host>.csv).
 #
@@ -45,8 +45,8 @@ on_host() { if [ "$1" = "$(hostname)" ]; then shift; bash -c "$*"; else h=$1; sh
 # wire rate is smooth to 0.9%, and no event of it can ever hold a +-10% band.
 # Shrinking the MESSAGE shortens the burst in the same proportion and leaves
 # 128 messages in flight. Shrinking burst_size instead left too few in flight
-# to fill a fence sitting at its 2 G floor, so the cap (twice the flow's own
-# use) never lifted and the fence stayed on the floor for a whole phase -
+# to fill a permitted rate sitting at its 2 G floor, so the cap (twice the flow's own
+# use) never lifted and the permitted rate stayed on the floor for a whole phase -
 # measured r23, 0.26 G delivered of a 10 G demand.
 rl_size() { case "$1" in rate_limit=*) echo "-s 8192" ;; esac; }
 
@@ -356,9 +356,9 @@ while read -r sh sv dh dv cls n st en opt; do
     # burst per 6.7 ms means a 20 ms telemetry sample holds 3 of them and
     # quantises to +-33%, which is why an application-limited flow reads as
     # ~18% jitter while its 100 ms wire rate is smooth to 0.9%. Do NOT
-    # shrink burst_size to fix that: at 8 the flow could not fill a fence
+    # shrink burst_size to fix that: at 8 the flow could not fill a permitted rate
     # sitting at its 2 G floor, so the floor never lifted (the cap is twice
-    # the flow's OWN use) and the fence stayed there for the whole phase -
+    # the flow's OWN use) and the permitted rate stayed there for the whole phase -
     # measured r23, the phase delivered 0.26 G of a 10 G demand.
     rate_limit=*) extra="--rate_limit=${opt#rate_limit=}" ;;
     tcp_cc=*)     extra="-C ${opt#tcp_cc=}" ;;

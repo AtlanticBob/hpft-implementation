@@ -34,7 +34,7 @@
 /* ======================================================================
  * HyperFront RDMA executor (design v4 section 6)
  *
- * The card is configured with ROCE_CC_SHAPER_COALESCE=SOURCE_QP on the port
+ * The card is configured with ROCE_CC_SHAPER_COALESCE_P2=SOURCE_QP on the port
  * that carries tenant traffic, so ONE PCC FLOW IS ONE QP: the tenant
  * congestion control (DCQCN, Swift or ZTR, selected by mailbox 0xccd) runs
  * per QP with exact signal attribution, and HyperFront keeps its own
@@ -63,7 +63,7 @@
 
 #define HPFT_MIN_RATE    (2u)        /* fxp20 floor the wire can still carry */
 /* Bytes a managed port carries in one microsecond at line rate: the token
- * bucket is the only place the device needs an absolute unit. Platform
+ * pool is the only place the device needs an absolute unit. Platform
  * quantity, like HPFT_MIN_RATE - 200 Gb/s on this fabric. */
 #define HPFT_LINE_B_PER_US (25000u)
 /* a QP silent longer than this contributes nothing to its own rate account */
@@ -91,10 +91,12 @@ static volatile uint32_t g_algo = HPFT_CC_DCQCN;
 /* 0xcce <0|1> 12: run the tenant CC alone, HyperFront ignored. This is the
  * control arm and also how the CC models are validated on their own. */
 static volatile uint32_t g_cc_only;
-/* 0xcce <units> 21: what a QP whose flow set is not known yet may send. */
-static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE >> 6);
-/* 2^20/64 = 3.1 G per QP: design v4 5.4 starts a new flow set at the port's
- * headroom R0 = h*C (16 G here) split over its expected QPs. */
+/* 0xcce <units> 21: what a QP whose flow set is not known yet may send.
+ * The agent computes it as R0 / expected QPs per flow set (design v4 5.4,
+ * R0 = h*C) and re-asserts it every 5 s; this compiled-in value is the
+ * same number for h = 8 %, four QPs (2^20 / 50 = 4 G on a 200 G port) and
+ * only matters between an executor restart and the agent's first push. */
+static volatile uint32_t g_unknown_rate = (DOCA_PCC_DEV_MAX_RATE / 50u);
 /* 0xcce <n> 22: the law. 0 = the token pool (default); 1 = equal cap,
  * r_i = min(c_i, R/N), no sharing inside the set; 2 = equal split ignoring
  * the CC, r_i = R/N. 1 and 2 are the ablation arms. */
@@ -888,7 +890,7 @@ static inline void hpft_pacc_settle(volatile hpft_q_t *q, uint32_t now)
 /* Refill the pool at R and cap it at one control period's worth: a set may
  * burst up to the depth and no more, which is the classic bucket and the
  * same time constant the rest of the executor already runs on. */
-static inline void hpft_bucket_refill(volatile hpft_set_t *s, uint32_t now)
+static inline void hpft_pool_refill(volatile hpft_set_t *s, uint32_t now)
 {
 	uint32_t dt = (uint32_t)(now - s->tok_ts);
 	int64_t depth, v;
@@ -922,7 +924,7 @@ static inline void hpft_bucket_refill(volatile hpft_set_t *s, uint32_t now)
  * which one QP may exceed its equal share. Both terms are rates in the
  * device's fxp20; the spare term is the pool spread over one control
  * period. */
-static inline uint32_t hpft_bucket_ceiling(volatile hpft_set_t *s)
+static inline uint32_t hpft_pool_ceiling(volatile hpft_set_t *s)
 {
 	uint32_t n = s->nlive ? s->nlive : (s->nq ? s->nq : 1u);
 	int64_t bonus = ((int64_t)s->tok << 20) /
@@ -1242,7 +1244,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			if (g_law == HPFT_LAW_TOKEN) {
 				uint32_t ceil_, dt;
 
-				hpft_bucket_refill(s, now);
+				hpft_pool_refill(s, now);
 				/* Pay for the interval this QP has just covered,
 				 * at the rate it was pacing over it: summed over
 				 * the set that is exactly what it was allowed to
@@ -1262,7 +1264,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 				q->tok_ts = now;
 				s->tok -= (int32_t)(((int64_t)q->paced *
 						     HPFT_LINE_B_PER_US * dt) >> 20);
-				ceil_ = hpft_bucket_ceiling(s);
+				ceil_ = hpft_pool_ceiling(s);
 				if (ceil_ < r)
 					r = ceil_;
 				goto shaped;
