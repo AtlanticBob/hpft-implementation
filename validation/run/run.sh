@@ -144,9 +144,9 @@ fi
 # 2026-09-09). udp_blast prints a summary on SIGTERM, so it does not exit at
 # once; wait for the name to be gone and only then start listeners, and kill
 # what is left rather than racing it.
-for h in $HOSTS; do on_host "$h" 'pkill -f "ib_write_b[w]" 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x udp_blast 2>/dev/null
-  for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x "udp_blast|iperf3" >/dev/null 2>&1 || break; sleep 0.5; done
-  pkill -9 -x udp_blast 2>/dev/null; pkill -9 -x iperf3 2>/dev/null; true'; done
+for h in $HOSTS; do on_host "$h" 'pkill -f "ib_write_b[w]" 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x udp_blast 2>/dev/null; pkill -x kvfetch 2>/dev/null
+  for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x "udp_blast|iperf3|kvfetch" >/dev/null 2>&1 || break; sleep 0.5; done
+  pkill -9 -x udp_blast 2>/dev/null; pkill -9 -x iperf3 2>/dev/null; pkill -9 -x kvfetch 2>/dev/null; true'; done
 sleep 1
 
 snap_cnp() {
@@ -187,6 +187,13 @@ for h in $RECVS $(echo "$ROWS" | awk '$5=="tcp"{print $1}' | sort -u); do
   on_host "$h" "strings /usr/local/lib/libiperf.so.0 2>/dev/null | grep -q start-at" \
     || { echo "ABORT: $h has an iperf3 without the --start-at patch"; exit 1; }
 done
+# kv rows: application-shaped RDMA WRITE transfers (tools/host/kvfetch.c, the
+# 2-8 experiments), built where they run and rebuilt when the source changes
+if echo "$ROWS" | awk '{print $5}' | grep -q '^kv$'; then
+  for h in $(echo "$ROWS" | awk '$5=="kv"{print $1; print $3}' | sort -u); do
+    on_host "$h" "[ /tmp/kvfetch -nt $REPO/tools/host/kvfetch.c ] || gcc -O2 -pthread -o /tmp/kvfetch $REPO/tools/host/kvfetch.c -libverbs" || { echo "ABORT: kvfetch does not build on $h"; exit 1; }
+  done
+fi
 if echo "$ROWS" | awk '{print $5}' | grep -q '^udp$'; then
   for h in $RECVS $(echo "$ROWS" | awk '$5=="udp"{print $1}' | sort -u); do
     on_host "$h" "[ -x /tmp/udp_blast ] || gcc -O2 -pthread -o /tmp/udp_blast $REPO/tools/host/udp_blast.c" || { echo "ABORT: udp_blast missing on $h"; exit 1; }
@@ -370,6 +377,8 @@ while read -r sh sv dh dv cls n st en opt; do
     SRV[$dh]+="setsid nohup $PT -d $(dev_of $dh $dv) -q $n -m $QMTU $RDMA_TC $(rl_size "$opt") -p $((27000+k)) --report_gbits -D $dur --start_at=$((T0+off)) >/tmp/val_s$k.log 2>&1 </dev/null & "
   elif [ "$cls" = udp ]; then
     SRV[$dh]+="setsid nohup /tmp/udp_blast -r -p $((5900+k)) -B $(ip_of $dh $dv) >/tmp/val_s$k.log 2>&1 </dev/null & "
+  elif [ "$cls" = kv ]; then
+    SRV[$dh]+="setsid nohup /tmp/kvfetch -s -d $(dev_of $dh $dv) -p $((29000+k)) -b 2 >/tmp/val_s$k.log 2>&1 </dev/null & "
   else
     SRV[$dh]+="setsid nohup iperf3 -s -p $((5600+k)) >/tmp/val_s$k.log 2>&1 </dev/null & "
   fi
@@ -393,6 +402,20 @@ for h in $RECVS; do
   timeout 15 ssh -n -o BatchMode=yes "$d" "rm -f /tmp/vpm_series.csv; nohup python3 /tmp/vpm_sample.py $((END+WARM+40)) /tmp/vpm_series.csv 100 </dev/null >/dev/null 2>&1 & true" || echo "WARN: vpm sampler did not start on $d"
 done
 declare -A CLI
+# kv groups (option group=<name>): members wait for each other at the end of
+# every iteration; the group's first row leads, on its sender's management name
+declare -A KV_GLEAD KV_GHOST KV_GN
+k=0
+while read -r sh sv dh dv cls n st en opt; do
+  if [ "$cls" = kv ]; then
+    g=$(echo ",$opt," | grep -o ',group=[^,]*' | cut -d= -f2)
+    if [ -n "$g" ]; then
+      [ -n "${KV_GLEAD[$g]:-}" ] || { KV_GLEAD[$g]=$k; KV_GHOST[$g]=$sh; }
+      KV_GN[$g]=$(( ${KV_GN[$g]:-0} + 1 ))
+    fi
+  fi
+  k=$((k+1))
+done <<<"$ROWS"
 k=0
 while read -r sh sv dh dv cls n st en opt; do
   case "$cls" in meter|core) k=$((k+1)); continue ;; esac
@@ -448,6 +471,32 @@ while read -r sh sv dh dv cls n st en opt; do
     fi
   elif [ "$cls" = udp ]; then
     cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-time.time()))\"; /tmp/udp_blast -c $dip -p $((5900+k)) -B $sip -G $extra -t $dur' >/tmp/val_c$k.log 2>&1 </dev/null & "
+  elif [ "$cls" = kv ]; then
+    # A kv row is an application, not a bulk load: it starts on the
+    # experiment clock (T0 + warm-up + start), never during the warm-up, and
+    # runs for end - start. Options, comma separated: sched=<file> (open
+    # loop; a path relative to the flow table), maxreq=<requests in
+    # service>, iter=<steps>:<bytes>:<compute s>, group=<name>, depth=,
+    # slice=. The client connects at launch through the server's management
+    # name and waits for its start time.
+    koff=$((WARM+st)); kdur=$((en-st)); kargs=""
+    for kv in ${opt//,/ }; do
+      case "$kv" in
+        sched=*) ksrc=${kv#sched=}; [[ "$ksrc" = /* ]] || ksrc="$(dirname "$FLOWS")/$ksrc"
+                 [ -f "$ksrc" ] || { echo "ABORT: kv row $k: no schedule $ksrc"; exit 1; }
+                 if [ "$sh" = "$(hostname)" ]; then cp "$ksrc" /tmp/val_kv$k.sched; else scp -q "$ksrc" "$sh:/tmp/val_kv$k.sched"; fi
+                 kargs+=" -S /tmp/val_kv$k.sched" ;;
+        maxreq=*) kargs+=" -M ${kv#maxreq=}" ;;
+        iter=*)   kargs+=" -I ${kv#iter=}" ;;
+        depth=*)  kargs+=" -D ${kv#depth=}" ;;
+        slice=*)  kargs+=" -z ${kv#slice=}" ;;
+        group=*)  g=${kv#group=}
+                  if [ "${KV_GLEAD[$g]}" = "$k" ]; then kargs+=" -G L:$((29500+k)):${KV_GN[$g]}"
+                  else kargs+=" -G F:${KV_GHOST[$g]}:$((29500+${KV_GLEAD[$g]}))"; fi ;;
+      esac
+    done
+    cmd="setsid nohup /tmp/kvfetch -c $dh -d $(dev_of $sh $sv) -p $((29000+k)) -m $QMTU -q $n ${TCLASS:+-C $TCLASS} $kargs -A $((T0+koff)) -t $kdur -o /tmp/val_kv$k.csv -i row$k >/tmp/val_c$k.log 2>&1 </dev/null & "
+    CLI[$sh]="rm -f /tmp/val_kv$k.csv; ${CLI[$sh]:-}"
   else
     # A late TCP row is launched 3 s before its start, not at T0: iperf3
     # opens its control connection at launch, and a control connection that
@@ -487,6 +536,9 @@ k=0
 while read -r sh sv dh dv cls n st en opt; do
   case "$cls" in meter|core) k=$((k+1)); continue ;; esac
   if [ "$sh" = "$(hostname)" ]; then cp /tmp/val_c$k.log "$OUT/flow${k}_${sh}vf${sv}_to_${dh}vf${dv}_${cls}.log"; else scp -q "$sh:/tmp/val_c$k.log" "$OUT/flow${k}_${sh}vf${sv}_to_${dh}vf${dv}_${cls}.log"; fi
+  if [ "$cls" = kv ]; then
+    if [ "$sh" = "$(hostname)" ]; then cp /tmp/val_kv$k.csv "$OUT/kv_flow${k}_${sh}vf${sv}_to_${dh}vf${dv}.csv" 2>/dev/null; else scp -q "$sh:/tmp/val_kv$k.csv" "$OUT/kv_flow${k}_${sh}vf${sv}_to_${dh}vf${dv}.csv" 2>/dev/null; fi || echo "WARN: no per-request log for kv flow $k"
+  fi
   if [ "$cls" = rdma ] && [[ ",$opt," == *,perqp,* ]]; then
     if [ "$sh" = "$(hostname)" ]; then cp /tmp/val_qp$k.csv "$OUT/qptrace_flow$k.csv" 2>/dev/null; else scp -q "$sh:/tmp/val_qp$k.csv" "$OUT/qptrace_flow$k.csv" 2>/dev/null; fi || echo "WARN: no per-QP trace for flow $k"
   fi
@@ -494,7 +546,7 @@ while read -r sh sv dh dv cls n st en opt; do
 done <<<"$ROWS"
 sleep 8
 for h in $RECVS; do scp -q "$(dpu_of $h):/tmp/vpm_series.csv" "$OUT/vpm_series_$h.csv"; done
-for h in $HOSTS; do on_host "$h" 'pkill -f "ib_write_b[w]" 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x udp_blast 2>/dev/null; true'; done
+for h in $HOSTS; do on_host "$h" 'pkill -f "ib_write_b[w]" 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x udp_blast 2>/dev/null; pkill -x kvfetch 2>/dev/null; true'; done
 # 9>&-: this child must NOT inherit the run lock. Without it the lock
 # stays held for 40 s after run.sh exits and the next run aborts.
 ( sleep 40; snap_switch > "$OUT/switch_post.txt" ) 9>&- &
