@@ -42,7 +42,7 @@
 #   vf_caps.sh clear       release every devlink cap and delete every meter
 #   vf_caps.sh meter-on    meters only (policy rate)
 #   vf_caps.sh meter-off   meters only (REMOVES FORWARDING TOO - see meter_bypass)
-#   BYPASS_HOST=<host> BYPASS_VF=<n> vf_caps.sh meter-bypass
+#   BYPASS_HOST=<host> BYPASS_VF="<n> [<n> ...]" vf_caps.sh meter-bypass
 #                          that one VF keeps its forwarding and loses its policer
 #   vf_caps.sh devlink-on  devlink only
 #   vf_caps.sh devlink-off devlink only
@@ -101,10 +101,10 @@ EOF
 # behind it would police the same traffic twice. The rules are rewritten
 # without the meter action and the meter itself is deleted; `meter-on` puts
 # both back.
-meter_bypass() {   # $1 host  $2 dpu  $3 vf index
+meter_bypass() {   # $1 host  $2 dpu  $3 vf indices, space or comma separated
   local rows; rows=$(vf_rows "$1")
   ssh -o BatchMode=yes "$2" "while read -r i ip kbps rep; do
-      [ \"\$i\" = \"$3\" ] || continue
+      case \" ${3//,/ } \" in *\" \$i \"*) ;; *) continue ;; esac
       sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"udp,nw_dst=\$ip,tp_dst=4791\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"tcp,nw_dst=\$ip\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"ip,nw_dst=\$ip\" 2>/dev/null
@@ -112,7 +112,7 @@ meter_bypass() {   # $1 host  $2 dpu  $3 vf index
       sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=121,tcp,nw_dst=\$ip,actions=output:\$rep\"
       sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=120,ip,nw_dst=\$ip,actions=output:\$rep\"
       sudo ovs-ofctl -O OpenFlow13 del-meter $BR \"meter=\$((11+i))\" 2>/dev/null
-      echo \"  $1 ($2): vf$3 forwards with no policer\"
+      echo \"  $1 ($2): vf\$i forwards with no policer\"
     done <<'EOF'
 $rows
 EOF
@@ -150,6 +150,6 @@ for n in "${NODES[@]}"; do
     devlink-off) devlink_off "$1" "$2" ;;
     status)      status "$1" "$2" ;;
     *) echo "usage: vf_caps.sh sync|clear|meter-on|meter-off|devlink-on|devlink-off|status"
-       echo "       BYPASS_HOST=<host> BYPASS_VF=<n> vf_caps.sh meter-bypass   (that VF forwards with no policer)"; exit 2 ;;
+       echo "       BYPASS_HOST=<host> BYPASS_VF=\"<n> ...\" vf_caps.sh meter-bypass   (those VFs forward with no policer)"; exit 2 ;;
   esac
 done

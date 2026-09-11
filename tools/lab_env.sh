@@ -105,26 +105,57 @@ status() {
 }
 
 # ------------------------------------------------------------ jakiro ctl ----
-# The Jakiro VF, read from the DHTB's own conf rather than named here: which VF
-# it manages is a property of that configuration.
-jakiro_vf() {
-  local ip
-  ip=$(ssh -o BatchMode=yes hpft-dpu2 "grep -m1 '^OVERLAY_DST_IP=' $JAKIRO_DIR/jakiro_dhtb.conf | cut -d= -f2" 2>/dev/null | tr -d '\r')
-  [ -n "$ip" ] || return 1
-  python3 -c "
-import json,re,sys
-r=json.load(open('$REPO/config/lab-registry.json'))
-for v in r['vnics']:
-    if v['ip']=='$ip':
-        print(v['host'], re.search(r'vf(\d+)\$', v['netdev']).group(1)); break
-"
+# The Jakiro vNICs, read from the DHTB's own conf rather than named here - one
+# Jakiro per vNIC, which vNICs is a property of that configuration. One line
+# per vNIC: "<host> <vf index> <overlay ip> <mac>".
+jakiro_vnics() {
+  local conf
+  conf=$(ssh -o BatchMode=yes hpft-dpu2 "grep -E '^(OVERLAY_DST_IP|JAKIRO_DST_MAC)=' $JAKIRO_DIR/jakiro_dhtb.conf" 2>/dev/null | tr -d '\r')
+  [ -n "$conf" ] || return 1
+  python3 - "$conf" "$REPO/config/lab-registry.json" <<'PY'
+import json, re, sys
+kv = dict(l.split("=", 1) for l in sys.argv[1].splitlines() if "=" in l)
+ips = [x for x in kv.get("OVERLAY_DST_IP", "").split(",") if x]
+macs = [x for x in kv.get("JAKIRO_DST_MAC", "").split(",") if x]
+reg = {v["ip"]: v for v in json.load(open(sys.argv[2]))["vnics"]}
+for i, ip in enumerate(ips):
+    v = reg.get(ip)
+    if v:
+        print(v["host"], re.search(r"vf(\d+)$", v["netdev"]).group(1), ip, macs[i] if i < len(macs) else "-")
+PY
+}
+# Every sender reaches the Jakiro vNICs through static neighbour entries while
+# the DHTB is up. The DHTB owns all tunnelled traffic into the receiver and
+# steers each packet to one vNIC by its address or MAC; a broadcast ARP request
+# belongs to no single vNIC, so it cannot be delivered, and a sender that had
+# to resolve a receiver vNIC by ARP would never connect. With the entries in
+# place the only ARP towards the receiver is a reply, which is unicast to the
+# vNIC's MAC. jakiro_stop takes them out again.
+jakiro_neigh() { # add|del
+  local vnics rhost cmds=""
+  vnics=$(jakiro_vnics) || return 0
+  rhost=$(echo "$vnics" | awk 'NR==1{print $1}')
+  while read -r h vf ip mac; do
+    [ "$mac" = "-" ] && continue
+    for j in 0 1 2 3 4 5 6 7; do
+      if [ "$1" = add ]; then cmds+="sudo ip neigh replace $ip lladdr $mac dev dpu1vf$j nud permanent 2>/dev/null; "
+      else cmds+="sudo ip neigh del $ip dev dpu1vf$j 2>/dev/null; "; fi
+    done
+  done <<<"$vnics"
+  for h in $(all_hosts); do
+    [ "$h" = "$rhost" ] && continue
+    if [ "$h" = "$(hostname)" ]; then bash -c "$cmds true"; else ssh -n -o BatchMode=yes "$h" "$cmds true"; fi
+  done
 }
 jakiro_stop() {
   ssh hpft-dpu2 'pid=$(pgrep -f "build/jakiro_dht[b]" | head -1)
     [ -n "$pid" ] && { sudo kill "$pid" 2>/dev/null; for i in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done; sudo kill -9 "$pid" 2>/dev/null; }
-    sudo rm -f '"$JAKIRO_DIR"'/run/jakiro_dhtb.pid; true'
-  # give the VF its ordinary policer back
+    sudo rm -f '"$JAKIRO_DIR"'/run/jakiro_dhtb.pid
+    sudo rm -rf /var/run/dpdk/rte; sudo rm -f /dev/hugepages/rtemap_*
+    echo 0 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages >/dev/null; true'
+  # give the VFs their ordinary policers and the senders their ARP back
   bash "$REPO/tools/lab-infra/vf_caps.sh" meter-on >/dev/null 2>&1 || true
+  jakiro_neigh del
 }
 jakiro_start() {
   # hardened: hugepages -> kill -> wipe stale DPDK runtime (a fast relaunch over
@@ -132,36 +163,41 @@ jakiro_start() {
   #
   # Hugepages are not persistent: an Arm reboot leaves nr_hugepages at 0 and the
   # DHTB dies in EAL with "No free 2048 kB hugepages", which the retry loop then
-  # repeats three times and reports as a plain start failure. 4096 x 2 MB is what
-  # it takes - 1024 gets past EAL and then fails to allocate the mbuf pool,
-  # because the underlay runs jumbo and the pool is sized for 9800-byte mbufs.
+  # repeats three times and reports as a plain start failure. The mbuf pool is
+  # 8192 jumbo (9800-byte) mbufs per DPDK port, and there is one port per Jakiro
+  # vNIC plus the switch manager: nine ports took 5,731 pages (11.2 GB) when
+  # measured, so 8192 x 2 MB leaves a margin. jakiro_stop gives them back.
   for attempt in 1 2 3; do
     timeout 90 ssh -n hpft-dpu2 'cd '"$JAKIRO_DIR"'
-      [ "$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)" -ge 4096 ] \
-        || echo 4096 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages >/dev/null
+      [ "$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)" -ge 8192 ] \
+        || echo 8192 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages >/dev/null
       pid=$(pgrep -f "build/jakiro_dht[b]" | head -1)
       [ -n "$pid" ] && { sudo kill -9 "$pid" 2>/dev/null; sleep 1; }
       sudo rm -f run/jakiro_dhtb.pid; sudo rm -rf /var/run/dpdk/rte; sudo rm -f /dev/hugepages/rtemap_*
       set -a; . ./jakiro_dhtb.conf; set +a
       sudo -E bash apply_jakiro_dhtb.sh >/dev/null 2>&1 || true
       sleep 3
-      pgrep -f "build/jakiro_dht[b]" >/dev/null && grep -aq "DHTB_CFG" run/jakiro_dhtb.log' \
+      pgrep -f "build/jakiro_dht[b]" >/dev/null && grep -aq "Installed .* receiver-side Jakiro DHTB" run/jakiro_dhtb.log' \
       && {
         echo "  jakiro up (attempt $attempt)"
-        # Only one policer on the Jakiro VF. The DHTB IS a policer - it drops
-        # TCP and CE-marks RoCE once the 50 G root is exceeded - and the lab's
-        # standing per-VF OVS meter is a second one at the same rate behind it,
-        # so the arm would police the same traffic twice and the figure would
-        # not be Jakiro's. The VF keeps its forwarding rules and loses the meter
-        # (vf_caps.sh meter_bypass explains why those are not the same thing);
-        # every other VF keeps the ordinary policer, which is what the native
-        # arm is. jakiro_stop puts it back.
-        read -r jh jv <<<"$(jakiro_vf)"
+        # Only one policer per Jakiro vNIC. The DHTB IS a policer - it drops
+        # TCP and CE-marks RoCE once a vNIC's root is exceeded - and the lab's
+        # standing per-VF OVS meter is a second one at the same rate behind
+        # it, so the arm would police the same traffic twice and the figure
+        # would not be Jakiro's. The VFs keep their forwarding rules and lose
+        # the meter (vf_caps.sh meter_bypass explains why those are not the
+        # same thing); jakiro_stop puts it back.
+        local vnics jh jvs
+        vnics=$(jakiro_vnics)
+        jh=$(echo "$vnics" | awk 'NR==1{print $1}')
+        jvs=$(echo "$vnics" | awk '{printf "%s ", $2}')
         if [ -n "${jh:-}" ]; then
-          BYPASS_HOST=$jh BYPASS_VF=$jv bash "$REPO/tools/lab-infra/vf_caps.sh" meter-bypass
+          BYPASS_HOST=$jh BYPASS_VF="$jvs" bash "$REPO/tools/lab-infra/vf_caps.sh" meter-bypass
         else
-          echo "  WARN: could not tell which VF the DHTB manages; its OVS meter is still policing" >&2
+          echo "  WARN: could not tell which VFs the DHTB manages; their OVS meters are still policing" >&2
         fi
+        jakiro_neigh add
+        echo "  $(echo "$vnics" | grep -c .) Jakiro vNICs on ${jh:-?}; senders hold static neighbour entries for them"
         return 0; }
     echo "  jakiro start attempt $attempt failed, retrying"; sleep 3
   done

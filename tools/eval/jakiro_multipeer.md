@@ -1,29 +1,13 @@
-# Jakiro on this testbed: the one adaptation, and why
+# Jakiro on this testbed: two adaptations, and why
 
-The Jakiro baseline is the authors' DHTB implementation, used as it is: the
-token-bucket shape, the borrow rule, the greedy decision, the CE marking of
-RoCE and the dropping of TCP are all untouched. One thing had to change before
-it could be run here at all, and it is a change to what the classifier *sees*,
-not to what it *decides*.
+The Jakiro baseline is the authors' DHTB implementation: the token-bucket shape, the borrow rule, the greedy decision, the CE marking of RoCE and the dropping of TCP are all untouched. Two things had to change before it could be run here, and both are changes to what the classifier *sees* and where the DHTB is *deployed*, not to what it *decides*.
 
-**The gate matched one peer.** Jakiro's root pipe is an exact match on the
-outer VxLAN header: ingress port, outer source address, outer destination
-address, VxLAN destination port and VNI. The source address came from a single
-configuration value, so the pipeline accepted tunnelled traffic from exactly
-one peer. That is enough for the two-machine testbed the code was written on.
-This lab has four machines and every scenario that is worth putting Jakiro in
-has two or three senders reaching the same receiver, so traffic from all but
-one of them would miss the gate, never reach the DHTB, and arrive at the VF
-unpoliced. The arm would report no policing and look like a Jakiro failure
-when it was our topology the code had never seen.
+**The gate matched one peer.** Jakiro's root pipe is an exact match on the outer VxLAN header: ingress port, outer source address, outer destination address, VxLAN destination port and VNI. The source address came from a single configuration value, so the pipeline accepted tunnelled traffic from exactly one peer. That is enough for the two-machine testbed the code was written on. This lab has four machines and every scenario worth putting Jakiro in has two or three senders reaching the same receiver, so traffic from all but one of them would miss the gate and arrive unpoliced. `UNDERLAY_SRC_IP` now takes a comma-separated list and `add_outer_vxlan_gate_entry` installs one entry per address, each the same exact match the original built (`jakiro_multipeer.patch`).
 
-**What changed.** `UNDERLAY_SRC_IP` now takes a comma-separated list and
-`add_outer_vxlan_gate_entry` installs one entry per address, each the same
-exact match the original built. `jakiro_multipeer.patch` is the diff.
-`jakiro_conf.sh` writes the list.
+**One Jakiro per vNIC.** A Jakiro is a vNIC-level mechanism: it polices one VM's vNIC against that VM's quota, and a host carries one per VM. HyperFront is a receiver-side vswitch function that manages all VFs at once; Jakiro is not, so the Jakiro arm needs one Jakiro on every VF of the receiving host - eight here. The authors' code built exactly one: its gate takes all tunnelled traffic from the listed peers, decaps it, and sends whatever is not that one vNIC's RoCE or TCP to that vNIC's port, so with more than one VM behind the tunnel every other VM's traffic was delivered to the managed VF instead. Now the program builds one complete Jakiro per vNIC - its own root bucket, RoCE and TCP buckets, colour and decision pipes, CE marking and forward to its own representor - and after the shared gate and decap a packet walks the vNICs in turn: RoCE to that vNIC's address, TCP to that address, then any other unicast to that vNIC's MAC (ARP replies, ICMP), which goes to its representor without touching its buckets. A packet no vNIC owns is counted (`no_vnic_dropped`) and dropped. They share one process because the embedded switch pipeline of a port has a single owner; nothing is shared between their buckets. `jakiro_per_vnic.patch` is the diff on top of the multi-peer one.
 
-**What did not.** The meters, the colour pipes, the root/leaf hierarchy and the
-greedy decision are the authors' code. The known platform limitation the
-authors' own README records - `switch,hws` rejects the outer-to-inner ECN
-inheritance descriptor, so that step is not installed - still stands and is not
-something this patch touches.
+**Configuration.** `jakiro_conf.sh set <capacity> <permille>` names one Jakiro per VF of the receiving host - `JAKIRO_LABELS`, `OVERLAY_DST_IP`, `JAKIRO_REP_PCI` (the VF's host PCI address, read live) and `JAKIRO_DST_MAC` (read live) as comma-separated lists in VF order - with the same capacity and class weight for all; `CAPACITY_GBPS` and `ROCE_WEIGHT_PERMILLE` also accept one value per vNIC. Representor *i* in the list is DOCA Flow port *i* + 1. Every log line carries `inst=<label>`, and there is one `DHTB_CFG` line per vNIC.
+
+**What the arm does around it.** `lab_env.sh jakiro` takes the standing OVS meter off every managed VF (the Jakiro is that VF's policer) and gives every sender static neighbour entries for the managed vNICs: a broadcast ARP request belongs to no single vNIC, so the DHTB cannot deliver it, while with the entries in place the only ARP towards the receiver is a reply, unicast to the vNIC's MAC. `lab_env.sh` leaving the Jakiro environment puts both back.
+
+**What did not change.** The meters, the colour pipes, the root/leaf hierarchy and the greedy decision are the authors' code, instantiated once per vNIC. The platform limitation the authors' own README records - `switch,hws` rejects the outer-to-inner ECN inheritance descriptor, so that step is not installed - still stands.

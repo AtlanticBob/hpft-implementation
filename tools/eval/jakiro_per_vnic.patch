@@ -1,0 +1,1305 @@
+--- jakiro_dhtb.h.before_per_vnic	2026-09-11 14:26:08.448739036 +0000
++++ jakiro_dhtb.h	2026-09-11 14:26:08.987120902 +0000
+@@ -8,20 +8,35 @@
+ 
+ #include "flow_switch_common.h"
+ 
++/* One Jakiro per vNIC. A Jakiro is the receiver-side DHTB of ONE VM's vNIC -
++ * its own root bucket, its own two class buckets, its own decision - and a
++ * host carries one per VF, all behind the same wire port. They share this
++ * process only because the embedded switch pipeline of a port has a single
++ * owner; nothing is shared between their buckets. */
++#define JAKIRO_MAX_INST 8
++
++struct jakiro_inst_cfg {
++	char label[16];			/* e.g. "vf3", used in every log line */
++	char overlay_dst_ip[16];	/* the vNIC's overlay address */
++	uint8_t dst_mac[6];		/* the vNIC's MAC: its non-TCP/RoCE unicast */
++	bool has_mac;
++	uint16_t fwd_port;		/* DOCA Flow port of its representor */
++	uint64_t capacity_bytes_per_sec;
++	uint32_t roce_weight_permille;
++};
++
+ struct jakiro_dhtb_config {
+ 	const char *underlay_src_ip;
+ 	const char *underlay_dst_ip;
+-	const char *overlay_dst_ip;
+ 	uint32_t vxlan_vni;
+ 	uint16_t ingress_port_meta;
+-	uint16_t jakiro_fwd_port;
+ 	uint16_t vxlan_dst_port;
+ 	uint16_t roce_udp_dst_port;
+ 	uint16_t tcp_dst_port;
+-	uint64_t capacity_bytes_per_sec;
+-	uint32_t roce_weight_permille;
+ 	uint64_t root_burst_bytes;
+ 	uint64_t leaf_burst_bytes;
++	uint32_t nb_inst;
++	struct jakiro_inst_cfg inst[JAKIRO_MAX_INST];
+ };
+ 
+ extern volatile bool jakiro_dhtb_stop_requested;
+--- jakiro_dhtb_main.c.before_per_vnic	2026-09-11 14:26:08.452742746 +0000
++++ jakiro_dhtb_main.c	2026-09-11 14:26:09.007139452 +0000
+@@ -8,7 +8,9 @@
+ #include <errno.h>
+ #include <inttypes.h>
+ #include <signal.h>
++#include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include <doca_argp.h>
+ #include <doca_flow.h>
+@@ -21,8 +23,6 @@
+ 
+ DOCA_LOG_REGISTER(JAKIRO_DHTB::MAIN);
+ 
+-#define DEFAULT_CAPACITY_GBPS 100ULL
+-#define DEFAULT_ROCE_WEIGHT_PERMILLE 600U
+ #define DEFAULT_ROOT_BURST_BYTES (64ULL * 1024ULL * 1024ULL)
+ #define DEFAULT_LEAF_BURST_BYTES (64ULL * 1024ULL * 1024ULL)
+ 
+@@ -88,36 +88,147 @@
+ 
+ 
+ /* argp in DOCA 3.4 fails to look up controller-1 (host-side) representors
+- * on this platform; open the rep ourselves by host PCI address instead. */
+-static doca_error_t jakiro_open_rep_by_pci(struct flow_dev_ctx *devs, const char *pci)
++ * on this platform; open the reps ourselves by host PCI address instead.
++ * One representor per Jakiro, in the order the instances are listed: the
++ * switch manager is DOCA Flow port 0 and representor i becomes port i + 1. */
++static doca_error_t jakiro_open_reps_by_pci(struct flow_dev_ctx *devs, char pcis[][16], uint32_t nb)
+ {
+ 	struct doca_devinfo_rep **list = NULL;
+-	uint32_t nb = 0, i;
++	uint32_t nb_list = 0, i, k;
+ 	doca_error_t result;
+ 	struct doca_dev *dev = devs->devs_manager[0].doca_dev;
+ 
+ 	if (dev == NULL)
+ 		return DOCA_ERROR_BAD_STATE;
+-	result = doca_devinfo_rep_create_list(dev, DOCA_DEVINFO_REP_FILTER_ALL, &list, &nb);
++	result = doca_devinfo_rep_create_list(dev, DOCA_DEVINFO_REP_FILTER_ALL, &list, &nb_list);
+ 	if (result != DOCA_SUCCESS)
+ 		return result;
+-	result = DOCA_ERROR_NOT_FOUND;
+-	for (i = 0; i < nb; i++) {
+-		char addr[DOCA_DEVINFO_PCI_ADDR_SIZE] = {0};
+-
+-		if (doca_devinfo_rep_get_pci_addr_str(list[i], addr) != DOCA_SUCCESS)
+-			continue;
+-		if (strcmp(addr, pci) != 0)
+-			continue;
+-		result = doca_dev_rep_open(list[i], &devs->devs_manager[0].doca_dev_rep[0]);
+-		if (result == DOCA_SUCCESS)
+-			devs->devs_manager[0].nb_reps = 1;
+-		break;
++	for (k = 0; k < nb; k++) {
++		result = DOCA_ERROR_NOT_FOUND;
++		for (i = 0; i < nb_list; i++) {
++			char addr[DOCA_DEVINFO_PCI_ADDR_SIZE] = {0};
++
++			if (doca_devinfo_rep_get_pci_addr_str(list[i], addr) != DOCA_SUCCESS)
++				continue;
++			if (strcmp(addr, pcis[k]) != 0)
++				continue;
++			result = doca_dev_rep_open(list[i], &devs->devs_manager[0].doca_dev_rep[k]);
++			break;
++		}
++		if (result != DOCA_SUCCESS) {
++			DOCA_LOG_ERR("Failed to open representor %s", pcis[k]);
++			break;
++		}
++		devs->devs_manager[0].nb_reps = (int)(k + 1);
+ 	}
+ 	doca_devinfo_rep_destroy_list(list);
+ 	return result;
+ }
+ 
++/* Split a comma-separated list into at most max fields of at most len - 1
++ * characters; returns how many there were, or -1 if one does not fit. */
++static int split_list(const char *value, char out[][16], int max)
++{
++	char buf[512];
++	char *save = NULL, *tok;
++	int n = 0;
++
++	if (value == NULL || strlen(value) >= sizeof(buf))
++		return value == NULL ? 0 : -1;
++	strcpy(buf, value);
++	for (tok = strtok_r(buf, ",", &save); tok != NULL; tok = strtok_r(NULL, ",", &save)) {
++		while (*tok == ' ')
++			tok++;
++		if (*tok == '\0')
++			continue;
++		if (n >= max || strlen(tok) >= 16)
++			return -1;
++		strcpy(out[n++], tok);
++	}
++	return n;
++}
++
++static bool parse_mac(const char *s, uint8_t mac[6])
++{
++	unsigned int b[6];
++
++	if (sscanf(s, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
++		return false;
++	for (int i = 0; i < 6; i++)
++		mac[i] = (uint8_t)b[i];
++	return true;
++}
++
++/* The per-vNIC lists: OVERLAY_DST_IP, JAKIRO_REP_PCI, JAKIRO_DST_MAC and
++ * JAKIRO_LABELS name one Jakiro per position; CAPACITY_GBPS and
++ * ROCE_WEIGHT_PERMILLE are one value for all or one per position. A single
++ * address with no MAC is the original single-Jakiro deployment: everything
++ * the classifier does not take goes to that one vNIC. */
++static int parse_instances(struct jakiro_dhtb_config *cfg, char pcis[][16])
++{
++	char ips[JAKIRO_MAX_INST][16], labels[JAKIRO_MAX_INST][16];
++	char caps[JAKIRO_MAX_INST][16], wts[JAKIRO_MAX_INST][16];
++	int n, nm, nl, nc, nw, np;
++	const char *mac_env = getenv("JAKIRO_DST_MAC");
++
++	n = split_list(parse_env_str("OVERLAY_DST_IP", "10.1.0.211"), ips, JAKIRO_MAX_INST);
++	np = split_list(parse_env_str("JAKIRO_REP_PCI", "0000:38:02.3"), pcis, JAKIRO_MAX_INST);
++	nl = split_list(getenv("JAKIRO_LABELS"), labels, JAKIRO_MAX_INST);
++	nc = split_list(parse_env_str("CAPACITY_GBPS", "100"), caps, JAKIRO_MAX_INST);
++	nw = split_list(parse_env_str("ROCE_WEIGHT_PERMILLE", "600"), wts, JAKIRO_MAX_INST);
++	if (n <= 0 || np != n || (nl != 0 && nl != n) || (nc != 1 && nc != n) || (nw != 1 && nw != n)) {
++		DOCA_LOG_ERR("Per-vNIC lists disagree: %d addresses, %d representors, %d labels, %d capacities, %d weights",
++			     n, np, nl, nc, nw);
++		return -1;
++	}
++	/* MACs are 17 characters: split them by hand */
++	nm = 0;
++	if (mac_env != NULL && mac_env[0] != '\0') {
++		const char *p = mac_env;
++
++		while (*p && nm < JAKIRO_MAX_INST) {
++			const char *e = strchr(p, ',');
++			size_t len = e ? (size_t)(e - p) : strlen(p);
++
++			if (len != 17 || !parse_mac(p, cfg->inst[nm].dst_mac)) {
++				DOCA_LOG_ERR("Bad MAC in JAKIRO_DST_MAC at position %d", nm);
++				return -1;
++			}
++			cfg->inst[nm].has_mac = true;
++			nm++;
++			p = e ? e + 1 : p + len;
++		}
++	}
++	if (nm != 0 && nm != n) {
++		DOCA_LOG_ERR("JAKIRO_DST_MAC names %d vNICs, OVERLAY_DST_IP %d", nm, n);
++		return -1;
++	}
++	if (n > 1 && nm == 0) {
++		DOCA_LOG_ERR("Several Jakiros need JAKIRO_DST_MAC: without it their other traffic has nowhere to go");
++		return -1;
++	}
++	for (int k = 0; k < n; k++) {
++		struct jakiro_inst_cfg *in = &cfg->inst[k];
++		uint64_t cap = strtoull(caps[nc == 1 ? 0 : k], NULL, 10);
++		uint32_t w = (uint32_t)strtoul(wts[nw == 1 ? 0 : k], NULL, 10);
++
++		if (w > 1000) {
++			DOCA_LOG_ERR("ROCE_WEIGHT_PERMILLE must be in [0, 1000]");
++			return -1;
++		}
++		if (nl)
++			snprintf(in->label, sizeof(in->label), "%s", labels[k]);
++		else
++			snprintf(in->label, sizeof(in->label), "inst%d", k);
++		snprintf(in->overlay_dst_ip, sizeof(in->overlay_dst_ip), "%s", ips[k]);
++		in->fwd_port = (uint16_t)(k + 1);
++		in->capacity_bytes_per_sec = cap * 1000ULL * 1000ULL * 1000ULL / 8ULL;
++		in->roce_weight_permille = w;
++	}
++	cfg->nb_inst = (uint32_t)n;
++	return n;
++}
++
+ /* argp's TYPE_DEVICE parsing is also broken on this platform (2026-07-24:
+  * device_utils rejects every identifier form -- PCI, ibdev and iface alike),
+  * so open the switch device ourselves by PCI, mirroring the representor
+@@ -162,28 +273,23 @@
+ 		 * 2KB mbufs make mlx5 RX queue setup fail with ENOMEM. */
+ 		.port_config.mbuf_size = 9800,
+ 	};
+-	uint64_t capacity_gbps = parse_env_u64("CAPACITY_GBPS", DEFAULT_CAPACITY_GBPS);
+-	uint32_t roce_weight = parse_env_u32("ROCE_WEIGHT_PERMILLE", DEFAULT_ROCE_WEIGHT_PERMILLE);
+ 	struct jakiro_dhtb_config dhtb_cfg = {
+ 		.underlay_src_ip = parse_env_str("UNDERLAY_SRC_IP", "172.16.1.1"),
+ 		.underlay_dst_ip = parse_env_str("UNDERLAY_DST_IP", "172.16.1.2"),
+-		.overlay_dst_ip = parse_env_str("OVERLAY_DST_IP", "10.1.0.211"),
+ 		.vxlan_vni = parse_env_u32("VXLAN_VNI", 100),
+ 		.ingress_port_meta = parse_env_u16("INGRESS_PORT_META", 0),
+-		.jakiro_fwd_port = parse_env_u16("JAKIRO_FWD_PORT", 1),
+ 		.vxlan_dst_port = parse_env_u16("VXLAN_DST_PORT", 4789),
+ 		.roce_udp_dst_port = parse_env_u16("ROCE_UDP_DST_PORT", 4791),
+ 		.tcp_dst_port = parse_env_u16("TCP_DST_PORT", 5201),
+-		.capacity_bytes_per_sec = capacity_gbps * 1000ULL * 1000ULL * 1000ULL / 8ULL,
+-		.roce_weight_permille = roce_weight,
+ 		.root_burst_bytes = parse_env_u64("ROOT_BURST_BYTES", DEFAULT_ROOT_BURST_BYTES),
+ 		.leaf_burst_bytes = parse_env_u64("LEAF_BURST_BYTES", DEFAULT_LEAF_BURST_BYTES),
+ 	};
++	char rep_pcis[JAKIRO_MAX_INST][16];
+ 
+-	if (roce_weight > 1000) {
+-		DOCA_LOG_ERR("ROCE_WEIGHT_PERMILLE must be in [0, 1000]");
++	if (parse_instances(&dhtb_cfg, rep_pcis) <= 0)
+ 		return EXIT_FAILURE;
+-	}
++	/* one DPDK port for the switch manager and one per representor */
++	dpdk_config.port_config.nb_ports = (int)(1 + dhtb_cfg.nb_inst);
+ 
+ 	signal(SIGINT, handle_signal);
+ 	signal(SIGTERM, handle_signal);
+@@ -233,19 +339,12 @@
+ 		DOCA_LOG_INFO("Jakiro switch device %s opened directly (argp bypassed)", dev_pci);
+ 	}
+ 
+-	{
+-		const char *rep_pci = getenv("JAKIRO_REP_PCI");
+-
+-		if (rep_pci == NULL)
+-			rep_pci = "0000:38:02.3";
+-		result = jakiro_open_rep_by_pci(&ctx.devs_ctx, rep_pci);
+-		if (result != DOCA_SUCCESS) {
+-			DOCA_LOG_ERR("Failed to open Jakiro representor %s: %s",
+-				     rep_pci, doca_error_get_descr(result));
+-			goto dpdk_cleanup;
+-		}
+-		DOCA_LOG_INFO("Jakiro representor %s opened directly (argp bypassed)", rep_pci);
++	result = jakiro_open_reps_by_pci(&ctx.devs_ctx, rep_pcis, dhtb_cfg.nb_inst);
++	if (result != DOCA_SUCCESS) {
++		DOCA_LOG_ERR("Failed to open the Jakiro representors: %s", doca_error_get_descr(result));
++		goto dpdk_cleanup;
+ 	}
++	DOCA_LOG_INFO("%u Jakiro representors opened directly (argp bypassed)", dhtb_cfg.nb_inst);
+ 
+ 	result = init_doca_flow_devs(&ctx.devs_ctx);
+ 	if (result != DOCA_SUCCESS) {
+--- jakiro_dhtb_flow.c.before_per_vnic	2026-09-11 14:26:08.448739036 +0000
++++ jakiro_dhtb_flow.c	2026-09-11 14:26:25.445442180 +0000
+@@ -1,5 +1,14 @@
+ /*
+- * DOCA Flow implementation of a receiver-side single-Jakiro DHTB.
++ * DOCA Flow implementation of receiver-side Jakiro DHTBs, one per vNIC.
++ *
++ * Every vNIC behind this wire port has its own Jakiro: its own root bucket,
++ * its own RoCE and TCP buckets, its own colour and decision pipes and its own
++ * forward to its representor. They are built in one process because the
++ * embedded switch pipeline of a port has one owner. After the shared VxLAN
++ * gate and decap, the packet walks the vNICs' classifiers in turn - RoCE to
++ * that vNIC's address, TCP to that address, then anything else to that
++ * vNIC's MAC - and the first one that matches owns it; what no vNIC owns is
++ * counted and dropped. Within one Jakiro the graph is the authors':
+  *
+  * The pipe graph keeps the leaf color in the path:
+  *   VxLAN gate/class match -> decap -> leaf meter -> leaf color split
+@@ -26,15 +35,16 @@
+ 
+ DOCA_LOG_REGISTER(JAKIRO_DHTB);
+ 
+-#define JAKIRO_NB_ENTRIES 64
+-#define ROOT_METER_ID 0
+-#define TCP_LEAF_METER_ID 1
+-#define ROCE_LEAF_METER_ID 2
+-#define NB_SHARED_METERS 3
++#define JAKIRO_NB_ENTRIES 512
++/* shared meters of Jakiro k: its root, TCP and RoCE buckets */
++#define ROOT_METER_ID(k) (3 * (k))
++#define TCP_LEAF_METER_ID(k) (3 * (k) + 1)
++#define ROCE_LEAF_METER_ID(k) (3 * (k) + 2)
+ 
+ #define METER_COLOR_MASK 3
+ #define STATUS_POLL_SECS 5
+-#define MAX_COUNTERS 64
++#define MAX_COUNTERS 256
++#define COUNTER_NAME_LEN 48
+ 
+ struct counter_ref {
+ 	const char *name;
+@@ -55,6 +65,21 @@
+ 
+ static struct counter_ref counter_refs[MAX_COUNTERS];
+ static size_t nb_counter_refs;
++static char counter_names[2 * MAX_COUNTERS][COUNTER_NAME_LEN];
++static size_t nb_counter_names;
++
++/* "<label>.<base>": a counter of one Jakiro. The counter table keeps the
++ * pointer, so the string lives in a static pool. */
++static const char *inst_name(const struct jakiro_inst_cfg *in, const char *base)
++{
++	char *name;
++
++	if (nb_counter_names >= 2 * MAX_COUNTERS)
++		return base;
++	name = counter_names[nb_counter_names++];
++	snprintf(name, COUNTER_NAME_LEN, "%s.%s", in->label, base);
++	return name;
++}
+ 
+ static doca_error_t ipv4_to_be32(const char *ip, doca_be32_t *addr)
+ {
+@@ -207,17 +232,9 @@
+ 	};
+ }
+ 
+-static struct counter_values counter_sub(struct counter_values lhs, struct counter_values rhs)
+-{
+-	return (struct counter_values){
+-		.pkts = saturating_sub_u64(lhs.pkts, rhs.pkts),
+-		.bytes = saturating_sub_u64(lhs.bytes, rhs.bytes),
+-		.valid = lhs.valid || rhs.valid,
+-	};
+-}
+-
+ static void log_period_counter(uint64_t period_id,
+ 			       uint32_t elapsed_secs,
++			       const char *inst,
+ 			       const char *layer,
+ 			       const char *branch,
+ 			       const char *role,
+@@ -227,10 +244,11 @@
+ 	(void)role;
+ 
+ 	DOCA_LOG_INFO("DHTB_NODE period=%" PRIu64
+-		      " layer=%s branch=%s delta_packets=%" PRIu64
++		      " inst=%s layer=%s branch=%s delta_packets=%" PRIu64
+ 		      " delta_bytes=%" PRIu64 " delta_gbps=%.3f total_packets=%" PRIu64
+ 		      " total_bytes=%" PRIu64,
+ 		      period_id,
++		      inst,
+ 		      layer,
+ 		      branch,
+ 		      delta.pkts,
+@@ -240,225 +258,90 @@
+ 		      total.bytes);
+ }
+ 
+-static void log_dhtb_config(const struct jakiro_dhtb_config *cfg, uint64_t roce_rate, uint64_t tcp_rate)
++static void log_dhtb_config(const struct jakiro_dhtb_config *cfg)
+ {
+-	DOCA_LOG_INFO("DHTB_CFG underlay_src=%s underlay_dst=%s vxlan_dport=%u vni=%u overlay_dst=%s "
+-		      "root_gbps=%.3f roce_gbps=%.3f tcp_gbps=%.3f poll_sec=%u ingress_port_meta=%u fwd_port=%u",
+-		      cfg->underlay_src_ip,
+-		      cfg->underlay_dst_ip,
+-		      cfg->vxlan_dst_port,
+-		      cfg->vxlan_vni,
+-		      cfg->overlay_dst_ip,
+-		      bytes_per_sec_to_gbps(cfg->capacity_bytes_per_sec),
+-		      bytes_per_sec_to_gbps(roce_rate),
+-		      bytes_per_sec_to_gbps(tcp_rate),
+-		      STATUS_POLL_SECS,
+-		      cfg->ingress_port_meta,
+-		      cfg->jakiro_fwd_port);
+-}
+-
+-static void log_dhtb_period(uint64_t period_id,
+-			    uint32_t elapsed_secs,
+-			    const struct jakiro_dhtb_config *cfg,
+-			    uint64_t roce_rate,
+-			    uint64_t tcp_rate)
+-{
+-	struct counter_values vxlan_gate_delta;
+-	struct counter_values vxlan_gate_total;
+-	struct counter_values decap_delta;
+-	struct counter_values decap_total;
+-	struct counter_values roce_class_delta;
+-	struct counter_values roce_class_total;
+-	struct counter_values tcp_class_delta;
+-	struct counter_values tcp_class_total;
+-	struct counter_values classified_delta;
+-	struct counter_values classified_total;
+-	struct counter_values unclassified_delta;
+-	struct counter_values unclassified_total;
++	for (uint32_t k = 0; k < cfg->nb_inst; k++) {
++		const struct jakiro_inst_cfg *in = &cfg->inst[k];
++		uint64_t roce_rate = in->capacity_bytes_per_sec * in->roce_weight_permille / 1000ULL;
++
++		DOCA_LOG_INFO("DHTB_CFG inst=%s underlay_src=%s underlay_dst=%s vxlan_dport=%u vni=%u overlay_dst=%s "
++			      "root_gbps=%.3f roce_gbps=%.3f tcp_gbps=%.3f poll_sec=%u ingress_port_meta=%u fwd_port=%u",
++			      in->label,
++			      cfg->underlay_src_ip,
++			      cfg->underlay_dst_ip,
++			      cfg->vxlan_dst_port,
++			      cfg->vxlan_vni,
++			      in->overlay_dst_ip,
++			      bytes_per_sec_to_gbps(in->capacity_bytes_per_sec),
++			      bytes_per_sec_to_gbps(roce_rate),
++			      bytes_per_sec_to_gbps(in->capacity_bytes_per_sec - roce_rate),
++			      STATUS_POLL_SECS,
++			      cfg->ingress_port_meta,
++			      in->fwd_port);
++	}
++}
+ 
+-	refresh_counter_deltas();
++/* the delta or total of "<label>.<base>", or of <base> for a shared counter */
++static struct counter_values inst_counter(const struct jakiro_inst_cfg *in, const char *base, bool total)
++{
++	char name[COUNTER_NAME_LEN];
+ 
+-	vxlan_gate_delta = counter_delta("vxlan_gate_outer_to_decap");
+-	vxlan_gate_total = counter_total("vxlan_gate_outer_to_decap");
+-	decap_delta = counter_delta("vxlan_decap_to_classify");
+-	decap_total = counter_total("vxlan_decap_to_classify");
+-	roce_class_delta = counter_delta("classify_rocev2_leaf_meter");
+-	roce_class_total = counter_total("classify_rocev2_leaf_meter");
+-	tcp_class_delta = counter_delta("classify_tcp_leaf_meter");
+-	tcp_class_total = counter_total("classify_tcp_leaf_meter");
+-	classified_delta = counter_add(roce_class_delta, tcp_class_delta);
+-	classified_total = counter_add(roce_class_total, tcp_class_total);
+-	unclassified_delta = counter_sub(decap_delta, classified_delta);
+-	unclassified_total = counter_sub(decap_total, classified_total);
++	if (in != NULL)
++		snprintf(name, sizeof(name), "%s.%s", in->label, base);
++	else
++		snprintf(name, sizeof(name), "%s", base);
++	return total ? counter_total(name) : counter_delta(name);
++}
+ 
+-	DOCA_LOG_INFO("DHTB_PERIOD period=%" PRIu64 " elapsed_sec=%u",
+-		      period_id,
+-		      elapsed_secs);
++static void log_node(uint64_t period_id, uint32_t elapsed_secs, const struct jakiro_inst_cfg *in,
++		     const char *layer, const char *branch, const char *base)
++{
++	log_period_counter(period_id, elapsed_secs, in ? in->label : "all", layer, branch, NULL,
++			   inst_counter(in, base, false), inst_counter(in, base, true));
++}
+ 
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "ingress",
+-			   "vxlan_gate",
+-			   "outer VxLAN packets matching underlay/VNI and entering DHTB decap",
+-			   vxlan_gate_delta,
+-			   vxlan_gate_total);
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "ingress",
+-			   "after_decap",
+-			   "decapped packets entering overlay classifier",
+-			   decap_delta,
+-			   decap_total);
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "ingress",
+-			   "dhtb_classified",
+-			   "RoCE plus TCP packets that entered DHTB leaf meters",
+-			   classified_delta,
+-			   classified_total);
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "ingress",
+-			   "unclassified_after_decap",
+-			   "decapped packets not matching configured RoCE/TCP class rules",
+-			   unclassified_delta,
+-			   unclassified_total);
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "classify",
+-			   "roce_to_leaf",
+-			   "overlay UDP dst port matched RoCE leaf meter",
+-			   roce_class_delta,
+-			   roce_class_total);
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "classify",
+-			   "tcp_to_leaf",
+-			   "overlay TCP dst port matched TCP leaf meter",
+-			   tcp_class_delta,
+-			   tcp_class_total);
+-
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "leaf",
+-			   "roce_green",
+-			   "RoCE within guaranteed share; send to root as non-borrowing traffic",
+-			   counter_delta("roce_leaf_green"),
+-			   counter_total("roce_leaf_green"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "leaf",
+-			   "roce_yellow_borrow",
+-			   "RoCE above share and borrowing; root decides whether aggregate is saturated",
+-			   counter_delta("roce_leaf_yellow_borrow"),
+-			   counter_total("roce_leaf_yellow_borrow"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "leaf",
+-			   "roce_red_borrow",
+-			   "RoCE above share on meters that report excess as RED; treated as borrowing",
+-			   counter_delta("roce_leaf_red_borrow"),
+-			   counter_total("roce_leaf_red_borrow"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "leaf",
+-			   "tcp_green",
+-			   "TCP within guaranteed share; send to root as non-borrowing traffic",
+-			   counter_delta("tcp_leaf_green"),
+-			   counter_total("tcp_leaf_green"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "leaf",
+-			   "tcp_yellow_borrow",
+-			   "TCP above share and borrowing; root decides whether aggregate is saturated",
+-			   counter_delta("tcp_leaf_yellow_borrow"),
+-			   counter_total("tcp_leaf_yellow_borrow"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "leaf",
+-			   "tcp_red_borrow",
+-			   "TCP above share on meters that report excess as RED; treated as borrowing",
+-			   counter_delta("tcp_leaf_red_borrow"),
+-			   counter_total("tcp_leaf_red_borrow"));
+-
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "root",
+-			   "from_leaf_green",
+-			   "leaf-green traffic consumes aggregate root bucket and normally forwards",
+-			   counter_delta("root_meter_from_leaf_green"),
+-			   counter_total("root_meter_from_leaf_green"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "root",
+-			   "from_roce_borrow",
+-			   "RoCE borrowing traffic consumes aggregate root bucket before CE decision",
+-			   counter_delta("root_meter_from_roce_borrow"),
+-			   counter_total("root_meter_from_roce_borrow"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "root",
+-			   "from_tcp_borrow",
+-			   "TCP borrowing traffic consumes aggregate root bucket before drop decision",
+-			   counter_delta("root_meter_from_tcp_borrow"),
+-			   counter_total("root_meter_from_tcp_borrow"));
+-
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "decision",
+-			   "roce_borrow_root_green_forward",
+-			   "RoCE borrowed bandwidth while aggregate root bucket was not saturated",
+-			   counter_delta("roce_borrow_root_green_forward"),
+-			   counter_total("roce_borrow_root_green_forward"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "decision",
+-			   "roce_borrow_root_yellow_forward",
+-			   "RoCE borrowed bandwidth while root meter reported yellow/non-red",
+-			   counter_delta("roce_borrow_root_yellow_forward"),
+-			   counter_total("roce_borrow_root_yellow_forward"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "decision",
+-			   "roce_greedy_root_red_ce",
+-			   "RoCE greedy path: leaf borrowing and root saturated; mark CE then forward",
+-			   counter_delta("roce_greedy_root_red_ce_mark"),
+-			   counter_total("roce_greedy_root_red_ce_mark"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "decision",
+-			   "tcp_borrow_root_green_forward",
+-			   "TCP borrowed bandwidth while aggregate root bucket was not saturated",
+-			   counter_delta("tcp_borrow_root_green_forward"),
+-			   counter_total("tcp_borrow_root_green_forward"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "decision",
+-			   "tcp_borrow_root_yellow_forward",
+-			   "TCP borrowed bandwidth while root meter reported yellow/non-red",
+-			   counter_delta("tcp_borrow_root_yellow_forward"),
+-			   counter_total("tcp_borrow_root_yellow_forward"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "decision",
+-			   "tcp_greedy_root_red_drop",
+-			   "TCP greedy path: leaf borrowing and root saturated; drop",
+-			   counter_delta("tcp_greedy_root_red_drop"),
+-			   counter_total("tcp_greedy_root_red_drop"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "egress",
+-			   "ce_marked_roce_forward",
+-			   "RoCE packets whose inner ECN was set to CE after decap",
+-			   counter_delta("mark_ecn_ce_after_decap"),
+-			   counter_total("mark_ecn_ce_after_decap"));
+-	log_period_counter(period_id,
+-			   elapsed_secs,
+-			   "egress",
+-			   "forward_to_jakiro",
+-			   "packets forwarded to the managed VF/Jakiro after DHTB or classifier miss",
+-			   counter_delta("forward_to_jakiro"),
+-			   counter_total("forward_to_jakiro"));
++static void log_dhtb_period(uint64_t period_id, uint32_t elapsed_secs, const struct jakiro_dhtb_config *cfg)
++{
++	struct counter_values gate_d = {0}, gate_t = {0};
++	char gname[COUNTER_NAME_LEN];
++
++	refresh_counter_deltas();
++	DOCA_LOG_INFO("DHTB_PERIOD period=%" PRIu64 " elapsed_sec=%u", period_id, elapsed_secs);
++
++	/* shared front: the gate (one entry per peer), decap, and what no vNIC owned */
++	for (int g = 0; g < 4; g++) {
++		snprintf(gname, sizeof(gname), g ? "vxlan_gate_outer_to_decap_%d" : "vxlan_gate_outer_to_decap", g + 1);
++		gate_d = counter_add(gate_d, counter_delta(gname));
++		gate_t = counter_add(gate_t, counter_total(gname));
++	}
++	log_period_counter(period_id, elapsed_secs, "all", "ingress", "vxlan_gate", NULL, gate_d, gate_t);
++	log_node(period_id, elapsed_secs, NULL, "ingress", "after_decap", "vxlan_decap_to_classify");
++	log_node(period_id, elapsed_secs, NULL, "ingress", "no_vnic_dropped", "no_vnic_drop");
++
++	for (uint32_t k = 0; k < cfg->nb_inst; k++) {
++		const struct jakiro_inst_cfg *in = &cfg->inst[k];
++
++		log_node(period_id, elapsed_secs, in, "classify", "roce_to_leaf", "classify_rocev2_leaf_meter");
++		log_node(period_id, elapsed_secs, in, "classify", "tcp_to_leaf", "classify_tcp_leaf_meter");
++		log_node(period_id, elapsed_secs, in, "classify", "other_to_vnic", "classify_other_forward");
++		log_node(period_id, elapsed_secs, in, "leaf", "roce_green", "roce_leaf_green");
++		log_node(period_id, elapsed_secs, in, "leaf", "roce_yellow_borrow", "roce_leaf_yellow_borrow");
++		log_node(period_id, elapsed_secs, in, "leaf", "roce_red_borrow", "roce_leaf_red_borrow");
++		log_node(period_id, elapsed_secs, in, "leaf", "tcp_green", "tcp_leaf_green");
++		log_node(period_id, elapsed_secs, in, "leaf", "tcp_yellow_borrow", "tcp_leaf_yellow_borrow");
++		log_node(period_id, elapsed_secs, in, "leaf", "tcp_red_borrow", "tcp_leaf_red_borrow");
++		log_node(period_id, elapsed_secs, in, "root", "from_leaf_green", "root_meter_from_leaf_green");
++		log_node(period_id, elapsed_secs, in, "root", "from_roce_borrow", "root_meter_from_roce_borrow");
++		log_node(period_id, elapsed_secs, in, "root", "from_tcp_borrow", "root_meter_from_tcp_borrow");
++		log_node(period_id, elapsed_secs, in, "decision", "roce_borrow_root_green_forward", "roce_borrow_root_green_forward");
++		log_node(period_id, elapsed_secs, in, "decision", "roce_borrow_root_yellow_forward", "roce_borrow_root_yellow_forward");
++		log_node(period_id, elapsed_secs, in, "decision", "roce_greedy_root_red_ce", "roce_greedy_root_red_ce_mark");
++		log_node(period_id, elapsed_secs, in, "decision", "tcp_borrow_root_green_forward", "tcp_borrow_root_green_forward");
++		log_node(period_id, elapsed_secs, in, "decision", "tcp_borrow_root_yellow_forward", "tcp_borrow_root_yellow_forward");
++		log_node(period_id, elapsed_secs, in, "decision", "tcp_greedy_root_red_drop", "tcp_greedy_root_red_drop");
++		log_node(period_id, elapsed_secs, in, "egress", "ce_marked_roce_forward", "mark_ecn_ce_after_decap");
++		log_node(period_id, elapsed_secs, in, "egress", "forward_to_jakiro", "forward_to_jakiro");
++	}
+ }
+ 
+ static doca_error_t process_stage(struct doca_flow_port *port,
+@@ -599,6 +482,7 @@
+ }
+ 
+ static doca_error_t create_root_decision_pipe(struct doca_flow_port *port,
++					      const struct jakiro_inst_cfg *in,
+ 					      const char *name,
+ 					      bool is_roce,
+ 					      struct doca_flow_pipe *decap_forward_pipe,
+@@ -624,7 +508,7 @@
+ 	result = add_color_entry(*pipe,
+ 				 DOCA_FLOW_METER_COLOR_GREEN,
+ 				 &fwd_pass,
+-				 is_roce ? "roce_borrow_root_green_forward" : "tcp_borrow_root_green_forward",
++				 inst_name(in, is_roce ? "roce_borrow_root_green_forward" : "tcp_borrow_root_green_forward"),
+ 				 status);
+ 	if (result != DOCA_SUCCESS)
+ 		return result;
+@@ -632,7 +516,7 @@
+ 	result = add_color_entry(*pipe,
+ 				 DOCA_FLOW_METER_COLOR_YELLOW,
+ 				 &fwd_pass,
+-				 is_roce ? "roce_borrow_root_yellow_forward" : "tcp_borrow_root_yellow_forward",
++				 inst_name(in, is_roce ? "roce_borrow_root_yellow_forward" : "tcp_borrow_root_yellow_forward"),
+ 				 status);
+ 	if (result != DOCA_SUCCESS)
+ 		return result;
+@@ -640,7 +524,7 @@
+ 	result = add_color_entry(*pipe,
+ 				 DOCA_FLOW_METER_COLOR_RED,
+ 				 is_roce ? &fwd_greedy_roce_mark : &fwd_greedy_tcp_drop,
+-				 is_roce ? "roce_greedy_root_red_ce_mark" : "tcp_greedy_root_red_drop",
++				 inst_name(in, is_roce ? "roce_greedy_root_red_ce_mark" : "tcp_greedy_root_red_drop"),
+ 				 status);
+ 	return result;
+ }
+@@ -742,7 +626,7 @@
+ }
+ 
+ static doca_error_t create_plain_forward_pipe(struct doca_flow_port *port,
+-					      uint16_t fwd_port,
++					      const struct jakiro_inst_cfg *in,
+ 					      struct doca_flow_pipe **pipe,
+ 					      struct entries_status *status)
+ {
+@@ -754,14 +638,14 @@
+ 	doca_error_t result;
+ 
+ 	fwd.type = DOCA_FLOW_FWD_PORT;
+-	fwd.port_id = fwd_port;
++	fwd.port_id = in->fwd_port;
+ 	monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+ 
+ 	result = doca_flow_pipe_cfg_create(&pipe_cfg, port);
+ 	if (result != DOCA_SUCCESS)
+ 		return result;
+ 
+-	result = set_flow_pipe_cfg(pipe_cfg, "JAKIRO_FORWARD", DOCA_FLOW_PIPE_BASIC, false);
++	result = set_flow_pipe_cfg(pipe_cfg, inst_name(in, "JAKIRO_FORWARD"), DOCA_FLOW_PIPE_BASIC, false);
+ 	if (result != DOCA_SUCCESS)
+ 		goto destroy_cfg;
+ 	result = doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 1);
+@@ -782,7 +666,7 @@
+ 	if (result != DOCA_SUCCESS)
+ 		DOCA_LOG_ERR("Failed to add plain forward entry: %s", doca_error_get_descr(result));
+ 	else
+-		remember_counter("forward_to_jakiro", entry);
++		remember_counter(inst_name(in, "forward_to_jakiro"), entry);
+ 
+ destroy_cfg:
+ 	doca_flow_pipe_cfg_destroy(pipe_cfg);
+@@ -852,6 +736,7 @@
+ static doca_error_t create_post_decap_leaf_meter_pipe(struct doca_flow_port *port,
+ 						      const char *name,
+ 						      const struct jakiro_dhtb_config *cfg,
++						      const struct jakiro_inst_cfg *in,
+ 						      bool is_roce,
+ 						      uint32_t shared_meter_id,
+ 						      struct doca_flow_pipe *leaf_color_pipe,
+@@ -874,7 +759,7 @@
+ 	doca_be32_t overlay_dst;
+ 	doca_error_t result;
+ 
+-	result = ipv4_to_be32(cfg->overlay_dst_ip, &overlay_dst);
++	result = ipv4_to_be32(in->overlay_dst_ip, &overlay_dst);
+ 	if (result != DOCA_SUCCESS)
+ 		return result;
+ 
+@@ -946,7 +831,7 @@
+ }
+ 
+ static doca_error_t create_mark_ce_after_decap_pipe(struct doca_flow_port *port,
+-						    uint16_t fwd_port,
++						    const struct jakiro_inst_cfg *in,
+ 						    struct doca_flow_pipe **pipe,
+ 						    struct entries_status *status)
+ {
+@@ -970,14 +855,14 @@
+ 	actions_masks_arr[0] = &actions_mask_template;
+ 
+ 	fwd.type = DOCA_FLOW_FWD_PORT;
+-	fwd.port_id = fwd_port;
++	fwd.port_id = in->fwd_port;
+ 	monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+ 
+ 	result = doca_flow_pipe_cfg_create(&pipe_cfg, port);
+ 	if (result != DOCA_SUCCESS)
+ 		return result;
+ 
+-	result = set_flow_pipe_cfg(pipe_cfg, "JAKIRO_MARK_CE_AFTER_DECAP", DOCA_FLOW_PIPE_BASIC, false);
++	result = set_flow_pipe_cfg(pipe_cfg, inst_name(in, "JAKIRO_MARK_CE_AFTER_DECAP"), DOCA_FLOW_PIPE_BASIC, false);
+ 	if (result != DOCA_SUCCESS)
+ 		goto destroy_cfg;
+ 	result = doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 1);
+@@ -1001,7 +886,109 @@
+ 	if (result != DOCA_SUCCESS)
+ 		DOCA_LOG_ERR("Failed to add CE-after-decap entry: %s", doca_error_get_descr(result));
+ 	else
+-		remember_counter("mark_ecn_ce_after_decap", entry);
++		remember_counter(inst_name(in, "mark_ecn_ce_after_decap"), entry);
++
++destroy_cfg:
++	doca_flow_pipe_cfg_destroy(pipe_cfg);
++	return result;
++}
++
++/* What neither of a vNIC's two classes took: its other unicast (ARP replies,
++ * ICMP), recognised by the vNIC's MAC and handed to its representor without
++ * touching its buckets - the original sent every such packet to its single
++ * vNIC. A miss goes on to the next vNIC's classifiers. With no MAC (the single
++ * Jakiro of the original deployment) the pipe takes everything, as before. */
++static doca_error_t create_other_forward_pipe(struct doca_flow_port *port,
++					      const struct jakiro_inst_cfg *in,
++					      struct doca_flow_pipe *miss_pipe,
++					      struct doca_flow_pipe **pipe,
++					      struct entries_status *status)
++{
++	struct doca_flow_pipe_cfg *pipe_cfg;
++	struct doca_flow_match match_template = {0};
++	struct doca_flow_match match = {0};
++	struct doca_flow_monitor monitor = {0};
++	struct doca_flow_fwd fwd = {0};
++	struct doca_flow_fwd fwd_miss = {0};
++	struct doca_flow_pipe_entry *entry = NULL;
++	doca_error_t result;
++
++	if (in->has_mac) {
++		memset(match_template.outer.eth.dst_mac, 0xff, sizeof(match_template.outer.eth.dst_mac));
++		memcpy(match.outer.eth.dst_mac, in->dst_mac, sizeof(match.outer.eth.dst_mac));
++	}
++	fwd.type = DOCA_FLOW_FWD_PORT;
++	fwd.port_id = in->fwd_port;
++	fwd_miss.type = DOCA_FLOW_FWD_PIPE;
++	fwd_miss.next_pipe = miss_pipe;
++	monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
++
++	result = doca_flow_pipe_cfg_create(&pipe_cfg, port);
++	if (result != DOCA_SUCCESS)
++		return result;
++	result = set_flow_pipe_cfg(pipe_cfg, inst_name(in, "JAKIRO_OTHER_TO_VNIC"), DOCA_FLOW_PIPE_BASIC, false);
++	if (result != DOCA_SUCCESS)
++		goto destroy_cfg;
++	result = doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 1);
++	if (result != DOCA_SUCCESS)
++		goto destroy_cfg;
++	result = doca_flow_pipe_cfg_set_match(pipe_cfg, &match_template, NULL);
++	if (result != DOCA_SUCCESS)
++		goto destroy_cfg;
++	result = doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);
++	if (result != DOCA_SUCCESS)
++		goto destroy_cfg;
++	result = doca_flow_pipe_create(pipe_cfg, &fwd, (in->has_mac && miss_pipe != NULL) ? &fwd_miss : NULL, pipe);
++	if (result != DOCA_SUCCESS)
++		goto destroy_cfg;
++	result = doca_flow_pipe_basic_add_entry(0, *pipe, &match, 0, NULL, NULL, NULL, 0, status, &entry);
++	if (result != DOCA_SUCCESS)
++		DOCA_LOG_ERR("Failed to add %s other-forward entry: %s", in->label, doca_error_get_descr(result));
++	else
++		remember_counter(inst_name(in, "classify_other_forward"), entry);
++
++destroy_cfg:
++	doca_flow_pipe_cfg_destroy(pipe_cfg);
++	return result;
++}
++
++/* the end of the classifier chain: a decapped packet no vNIC owns */
++static doca_error_t create_no_vnic_drop_pipe(struct doca_flow_port *port,
++					     struct doca_flow_pipe **pipe,
++					     struct entries_status *status)
++{
++	struct doca_flow_pipe_cfg *pipe_cfg;
++	struct doca_flow_match match = {0};
++	struct doca_flow_monitor monitor = {0};
++	struct doca_flow_fwd fwd = {0};
++	struct doca_flow_pipe_entry *entry = NULL;
++	doca_error_t result;
++
++	fwd.type = DOCA_FLOW_FWD_DROP;
++	monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
++	result = doca_flow_pipe_cfg_create(&pipe_cfg, port);
++	if (result != DOCA_SUCCESS)
++		return result;
++	result = set_flow_pipe_cfg(pipe_cfg, "JAKIRO_NO_VNIC_DROP", DOCA_FLOW_PIPE_BASIC, false);
++	if (result != DOCA_SUCCESS)
++		goto destroy_cfg;
++	result = doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 1);
++	if (result != DOCA_SUCCESS)
++		goto destroy_cfg;
++	result = doca_flow_pipe_cfg_set_match(pipe_cfg, &match, NULL);
++	if (result != DOCA_SUCCESS)
++		goto destroy_cfg;
++	result = doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);
++	if (result != DOCA_SUCCESS)
++		goto destroy_cfg;
++	result = doca_flow_pipe_create(pipe_cfg, &fwd, NULL, pipe);
++	if (result != DOCA_SUCCESS)
++		goto destroy_cfg;
++	result = doca_flow_pipe_basic_add_entry(0, *pipe, &match, 0, NULL, NULL, NULL, 0, status, &entry);
++	if (result != DOCA_SUCCESS)
++		DOCA_LOG_ERR("Failed to add the no-vNIC drop entry: %s", doca_error_get_descr(result));
++	else
++		remember_counter("no_vnic_drop", entry);
+ 
+ destroy_cfg:
+ 	doca_flow_pipe_cfg_destroy(pipe_cfg);
+@@ -1180,41 +1167,108 @@
+ 	return result;
+ }
+ 
++/* One vNIC's Jakiro, the authors' graph with its own meters and forward. Its
++ * entry is its RoCE classifier; a packet that is neither its RoCE, its TCP
++ * nor its other unicast goes on to next_vnic (the next Jakiro's entry, or the
++ * final drop). */
++static doca_error_t build_one_jakiro(struct doca_flow_port *port,
++				     const struct jakiro_dhtb_config *cfg,
++				     uint32_t k,
++				     struct doca_flow_pipe *next_vnic,
++				     struct doca_flow_pipe **entry_pipe)
++{
++	const struct jakiro_inst_cfg *in = &cfg->inst[k];
++	struct entries_status status = {0};
++	struct doca_flow_pipe *plain_forward_pipe = NULL, *mark_ce_pipe = NULL;
++	struct doca_flow_pipe *tcp_decision = NULL, *roce_decision = NULL;
++	struct doca_flow_pipe *root_from_green = NULL, *root_from_tcp = NULL, *root_from_roce = NULL;
++	struct doca_flow_pipe *roce_color = NULL, *tcp_color = NULL;
++	struct doca_flow_pipe *other_pipe = NULL, *tcp_meter = NULL, *roce_meter = NULL;
++	doca_error_t result;
++
++	result = create_plain_forward_pipe(port, in, &plain_forward_pipe, &status);
++	if (result == DOCA_SUCCESS)
++		result = create_mark_ce_after_decap_pipe(port, in, &mark_ce_pipe, &status);
++	if (result == DOCA_SUCCESS)
++		result = process_stage(port, "forward", &status, 2);
++	if (result == DOCA_SUCCESS)
++		result = create_root_decision_pipe(port, in, inst_name(in, "TCP_ROOT_DECISION"), false,
++						   plain_forward_pipe, mark_ce_pipe, &tcp_decision, &status);
++	if (result == DOCA_SUCCESS)
++		result = create_root_decision_pipe(port, in, inst_name(in, "ROCE_ROOT_DECISION"), true,
++						   plain_forward_pipe, mark_ce_pipe, &roce_decision, &status);
++	if (result == DOCA_SUCCESS)
++		result = process_stage(port, "root decision", &status, 6);
++	if (result == DOCA_SUCCESS)
++		result = create_meter_stage_pipe(port, inst_name(in, "ROOT_FROM_LEAF_GREEN"), ROOT_METER_ID(k), false,
++						 plain_forward_pipe, inst_name(in, "root_meter_from_leaf_green"),
++						 &root_from_green, &status);
++	if (result == DOCA_SUCCESS)
++		result = create_meter_stage_pipe(port, inst_name(in, "ROOT_FROM_TCP_BORROW"), ROOT_METER_ID(k), false,
++						 tcp_decision, inst_name(in, "root_meter_from_tcp_borrow"),
++						 &root_from_tcp, &status);
++	if (result == DOCA_SUCCESS)
++		result = create_meter_stage_pipe(port, inst_name(in, "ROOT_FROM_ROCE_BORROW"), ROOT_METER_ID(k), false,
++						 roce_decision, inst_name(in, "root_meter_from_roce_borrow"),
++						 &root_from_roce, &status);
++	if (result == DOCA_SUCCESS)
++		result = process_stage(port, "root meter", &status, 3);
++	if (result == DOCA_SUCCESS)
++		result = create_leaf_color_pipe(port, inst_name(in, "ROCE_LEAF_COLOR"), root_from_green, root_from_roce,
++						&roce_color, &status, inst_name(in, "roce_leaf_green"),
++						inst_name(in, "roce_leaf_yellow_borrow"), inst_name(in, "roce_leaf_red_borrow"));
++	if (result == DOCA_SUCCESS)
++		result = create_leaf_color_pipe(port, inst_name(in, "TCP_LEAF_COLOR"), root_from_green, root_from_tcp,
++						&tcp_color, &status, inst_name(in, "tcp_leaf_green"),
++						inst_name(in, "tcp_leaf_yellow_borrow"), inst_name(in, "tcp_leaf_red_borrow"));
++	if (result == DOCA_SUCCESS)
++		result = process_stage(port, "leaf color", &status, 6);
++	if (result == DOCA_SUCCESS)
++		result = create_other_forward_pipe(port, in, next_vnic, &other_pipe, &status);
++	if (result == DOCA_SUCCESS)
++		result = process_stage(port, "other forward", &status, 1);
++	if (result == DOCA_SUCCESS)
++		result = create_post_decap_leaf_meter_pipe(port, inst_name(in, "JAKIRO_POST_DECAP_TCP_METER"), cfg, in,
++							   false, TCP_LEAF_METER_ID(k), tcp_color, other_pipe,
++							   inst_name(in, "classify_tcp_leaf_meter"), &tcp_meter, &status);
++	if (result == DOCA_SUCCESS)
++		result = process_stage(port, "tcp leaf meter", &status, 1);
++	if (result == DOCA_SUCCESS)
++		result = create_post_decap_leaf_meter_pipe(port, inst_name(in, "JAKIRO_POST_DECAP_ROCE_METER"), cfg, in,
++							   true, ROCE_LEAF_METER_ID(k), roce_color, tcp_meter,
++							   inst_name(in, "classify_rocev2_leaf_meter"), &roce_meter, &status);
++	if (result == DOCA_SUCCESS)
++		result = process_stage(port, "roce leaf meter", &status, 1);
++	if (result != DOCA_SUCCESS)
++		DOCA_LOG_ERR("Jakiro %s: pipeline build failed: %s", in->label, doca_error_get_descr(result));
++	*entry_pipe = roce_meter;
++	return result;
++}
++
+ doca_error_t jakiro_dhtb_run(int nb_queues, struct flow_switch_ctx *ctx, const struct jakiro_dhtb_config *cfg)
+ {
+ 	struct flow_resources resource = {0};
+ 	uint32_t nr_shared_resources[SHARED_RESOURCE_NUM_VALUES] = {0};
+-	struct doca_flow_port *ports[2] = {0};
+-	/* DOCA 3.4 requires an explicit per-port actions memory budget. Jakiro
+-	 * installs far more entries than the 2-entry sample: gate, decap,
+-	 * 2 classifiers, 2 leaf colour pipes, 3 root pipes, CE-mark, forward. */
+-	uint32_t actions_mem_size[2];
+-	struct doca_dev *dev_arr[2] = {0};
++	int nb_ports = (int)(1 + cfg->nb_inst);
++	struct doca_flow_port *ports[1 + JAKIRO_MAX_INST] = {0};
++	/* DOCA 3.4 requires an explicit per-port actions memory budget */
++	uint32_t actions_mem_size[1 + JAKIRO_MAX_INST];
++	uint32_t meter_ids[3 * JAKIRO_MAX_INST];
+ 	int nb_gate_entries = 0;
+ 	struct doca_flow_pipe *root_vxlan_gate_pipe = NULL;
+ 	struct doca_flow_pipe *vxlan_decap_to_classify_pipe = NULL;
+-	struct doca_flow_pipe *post_decap_roce_meter_pipe = NULL;
+-	struct doca_flow_pipe *post_decap_tcp_meter_pipe = NULL;
+-	struct doca_flow_pipe *roce_leaf_color_pipe = NULL;
+-	struct doca_flow_pipe *tcp_leaf_color_pipe = NULL;
+-	struct doca_flow_pipe *root_from_green_pipe = NULL;
+-	struct doca_flow_pipe *root_from_tcp_borrow_pipe = NULL;
+-	struct doca_flow_pipe *root_from_roce_borrow_pipe = NULL;
+-	struct doca_flow_pipe *tcp_root_decision_pipe = NULL;
+-	struct doca_flow_pipe *roce_root_decision_pipe = NULL;
+-	struct doca_flow_pipe *plain_forward_pipe = NULL;
+-	struct doca_flow_pipe *mark_ce_after_decap_pipe = NULL;
++	struct doca_flow_pipe *no_vnic_drop_pipe = NULL;
++	struct doca_flow_pipe *next = NULL;
+ 	struct entries_status status = {0};
+-	uint32_t meter_ids[NB_SHARED_METERS] = {ROOT_METER_ID, TCP_LEAF_METER_ID, ROCE_LEAF_METER_ID};
+-	uint64_t roce_rate = cfg->capacity_bytes_per_sec * cfg->roce_weight_permille / 1000ULL;
+-	uint64_t tcp_rate = cfg->capacity_bytes_per_sec - roce_rate;
++	struct doca_flow_port *sw;
+ 	uint64_t period_id = 0;
+ 	doca_error_t result;
+ 
+ 	nb_counter_refs = 0;
++	nb_counter_names = 0;
+ 	resource.nr_counters = MAX_COUNTERS;
+ 	resource.nr_meters = 8;
+-	nr_shared_resources[DOCA_FLOW_SHARED_RESOURCE_METER] = NB_SHARED_METERS;
++	nr_shared_resources[DOCA_FLOW_SHARED_RESOURCE_METER] = 3 * cfg->nb_inst;
+ 
+ 	result = init_doca_flow(nb_queues, "switch,hws", &resource, nr_shared_resources);
+ 	if (result != DOCA_SUCCESS) {
+@@ -1222,11 +1276,12 @@
+ 		return result;
+ 	}
+ 
+-	ARRAY_INIT(actions_mem_size, ACTIONS_MEM_SIZE(JAKIRO_NB_ENTRIES));
++	for (int i = 0; i < nb_ports; i++)
++		actions_mem_size[i] = ACTIONS_MEM_SIZE(JAKIRO_NB_ENTRIES);
+ 	result = init_doca_flow_switch_ports(ctx->devs_ctx.devs_manager,
+ 					     ctx->devs_ctx.nb_devs,
+ 					     ports,
+-					     2,
++					     nb_ports,
+ 					     actions_mem_size,
+ 					     &resource);
+ 	if (result != DOCA_SUCCESS) {
+@@ -1235,208 +1290,92 @@
+ 		return result;
+ 	}
+ 
+-	result = configure_shared_meter(ROOT_METER_ID, cfg->capacity_bytes_per_sec, cfg->root_burst_bytes, 0);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = configure_shared_meter(TCP_LEAF_METER_ID, tcp_rate, cfg->leaf_burst_bytes, 0);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = configure_shared_meter(ROCE_LEAF_METER_ID, roce_rate, cfg->leaf_burst_bytes, 0);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = doca_flow_shared_resources_bind(DOCA_FLOW_SHARED_RESOURCE_METER, meter_ids, NB_SHARED_METERS, ports[0]);
++	for (uint32_t k = 0; k < cfg->nb_inst; k++) {
++		const struct jakiro_inst_cfg *in = &cfg->inst[k];
++		uint64_t roce_rate = in->capacity_bytes_per_sec * in->roce_weight_permille / 1000ULL;
++
++		result = configure_shared_meter(ROOT_METER_ID(k), in->capacity_bytes_per_sec, cfg->root_burst_bytes, 0);
++		if (result == DOCA_SUCCESS)
++			result = configure_shared_meter(TCP_LEAF_METER_ID(k), in->capacity_bytes_per_sec - roce_rate,
++							cfg->leaf_burst_bytes, 0);
++		if (result == DOCA_SUCCESS)
++			result = configure_shared_meter(ROCE_LEAF_METER_ID(k), roce_rate, cfg->leaf_burst_bytes, 0);
++		if (result != DOCA_SUCCESS)
++			goto cleanup;
++		meter_ids[3 * k] = ROOT_METER_ID(k);
++		meter_ids[3 * k + 1] = TCP_LEAF_METER_ID(k);
++		meter_ids[3 * k + 2] = ROCE_LEAF_METER_ID(k);
++	}
++	result = doca_flow_shared_resources_bind(DOCA_FLOW_SHARED_RESOURCE_METER, meter_ids, 3 * cfg->nb_inst, ports[0]);
+ 	if (result != DOCA_SUCCESS) {
+ 		DOCA_LOG_ERR("Failed to bind shared meters: %s", doca_error_get_descr(result));
+ 		goto cleanup;
+ 	}
+ 
+-	result = create_plain_forward_pipe(doca_flow_port_switch_get(NULL),
+-					   cfg->jakiro_fwd_port,
+-					   &plain_forward_pipe,
+-					   &status);
++	sw = doca_flow_port_switch_get(NULL);
++	/* the chain ends in a drop; a single Jakiro with no MAC never reaches it */
++	result = create_no_vnic_drop_pipe(sw, &no_vnic_drop_pipe, &status);
++	if (result == DOCA_SUCCESS)
++		result = process_stage(sw, "no-vnic drop", &status, 1);
+ 	if (result != DOCA_SUCCESS)
+ 		goto cleanup;
++	next = no_vnic_drop_pipe;
++	for (int k = (int)cfg->nb_inst - 1; k >= 0; k--) {
++		struct doca_flow_pipe *entry_pipe = NULL;
+ 
+-	result = create_mark_ce_after_decap_pipe(doca_flow_port_switch_get(NULL),
+-						 cfg->jakiro_fwd_port,
+-						 &mark_ce_after_decap_pipe,
+-						 &status);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = process_stage(doca_flow_port_switch_get(NULL), "forward", &status, 2);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-
+-	result = create_root_decision_pipe(doca_flow_port_switch_get(NULL),
+-					   "TCP_ROOT_DECISION",
+-					   false,
+-					   plain_forward_pipe,
+-					   mark_ce_after_decap_pipe,
+-					   &tcp_root_decision_pipe,
+-					   &status);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = create_root_decision_pipe(doca_flow_port_switch_get(NULL),
+-					   "ROCE_ROOT_DECISION",
+-					   true,
+-					   plain_forward_pipe,
+-					   mark_ce_after_decap_pipe,
+-					   &roce_root_decision_pipe,
+-					   &status);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = process_stage(doca_flow_port_switch_get(NULL), "root decision", &status, 6);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-
+-	result = create_meter_stage_pipe(doca_flow_port_switch_get(NULL),
+-					 "ROOT_FROM_LEAF_GREEN",
+-					 ROOT_METER_ID,
+-					 false,
+-					 plain_forward_pipe,
+-					 "root_meter_from_leaf_green",
+-					 &root_from_green_pipe,
+-					 &status);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = create_meter_stage_pipe(doca_flow_port_switch_get(NULL),
+-					 "ROOT_FROM_TCP_BORROW",
+-					 ROOT_METER_ID,
+-					 false,
+-					 tcp_root_decision_pipe,
+-					 "root_meter_from_tcp_borrow",
+-					 &root_from_tcp_borrow_pipe,
+-					 &status);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = create_meter_stage_pipe(doca_flow_port_switch_get(NULL),
+-					 "ROOT_FROM_ROCE_BORROW",
+-					 ROOT_METER_ID,
+-					 false,
+-					 roce_root_decision_pipe,
+-					 "root_meter_from_roce_borrow",
+-					 &root_from_roce_borrow_pipe,
+-					 &status);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = process_stage(doca_flow_port_switch_get(NULL), "root meter", &status, 3);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-
+-	result = create_leaf_color_pipe(doca_flow_port_switch_get(NULL),
+-					"ROCE_LEAF_COLOR",
+-					root_from_green_pipe,
+-					root_from_roce_borrow_pipe,
+-					&roce_leaf_color_pipe,
+-					&status,
+-					"roce_leaf_green",
+-					"roce_leaf_yellow_borrow",
+-					"roce_leaf_red_borrow");
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = create_leaf_color_pipe(doca_flow_port_switch_get(NULL),
+-					"TCP_LEAF_COLOR",
+-					root_from_green_pipe,
+-					root_from_tcp_borrow_pipe,
+-					&tcp_leaf_color_pipe,
+-					&status,
+-					"tcp_leaf_green",
+-					"tcp_leaf_yellow_borrow",
+-					"tcp_leaf_red_borrow");
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = process_stage(doca_flow_port_switch_get(NULL), "leaf color", &status, 6);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-
+-	result = create_post_decap_leaf_meter_pipe(doca_flow_port_switch_get(NULL),
+-						   "JAKIRO_POST_DECAP_TCP_METER",
+-						   cfg,
+-						   false,
+-						   TCP_LEAF_METER_ID,
+-						   tcp_leaf_color_pipe,
+-						   plain_forward_pipe,
+-						   "classify_tcp_leaf_meter",
+-						   &post_decap_tcp_meter_pipe,
+-						   &status);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = process_stage(doca_flow_port_switch_get(NULL), "tcp leaf meter", &status, 1);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = create_post_decap_leaf_meter_pipe(doca_flow_port_switch_get(NULL),
+-						   "JAKIRO_POST_DECAP_ROCE_METER",
+-						   cfg,
+-						   true,
+-						   ROCE_LEAF_METER_ID,
+-						   roce_leaf_color_pipe,
+-						   post_decap_tcp_meter_pipe,
+-						   "classify_rocev2_leaf_meter",
+-						   &post_decap_roce_meter_pipe,
+-						   &status);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
+-	result = process_stage(doca_flow_port_switch_get(NULL), "roce leaf meter", &status, 1);
+-	if (result != DOCA_SUCCESS)
+-		goto cleanup;
++		result = build_one_jakiro(sw, cfg, (uint32_t)k, next, &entry_pipe);
++		if (result != DOCA_SUCCESS)
++			goto cleanup;
++		next = entry_pipe;
++	}
+ 
+-	result = create_decap_to_pipe(doca_flow_port_switch_get(NULL),
++	result = create_decap_to_pipe(sw,
+ 				      "JAKIRO_VXLAN_DECAP_TO_CLASSIFY",
+-				      post_decap_roce_meter_pipe,
++				      next,
+ 				      "vxlan_decap_to_classify",
+ 				      &vxlan_decap_to_classify_pipe,
+ 				      &status);
+ 	if (result != DOCA_SUCCESS)
+ 		goto cleanup;
+-	result = process_stage(doca_flow_port_switch_get(NULL), "vxlan decap", &status, 1);
++	result = process_stage(sw, "vxlan decap", &status, 1);
+ 	if (result != DOCA_SUCCESS)
+ 		goto cleanup;
+ 
+-	result = create_control_pipe(doca_flow_port_switch_get(NULL), "JAKIRO_RX_VXLAN_GATE", true, &root_vxlan_gate_pipe);
++	result = create_control_pipe(sw, "JAKIRO_RX_VXLAN_GATE", true, &root_vxlan_gate_pipe);
+ 	if (result != DOCA_SUCCESS)
+ 		goto cleanup;
+-	result = add_outer_vxlan_gate_entry(root_vxlan_gate_pipe,
+-					    cfg,
+-					    vxlan_decap_to_classify_pipe,
+-					    &status,
++	result = add_outer_vxlan_gate_entry(root_vxlan_gate_pipe, cfg, vxlan_decap_to_classify_pipe, &status,
+ 					    &nb_gate_entries);
+ 	if (result != DOCA_SUCCESS)
+ 		goto cleanup;
+-	result = process_stage(doca_flow_port_switch_get(NULL), "vxlan gate", &status, nb_gate_entries);
++	result = process_stage(sw, "vxlan gate", &status, nb_gate_entries);
+ 	if (result != DOCA_SUCCESS)
+ 		goto cleanup;
+ 
+-	DOCA_LOG_INFO("Installed receiver-side Jakiro DHTB after VxLAN decap: underlay %s -> %s vni=%u overlay_dst=%s",
++	DOCA_LOG_INFO("Installed %u receiver-side Jakiro DHTBs after VxLAN decap: underlay %s -> %s vni=%u",
++		      cfg->nb_inst,
+ 		      cfg->underlay_src_ip,
+ 		      cfg->underlay_dst_ip,
+-		      cfg->vxlan_vni,
+-		      cfg->overlay_dst_ip);
+-	DOCA_LOG_INFO("Ingress port_meta=%u, decap forward port=%u, root=%" PRIu64 " B/s, roce=%" PRIu64
+-		      " B/s, tcp=%" PRIu64 " B/s",
+-		      cfg->ingress_port_meta,
+-		      cfg->jakiro_fwd_port,
+-		      cfg->capacity_bytes_per_sec,
+-		      roce_rate,
+-		      tcp_rate);
++		      cfg->vxlan_vni);
+ 	DOCA_LOG_INFO("Leaf GREEN is guaranteed-share traffic; leaf YELLOW/RED is borrowing traffic");
+ 	DOCA_LOG_INFO("Leaf and root buckets use shared meters so excess traffic is color-tagged before branch selection");
+ 	DOCA_LOG_INFO("Greedy TCP is dropped; greedy RoCEv2 is inner-ECN CE marked and forwarded");
+ 	DOCA_LOG_INFO("Outer-to-inner ECN inheritance is not installed: switch,hws rejected inner header modification");
+-	log_dhtb_config(cfg, roce_rate, tcp_rate);
++	log_dhtb_config(cfg);
+ 
+ 	while (!jakiro_dhtb_stop_requested) {
+ 		sleep(STATUS_POLL_SECS);
+ 		if (jakiro_dhtb_stop_requested)
+ 			break;
+ 		period_id++;
+-		log_dhtb_period(period_id, STATUS_POLL_SECS, cfg, roce_rate, tcp_rate);
++		log_dhtb_period(period_id, STATUS_POLL_SECS, cfg);
+ 	}
+ 
+ 	DOCA_LOG_INFO("Stop requested, removing Jakiro DHTB rules");
+ 	result = DOCA_SUCCESS;
+ 
+ cleanup:
+-	stop_doca_flow_ports(2, ports);
++	stop_doca_flow_ports(nb_ports, ports);
+ 	doca_flow_destroy();
+ 	return result;
+ }
