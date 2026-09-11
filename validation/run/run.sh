@@ -192,7 +192,12 @@ if echo "$ROWS" | awk '{print $5}' | grep -q '^udp$'; then
     on_host "$h" "[ -x /tmp/udp_blast ] || gcc -O2 -pthread -o /tmp/udp_blast $REPO/tools/host/udp_blast.c" || { echo "ABORT: udp_blast missing on $h"; exit 1; }
   done
 fi
-T0=$(python3 -c "import time;print(int(time.time())+20)")
+# The lead has to cover starting every listener and launching every row, which
+# grows with the table: 15 s for 24 rows, 19-20 s for 48, 34 s for 96 (the
+# 96-row mesh launched 14 s after T0 with a fixed 20 s lead and its last
+# rows joined 11 s into the load). 10 s + 0.4 s per row, never under 20 s.
+T0_LEAD=$(echo "$ROWS" | awk 'NF{n++} END{l=int(10+0.4*n+0.5); print (l<20?20:l)}')
+T0=$(python3 -c "import time;print(int(time.time())+$T0_LEAD)")
 echo "$T0" > "$OUT/t0.txt"
 
 # ---- a hidden bottleneck at a VF (class=meter rows) ------------------------
