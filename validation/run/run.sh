@@ -422,6 +422,14 @@ while read -r sh sv dh dv cls n st en opt; do
     tcp_cc=*)     extra="-C ${opt#tcp_cc=}" ;;
     gbps=*)       extra="${opt#gbps=}" ;;
   esac
+  # perqp: a per-QP bandwidth time series (perftest-enhanced --report-per-qp,
+  # 100 ms bins) written on the sender and collected as qptrace_flow<k>.csv -
+  # what a flow-set's aggregate cannot show is how it divides among its own
+  # QPs. May appear in a comma-separated option list.
+  if [ "$cls" = rdma ] && [[ ",$opt," == *,perqp,* ]]; then
+    extra="$extra --report-per-qp --report-interval-us=100000 --report-csv=/tmp/val_qp$k.csv"
+    CLI[$sh]+="rm -f /tmp/val_qp$k.csv; "
+  fi
   if [ "$cls" = rdma ]; then
     # A late RDMA row is launched 5 s before its start (perftest's setup -
     # connect, get_cpu_mhz - takes well under a second), for the same
@@ -474,6 +482,9 @@ k=0
 while read -r sh sv dh dv cls n st en opt; do
   case "$cls" in meter|core) k=$((k+1)); continue ;; esac
   if [ "$sh" = "$(hostname)" ]; then cp /tmp/val_c$k.log "$OUT/flow${k}_${sh}vf${sv}_to_${dh}vf${dv}_${cls}.log"; else scp -q "$sh:/tmp/val_c$k.log" "$OUT/flow${k}_${sh}vf${sv}_to_${dh}vf${dv}_${cls}.log"; fi
+  if [ "$cls" = rdma ] && [[ ",$opt," == *,perqp,* ]]; then
+    if [ "$sh" = "$(hostname)" ]; then cp /tmp/val_qp$k.csv "$OUT/qptrace_flow$k.csv" 2>/dev/null; else scp -q "$sh:/tmp/val_qp$k.csv" "$OUT/qptrace_flow$k.csv" 2>/dev/null; fi || echo "WARN: no per-QP trace for flow $k"
+  fi
   k=$((k+1))
 done <<<"$ROWS"
 sleep 8
