@@ -91,6 +91,30 @@ if bad or r["policy"].get("per_sender_weights"):
     print("non-standard policy:", bad, r["policy"].get("per_sender_weights")); sys.exit(1)
 EOF
 cp config/lab-registry.json "$OUT/registry.json"
+# HPFT_CLASS_WEIGHTS="sgpu02/vf0=3:1[,<vm>=<rdma>:<tcp>...]": the class weights
+# this run gives some VMs (evaluation 2-8b). The standing registry stays the
+# standard one - the check above holds - and a copy with these weights goes to
+# the receiving DPUs, whose agents reload their policy when the file changes
+# (0.05 s after it lands, P8); cleanup puts the standing file back. The copy
+# travels with the run as registry.json.
+if [ -n "${HPFT_CLASS_WEIGHTS:-}" ]; then
+  python3 -c '
+import json, sys
+r = json.load(open("config/lab-registry.json"))
+for item in sys.argv[1].split(","):
+    vm, w = item.split("=")
+    a, b = (float(x) for x in w.split(":"))
+    r["policy"]["vms"][vm]["class_weights"] = {"tcp": b, "rdma": a}
+print(json.dumps(r, indent=2))
+' "$HPFT_CLASS_WEIGHTS" > "$OUT/registry.json" || { echo "ABORT: bad HPFT_CLASS_WEIGHTS"; exit 1; }
+  for h in $RECVS; do
+    scp -q "$OUT/registry.json" "$(dpu_of $h):/opt/hpft/lab-registry.json.new" \
+      && ssh -n -o BatchMode=yes "$(dpu_of $h)" "mv /opt/hpft/lab-registry.json.new /opt/hpft/lab-registry.json" \
+      || { echo "ABORT: could not push the run's class weights to $h"; exit 1; }
+  done
+  echo "class weights (rdma:tcp) for this run: $HPFT_CLASS_WEIGHTS" | tee "$OUT/policy.txt"
+  sleep 1
+fi
 for h in $HOSTS; do
   d=$(dpu_of $h); cur=$(ssh -o BatchMode=yes "$d" 'cat /sys/class/net/p1/speed' 2>/dev/null)
   [ "$cur" = "200000" ] || { echo "ABORT: $d p1 is ${cur} Mb, expected 200000"; exit 1; }
@@ -288,6 +312,10 @@ mbox() { # $1 host: write the remaining args, one line each, to its DPU's RP FIF
 }
 cleanup() {
   [ -n "$METER_ROWS" ] && echo "$METER_ROWS" | while read -r _ _ dh dv _; do meter_set "$dh" "$dv" 50000000 >/dev/null 2>&1; done
+  if [ -n "${HPFT_CLASS_WEIGHTS:-}" ]; then
+    for h in $RECVS; do scp -q config/lab-registry.json "$(dpu_of $h):/opt/hpft/lab-registry.json.new" \
+      && ssh -n -o BatchMode=yes "$(dpu_of $h)" "mv /opt/hpft/lab-registry.json.new /opt/hpft/lab-registry.json"; done
+  fi
   if [ "$ARM" = hpft ]; then
     for h in $SENDERS; do mbox "$h" "0xccd 2" "0xcce 0 22" "0xcce 0 12"; done
     for h in $SENDERS; do mbox "$h" "$RP_WINDOW_DEFAULT"; done
@@ -434,7 +462,7 @@ while read -r sh sv dh dv cls n st en opt; do
   # intended load. The management network (192.168.1.0/24, ens37f0) is
   # reachable by name from all four hosts and carries no experiment traffic.
   rctl=$dh
-  extra=""
+  extra=""; tend="-t $dur"
   case "$opt" in
     # perftest's SW rate limiter (the HW one is refused - the PCC executor
     # owns the QP's rate) sends burst_size messages then busy-waits out the
@@ -448,6 +476,10 @@ while read -r sh sv dh dv cls n st en opt; do
     # measured r23, the phase delivered 0.26 G of a 10 G demand.
     rate_limit=*) extra="--rate_limit=${opt#rate_limit=}" ;;
     tcp_cc=*)     extra="-C ${opt#tcp_cc=}" ;;
+    # bytes=<n>: a transfer that ends when its bytes are through (a 140 GiB
+    # weight download, evaluation 2-8a/b), not when the row's end comes; the
+    # row's end is then only the latest it may run
+    bytes=*)      tend="-n ${opt#bytes=}" ;;
     gbps=*)       extra="${opt#gbps=}" ;;
   esac
   # perqp: a per-QP bandwidth time series (perftest-enhanced --report-per-qp,
@@ -506,9 +538,9 @@ while read -r sh sv dh dv cls n st en opt; do
     # sees that idle connection as a live TCP flow-set and halves the VM's
     # class split around it (V9, 2026-09-02). 3 s covers iperf3's setup.
     if [ "$st" -gt 0 ]; then
-      cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-3-time.time()))\"; iperf3 -B $sip%dpu1vf$sv -c $dip -p $((5600+k)) -P $n -t $dur --start-at $((T0+off)) -J $extra' >/tmp/val_c$k.log 2>&1 </dev/null & "
+      cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-3-time.time()))\"; iperf3 -B $sip%dpu1vf$sv -c $dip -p $((5600+k)) -P $n $tend --start-at $((T0+off)) -J $extra' >/tmp/val_c$k.log 2>&1 </dev/null & "
     else
-      cmd="setsid nohup iperf3 -B $sip%dpu1vf$sv -c $dip -p $((5600+k)) -P $n -t $dur --start-at $((T0+off)) -J $extra >/tmp/val_c$k.log 2>&1 </dev/null & "
+      cmd="setsid nohup iperf3 -B $sip%dpu1vf$sv -c $dip -p $((5600+k)) -P $n $tend --start-at $((T0+off)) -J $extra >/tmp/val_c$k.log 2>&1 </dev/null & "
     fi
   fi
   CLI[$sh]+="$cmd"
