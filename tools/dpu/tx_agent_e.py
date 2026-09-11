@@ -35,6 +35,7 @@ Actuation: pace_f = max(min(R_f, Tree_f), floor); tcp -> host pace shim
 import argparse
 import json
 import zlib
+import errno
 import math
 import os
 import re
@@ -314,6 +315,11 @@ class RpMailbox:
         self.fd = -1
         self.ino = -1
         self.writes = self.errs = 0
+        # why a write did not land, by cause: ENXIO = no reader (the
+        # executor is not running), EAGAIN = the pipe is full (the executor
+        # is running but not draining), nofifo = the FIFO does not exist.
+        # One number for all three hid which of them sgpu02 was in (2026-09-11).
+        self.why = {}
         # set whenever the FIFO is found recreated, i.e. rp_service.sh has
         # restarted the executor and its device memory is empty again: the
         # caller must re-send everything the executor can only learn from
@@ -334,6 +340,7 @@ class RpMailbox:
         try:
             ino = os.stat(FIFO).st_ino
         except FileNotFoundError:
+            self.why["nofifo"] = self.why.get("nofifo", 0) + 1
             return False
         if self.fd < 0 or ino != self.ino:
             if self.fd >= 0:
@@ -341,7 +348,9 @@ class RpMailbox:
                 self.fd = -1
             try:
                 self.fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
-            except OSError:
+            except OSError as e:
+                k = errno.errorcode.get(e.errno, str(e.errno))
+                self.why[k] = self.why.get(k, 0) + 1
                 return False
             if self.ino != -1:
                 self.restarted = True
@@ -388,7 +397,9 @@ class RpMailbox:
         try:
             os.write(self.fd, line.encode())
             return True
-        except OSError:
+        except OSError as e:
+            k = errno.errorcode.get(e.errno, str(e.errno))
+            self.why[k] = self.why.get(k, 0) + 1
             os.close(self.fd)
             self.fd = -1
             return False
@@ -1278,9 +1289,12 @@ def main():
         if now - last_print >= 5.0:
             act = " ".join("%s R=%.2fG %s" % (f, st.R / 1e9, st.mode)
                            for f, st in sorted(flows.items()))
-            print("shim sent=%d acked=%d errs=%d fifo w=%d e=%d | %s"
+            print("shim sent=%d acked=%d errs=%d fifo w=%d e=%d%s | %s"
                   % (shim.sent, shim.acked, shim.errs, mailbox.writes,
-                     mailbox.errs, act or "no flows"), flush=True)
+                     mailbox.errs,
+                     " (" + " ".join("%s=%d" % kv for kv in sorted(mailbox.why.items())) + ")"
+                     if mailbox.why else "",
+                     act or "no flows"), flush=True)
             last_print = now
 
 

@@ -47,6 +47,13 @@ PCC_DEV=/home/ubuntu/bzx/doca34-apps/pcc/device/rp/rtt_template/rp_rtt_template_
 PCC_HSRC=tools/dpu/pcc/pcc_host.c
 PCC_HOST=/home/ubuntu/bzx/doca34-apps/pcc/host/pcc.c
 PCC_BUILD=/home/ubuntu/bzx/doca34-apps
+# The vendor host core the executor is built with. It carries the mailbox
+# size, and one DPU had the vendor default (8 bytes) while the others had
+# 512: that executor corrupted its heap on every budget batch and the device
+# dropped the batches as truncated (2026-09-11). Kept in the repo and
+# compared like the rest.
+PCC_CORE_SRC="tools/dpu/pcc/pcc_core.h tools/dpu/pcc/pcc_core.c"
+core_dst() { echo "$PCC_BUILD/pcc/host/$(basename "$1")"; }
 
 NODES=$(python3 -c "
 import json;print(' '.join(n['dpu'] for n in json.load(open('$CFG_FILE'))['nodes']))")
@@ -57,7 +64,7 @@ import json;print(' '.join(n['host'] for n in json.load(open('$CFG_FILE'))['node
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 bad=0; warn=0
 
-remote_paths() { for f in $DPU_FILES $CFG_FILE; do echo -n "/opt/hpft/$(basename "$f") "; done; echo -n "$PCC_DEV $PCC_HOST"; }
+remote_paths() { for f in $DPU_FILES $CFG_FILE; do echo -n "/opt/hpft/$(basename "$f") "; done; echo -n "$PCC_DEV $PCC_HOST"; for f in $PCC_CORE_SRC; do echo -n " $(core_dst $f)"; done; }
 
 # ---- one round trip per node, all nodes at once -------------------------
 for n in $NODES; do
@@ -92,6 +99,12 @@ for n in $NODES; do
     echo "  DIFFERS  $n:$PCC_HOST  (rebuild: ninja -C build pcc/doca_pcc)"
     bad=1; push="$push $PCC_HSRC"
   fi
+  for f in $PCC_CORE_SRC; do
+    if [ "$(want_of $f)" != "$(have_of "$n" "$(core_dst $f)")" ]; then
+      echo "  DIFFERS  $n:$(core_dst $f)  (rebuild: ninja -C build pcc/doca_pcc)"
+      bad=1; push="$push $f"
+    fi
+  done
   echo "$push" > "$TMP/$n.push"
 done
 
@@ -106,6 +119,7 @@ if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
         case "$f" in
           "$PCC_SRC") scp -q "$f" "$n:$PCC_DEV" ;;
           "$PCC_HSRC") scp -q "$f" "$n:$PCC_HOST" ;;
+          tools/dpu/pcc/pcc_core.*) scp -q "$f" "$n:$(core_dst $f)" ;;
           *)          scp -q "$f" "$n:/opt/hpft/" ;;
         esac
       done
@@ -140,7 +154,7 @@ if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
           [ build/pcc/doca_pcc -nt $PCC_DEV ] || exit 2" \
           || echo "  WARN $n: doca_pcc device build FAILED or did not pick up the new source - the RUNNING executor is still the old device code (see $n:/tmp/pcc_build.log)" ;;
       esac
-      case " $push " in *" $PCC_HSRC "*)
+      case " $push " in *" $PCC_HSRC "*|*pcc_core.*)
         case " $push " in *" $PCC_SRC "*) ;; *)
           ssh -o BatchMode=yes "$n" "cd $PCC_BUILD && ninja -C build pcc/doca_pcc >/dev/null 2>&1" \
             || echo "  WARN $n: doca_pcc host rebuild failed" ;;
@@ -162,6 +176,9 @@ if [ "${1:-}" = "--deploy" ] && { [ $bad -ne 0 ] || [ $warn -ne 0 ]; }; then
     done
     [ "$(want_of $PCC_SRC)" = "$(have_of "$n" "$PCC_DEV")" ] || { echo "  STILL DIFFERS  $n:$PCC_DEV"; bad=1; }
     [ "$(want_of $PCC_HSRC)" = "$(have_of "$n" "$PCC_HOST")" ] || { echo "  STILL DIFFERS  $n:$PCC_HOST"; bad=1; }
+    for f in $PCC_CORE_SRC; do
+      [ "$(want_of $f)" = "$(have_of "$n" "$(core_dst $f)")" ] || { echo "  STILL DIFFERS  $n:$(core_dst $f)"; bad=1; }
+    done
   done
 fi
 

@@ -15,7 +15,6 @@ import json
 import re
 import socket
 import struct
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -23,10 +22,14 @@ from pathlib import Path
 sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-implementation/tools/tcp_shaper/tools")
 from tcp_shaper_lib import (  # noqa: E402
     DirectBpfMapWriter,
+    TcpShaperError,
+    bpf_map_update_elem,
     build_pair_cfg_update,
     pack_pair_state,
     vnic_index,
 )
+
+BPF_NOEXIST = 1
 
 
 TCP_PIN_DIR = Path("/sys/fs/bpf/hpft_tcp_edt")
@@ -48,16 +51,22 @@ def evnic_map(tcp_reg):
     return out
 
 
-def seed_pair_states(tcp_reg):
+def seed_pair_states(tcp_reg, writer):
     """The datapath paces a pair only when BOTH cfg and state exist; the
     apply tool seeds state for its static rule list (the straight pairs)
     only, so cfg writes for any other pair were silently ignored and
     cross-pair TCP ran unpaced (stress D1, 2026-07-11). Seed state for
-    every local-src -> remote-dst pair; noexist never clobbers a live one."""
-    state_pin = TCP_PIN_DIR / "maps" / "hpft_pair_state"
+    every local-src -> remote-dst pair; NOEXIST never clobbers a live one.
+    Written through the bpf() syscall, not bpftool: on a host whose kernel
+    has no matching linux-tools package the bpftool on PATH is a wrapper
+    that only prints a warning, every seed failed, and all TCP outside the
+    straight pairs ran unpaced while the shim reported "seeded 0 new"
+    (sgpu01 on 5.15.0-187, found 2026-09-11 behind the 48-flow-set
+    failure)."""
+    fd = writer.fd("hpft_pair_state")
     indices = vnic_index(tcp_reg)
     host = socket.gethostname()
-    seeded = 0
+    seeded = present = failed = 0
     for s in tcp_reg["vnics"]:
         if str(s.get("host")) != host:
             continue
@@ -65,15 +74,21 @@ def seed_pair_states(tcp_reg):
             if str(d.get("host")) == host:
                 continue
             key = (indices[s["vnic_id"]] << 32) | indices[d["vnic_id"]]
-            cmd = (["bpftool", "map", "update", "pinned", str(state_pin),
-                    "key", "hex"]
-                   + ["%02x" % b for b in struct.pack("<Q", key)]
-                   + ["value", "hex"]
-                   + ["00"] * len(pack_pair_state())
-                   + ["noexist"])
-            if subprocess.run(cmd, capture_output=True).returncode == 0:
+            try:
+                bpf_map_update_elem(fd, struct.pack("<Q", key),
+                                    pack_pair_state(), BPF_NOEXIST)
                 seeded += 1
-    print("pace_shim: pair_state seeded %d new" % seeded, flush=True)
+            except TcpShaperError as e:
+                if "exists" in str(e):
+                    present += 1
+                else:
+                    failed += 1
+                    if failed <= 3:
+                        print("pace_shim: pair_state seed failed: %s" % e, flush=True)
+    print("pace_shim: pair_state seeded %d new, %d already present, %d failed"
+          % (seeded, present, failed), flush=True)
+    if seeded + present == 0:
+        sys.exit("pace_shim: no pair_state entry for this host - TCP would run unpaced")
 
 
 def main():
@@ -81,7 +96,7 @@ def main():
     emap = evnic_map(tcp_reg)
     writer = DirectBpfMapWriter(TCP_PIN_DIR)
     writer.fd("hpft_pair_cfg")  # open now, fail fast if EDT not applied
-    seed_pair_states(tcp_reg)
+    seed_pair_states(tcp_reg, writer)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(LISTEN)
     print("pace_shim: listening %s:%d pin=%s vnics=%d"

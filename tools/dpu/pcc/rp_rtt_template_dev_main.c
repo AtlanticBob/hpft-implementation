@@ -141,6 +141,32 @@ static volatile uint32_t g_law = HPFT_LAW_POOL;
  * ablation knob, 1 ms is the design point */
 static volatile uint32_t g_active_us = 1000u;
 #define HPFT_ACTIVE_US  (g_active_us)
+/* A member of a flow set is a QP that sends DATA in the set's direction,
+ * which is what design 6.1 means by "the flows that are sending" (S sums
+ * their c_i; each pays the pool for what it was allowed). A connection's two
+ * ends are both QPs of the same function pair, so on each host the far end of
+ * a connection coming the other way has the same (local, remote) VM pair as
+ * this host's own senders and is bound to this host's set - but all it sends
+ * is acknowledgements, and the data it carries belongs to the reverse flow
+ * set, drawn at the other host. BlueField-3 raises a TX event for those
+ * acknowledgements too, so "had a TX event" does not mean "sends data".
+ * What does is the size of what went out: an acknowledgement is ~66 bytes, a
+ * data packet at MTU 4096 is ~4 KB, and every TX event carries both a byte
+ * and a packet count. A QP that has not sent an event averaging
+ * HPFT_DATA_MIN_B or more per packet within HPFT_QP_STALE_US is not a data
+ * sender: it is left out of S, pays nothing, and is not shaped - its
+ * transmissions are the reverse flow's control traffic. The test is sticky
+ * over the same window that retires a departed QP, not over the 1 ms
+ * drawing window: a QP that sends data has gaps of more than a millisecond
+ * between its own events, and judging it per millisecond left it unshaped
+ * and unaccounted in those gaps (V1, criterion 6: paced below R in up to
+ * a third of the samples). Whether a data sender is drawing in a given
+ * millisecond is still decided by its last event of any kind, as before. This is verb-agnostic: a WRITE or
+ * SEND requester and a READ responder send data, a WRITE responder and a READ
+ * requester only control packets; it does not depend on how an application
+ * leaves its QPs' states. What it cannot see is data sent in messages smaller
+ * than this per packet; such a QP is not shaped (2026-09-11). */
+#define HPFT_DATA_MIN_B (512u)
 /* probe abort: a request unanswered this long (device ns) is re-issued */
 #define HPFT_PROBE_ABORT_NS (300000u)
 
@@ -416,6 +442,7 @@ typedef struct {
 	volatile uint32_t vhca;      /* the function (VF) this QP belongs to */
 	volatile uint32_t set;       /* flow-set index + 1; 0 = not known yet */
 	volatile uint32_t last_ts;
+	volatile uint32_t data_ts;   /* last TX event that carried data (see HPFT_DATA_MIN_B) */
 
 	hpft_dq_t dq;                /* DCQCN */
 
@@ -664,6 +691,7 @@ static inline void hpft_q_init(volatile hpft_q_t *q, uint32_t now)
 	q->vhca = 0;
 	q->set = 0;
 	q->last_ts = now;
+	q->data_ts = now - 0x40000000u;   /* not a data sender until it sends data */
 	hpft_dq_reset(&q->dq, now);
 	q->sw_cwnd = SW_INIT_CWND;
 	q->sw_rtt_s = 0;
@@ -874,8 +902,9 @@ static inline void hpft_set_epoch(volatile hpft_set_t *s, uint32_t now, uint32_t
 			s->qslot[k] = HPFT_SET_EMPTY;
 			continue;
 		}
-		if ((uint32_t)(now - q->last_ts) > HPFT_ACTIVE_US)
-			continue;              /* not drawing: not counted */
+		if ((uint32_t)(now - q->last_ts) > HPFT_ACTIVE_US ||
+		    (uint32_t)(now - q->data_ts) > HPFT_QP_STALE_US)
+			continue;              /* not drawing, or not a data sender: not counted */
 		sum += hpft_cc_rate(q);
 		live++;
 	}
@@ -1024,7 +1053,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 	doca_pcc_dev_event_general_attr_t a = doca_pcc_dev_get_ev_attr(event);
 	uint32_t now;
 	volatile hpft_q_t *q;
-	uint32_t slot, want_rtt = 0, r;
+	uint32_t slot, want_rtt = 0, r, is_data;
 	int ctx_ok;
 	volatile uint32_t *cx = (volatile uint32_t *)algo_ctxt;
 
@@ -1111,6 +1140,10 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 
 		g_ev_tx++;
 		q->n_tx++;
+		/* the byte counter clips at 2 MB per coalesced event: a clipped
+		 * count is data by construction */
+		if (pkts > 0 && (b32 >= 32768u || (b32 << 5) >= HPFT_DATA_MIN_B * pkts))
+			q->data_ts = now;
 		if (!q->qpn) {
 			q->qpn = doca_pcc_dev_get_flow_qpn(event);
 			q->vhca = hpft_ev_vhca(event);
@@ -1245,7 +1278,10 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 
 	/* ---- the rate: the QP's own CC rate, capped by the set's bucket ---- */
 	r = hpft_cc_rate(q);
-	if (!g_cc_only) {
+	is_data = (uint32_t)(now - q->data_ts) <= HPFT_QP_STALE_US;
+	if (!is_data)
+		q->tok_ts = now;   /* when it starts sending data it pays from then, not for the gap */
+	if (!g_cc_only && is_data) {
 		int si = (int)q->set - 1;
 
 		if (si >= 0 && si < HPFT_SETS && g_set[si].budget) {
@@ -1327,7 +1363,12 @@ shaped:
 		cx[6] = q->flags;
 		cx[7] = q->rtt_last;
 	}
-	hpft_pacc_settle(q, now);
+	/* the rate x time account is what the set was allowed; a QP that was
+	 * not sending data was not drawing on it */
+	if (is_data)
+		hpft_pacc_settle(q, now);
+	else
+		q->pacc_ts = now;
 	q->paced = r;
 	results->rate = r;
 	results->rtt_req = want_rtt;

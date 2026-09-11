@@ -190,6 +190,15 @@ int main(int argc, char **argv)
 			goto destroy_pcc;
 		}
 		PRINT_INFO("Info: HPFT rate-stdin mode ready\n");
+		/* The mailbox request buffer is as large as pcc_core.h says and
+		 * no larger; a budget batch or a QP map is up to 128 words. The
+		 * vendor header says 8 bytes, and one DPU built with it wrote
+		 * every batch past its buffer and died of SIGSEGV mid-run, while
+		 * the device, told each request was 8 bytes long, dropped every
+		 * batch as truncated (sgpu02, 2026-09-11). Printed so the log of
+		 * any executor shows what it was built with. */
+		printf("HPFT_MAILBOX request_bytes=%u\n", (unsigned)PCC_MAILBOX_REQUEST_SIZE);
+		fflush(stdout);
 		/* LATEST WINS (2026-08-25). One mailbox send costs 13 ms of wall
 		 * clock idle and ~22 ms under event load (measured), while the
 		 * sender agent pushes a fresh budget snapshot every few ms.
@@ -252,11 +261,19 @@ int main(int argc, char **argv)
 				uint32_t rate = words[1];
 				if (ft == 0)
 					continue;
+				if ((size_t)nw * sizeof(uint32_t) > PCC_MAILBOX_REQUEST_SIZE) {
+					printf("HPFT_DROP ft=0x%x words=%u mailbox_bytes=%u\n",
+					       ft, nw, (unsigned)PCC_MAILBOX_REQUEST_SIZE);
+					fflush(stdout);
+					continue;
+				}
 				clock_gettime(CLOCK_REALTIME, &t0);
 				for (uint32_t wi = 0; wi < nw; wi++)
 					req_buf[wi] = words[wi];
+				/* the length actually written: the device checks it
+				 * against what each message type needs */
 				result = doca_pcc_mailbox_send(resources.doca_pcc,
-							       PCC_MAILBOX_REQUEST_SIZE,
+							       nw * sizeof(uint32_t),
 							       &mb_response_size,
 							       &mb_cb_ret_val);
 				clock_gettime(CLOCK_REALTIME, &t1);

@@ -259,6 +259,20 @@ int hpft_tcp_edt(struct __sk_buff *skb)
     if ((void *)(tcph + 1) > data_end)
         return TC_ACT_OK;
 
+    /* A segment with no payload - a pure acknowledgement, or a bare
+     * SYN/FIN/RST - is not this flow set's traffic. On a host that sends
+     * to a peer and also receives from it, the receiving side's
+     * acknowledgements leave through the same (local VM, remote VM) pair
+     * as its own data, but what they carry is the control loop of the
+     * connection in the other direction, whose flow set is drawn at the
+     * other host. Such a segment adds nothing to the set's sum, pays the
+     * pool nothing and is not delayed; a connection that only
+     * acknowledges never becomes a member (design 6.1: S sums the flows
+     * that are sending). Same header arithmetic as the wire-byte count
+     * below: the IP header follows an untagged Ethernet header. */
+    if (skb->len <= ETH_HLEN + (__u32)iph->ihl * 4 + (__u32)tcph->doff * 4)
+        return TC_ACT_OK;
+
     now = bpf_ktime_get_ns();
     /* Meter WIRE bytes, not skb bytes: the share is defined against link
      * capacity, skb->len counts a GSO super-packet's headers once and

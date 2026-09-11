@@ -46,7 +46,12 @@ start)
     # no --remote-sw-handler: CCMAD RTT probes are answered by the REMOTE
     # NIC's HW handler (no NP process runs on the far DPU; with the flag
     # set, probes wait for a nonexistent NP process and vanish)
-    setsid sudo env HPFT_RATE_STDIN=1 $BIN -d mlx5_0 -l 40 -w 1100 \
+    # The executor leaves no trace when it stops: it exits silently on EOF
+    # and a DOCA-side failure may not print either. The wrapper records how
+    # and when it ended - a status of 128+N is signal N - which is the one
+    # thing a run that finds it gone needs to know (sgpu02, 2026-09-11: the
+    # executor vanished mid-run with its FIFO still held open).
+    setsid bash -c "sudo env HPFT_RATE_STDIN=1 $BIN -d mlx5_0 -l 40 -w 1100; echo \"HPFT_EXIT status=\$? at \$(date +%T.%N)\"" \
         < $FIFO > $LOG 2>&1 &
     sleep 6
     ps -C doca_pcc -o pid,etime,cmd | tail -1
