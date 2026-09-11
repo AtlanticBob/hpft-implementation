@@ -10,6 +10,11 @@ never forks).
 Datagram: {"src_vnic":"sgpu01/vf0","dst_vnic":"sgpu02/vf0","rate_bps":N}
 (E-registry vnic naming; translated to the tcp-registry naming here.)
 Replies {"ok":true,"latency_us":..} to the sender for path monitoring.
+
+Every TX_PUSH_S it also sends the agent the wire bytes each pair it has
+written has let through so far (hpft_pair_state.tx_bytes):
+{"tx": {"sgpu01/vf0>sgpu02/vf0": bytes, ...}}. The agent takes their
+ratios to divide a VF's vport total over the VF's flow sets.
 """
 import json
 import re
@@ -23,6 +28,7 @@ sys.path.insert(0, "/home/zhaoxiang/hyperfront/hpft-implementation/tools/tcp_sha
 from tcp_shaper_lib import (  # noqa: E402
     DirectBpfMapWriter,
     TcpShaperError,
+    bpf_map_lookup_elem,
     bpf_map_update_elem,
     build_pair_cfg_update,
     pack_pair_state,
@@ -38,6 +44,9 @@ TCP_REGISTRY = "/home/zhaoxiang/hyperfront/hpft-implementation/config/lab-tcp-re
 # least a clock can hand out at once, is also the natural burst
 BURST_BYTES = 65_536
 LISTEN = ("0.0.0.0", 9711)
+TX_PUSH_S = 0.010
+# offset of tx_bytes in struct hpft_pair_state: six u64, six u32
+TX_BYTES_OFF = 6 * 8 + 6 * 4
 RE_EVNIC = re.compile(r"^(\w+)/vf(\d+)$")
 
 
@@ -103,8 +112,31 @@ def main():
           % (*LISTEN, TCP_PIN_DIR, len(emap)), flush=True)
     n, err = 0, 0
     last_log = time.monotonic()
+    state_fd = writer.fd("hpft_pair_state")
+    state_size = len(pack_pair_state())
+    pairs = {}          # "src>dst" (agent naming) -> pair key bytes
+    agent = None        # where the rate datagrams come from
+    last_push = time.monotonic()
+    sock.settimeout(TX_PUSH_S)
     while True:
-        data, addr = sock.recvfrom(2048)
+        try:
+            data, addr = sock.recvfrom(2048)
+        except socket.timeout:
+            data = None
+        now = time.monotonic()
+        if agent is not None and pairs and now - last_push >= TX_PUSH_S:
+            last_push = now
+            tx = {}
+            for name, key in pairs.items():
+                v = bpf_map_lookup_elem(state_fd, key, state_size)
+                if v is not None:
+                    tx[name] = struct.unpack_from("<Q", v, TX_BYTES_OFF)[0]
+            try:
+                sock.sendto(json.dumps({"tx": tx}).encode(), agent)
+            except OSError:
+                pass
+        if data is None:
+            continue
         t0 = time.monotonic_ns()
         try:
             msg = json.loads(data)
@@ -120,6 +152,8 @@ def main():
                 flags=0,
                 generation=0)
             writer.update(upd)
+            pairs["%s>%s" % (msg["src_vnic"], msg["dst_vnic"])] = upd.key
+            agent = addr
             n += 1
             reply = {"ok": True,
                      "latency_us": round((time.monotonic_ns() - t0) / 1e3, 1)}

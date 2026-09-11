@@ -33,6 +33,7 @@ DEFAULT_RULES_SECTION = "tcp_rules"
 DEFAULT_QDISC_MODE = "mq-leaf-fq"
 DEFAULT_MQ_LEAF_COUNT = 4
 BPF_ANY = 0
+BPF_MAP_LOOKUP_ELEM = 1
 BPF_MAP_UPDATE_ELEM = 2
 BPF_OBJ_GET = 7
 
@@ -177,7 +178,7 @@ def pack_rate_cfg(rate_bps: int, generation: int, burst_bytes: int, flags: int =
 def pack_pair_state(next_ns: int = 0, generation: int = 0) -> bytes:
     """struct hpft_pair_state (lock-free proportional pool, 2026-09-10):
     epoch_ns, tok_ns, sum_cur, sum_prev, tok (signed), generation, epoch,
-    n_cur, n_prev, shots, nosock, pad0, reserved - 80 bytes. Every field
+    n_cur, n_prev, shots, nosock, pad0, tx_bytes - 80 bytes. Every field
     means "nothing seen yet" at zero; the clocks live per connection, so
     next_ns is accepted for the old callers and ignored."""
     del next_ns
@@ -531,6 +532,24 @@ def bpf_map_update_elem(fd: int, key: bytes, value: bytes, flags: int = BPF_ANY)
         flags,
     )
     _bpf_syscall(BPF_MAP_UPDATE_ELEM, attr)
+
+
+def bpf_map_lookup_elem(fd: int, key: bytes, value_size: int) -> bytes | None:
+    """The value stored under key, or None when there is none."""
+    key_buf = ctypes.create_string_buffer(key, len(key))
+    value_buf = ctypes.create_string_buffer(value_size)
+    attr = struct.pack(
+        "<I4xQQQ",
+        fd,
+        ctypes.addressof(key_buf),
+        ctypes.addressof(value_buf),
+        0,
+    )
+    try:
+        _bpf_syscall(BPF_MAP_LOOKUP_ELEM, attr)
+    except TcpShaperError:
+        return None
+    return value_buf.raw
 
 
 class DirectBpfMapWriter:

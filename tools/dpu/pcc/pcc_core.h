@@ -42,7 +42,8 @@
 #define PCC_COREDUMP_FILE_DEFAULT_PATH ("/tmp/doca_pcc_coredump.txt") /* Default pathname for device coredump file */
 #define PCC_PRINT_BUFFER_SIZE_DEFAULT_VALUE (512 * 2048)	      /* Device print buffer size - default value */
 #define PCC_MAILBOX_REQUEST_SIZE (512)		      /* Size of the mailbox request */
-#define PCC_MAILBOX_RESPONSE_SIZE (8 * sizeof(uint32_t))	     /* Size of the mailbox response. Currently not used */
+#define PCC_MAILBOX_RESPONSE_SIZE (512)		      /* Size of the mailbox response: a read-back is 8 words, a budget batch
+							 * answers with 1 + 2 words per flow set (HPFT_SETS = 32) */
 #define MAX_USER_ARG_SIZE (1024)	     /* Maximum size of user input argument */
 #define MAX_ARG_SIZE (MAX_USER_ARG_SIZE + 1) /* Maximum size of input argument */
 

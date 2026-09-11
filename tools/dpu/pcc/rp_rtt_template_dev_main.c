@@ -484,6 +484,11 @@ typedef struct {
 	volatile uint32_t n_nack;
 	volatile uint32_t n_tx;
 	volatile uint32_t avg_b32_x16;
+	/* data bytes this QP has put on the wire, in 32-byte units, wrapping;
+	 * written only by the event path. tx_rd is where the mailbox last read
+	 * it, written only by the mailbox (see the 0xb47f response). */
+	volatile uint32_t tx_b32;
+	volatile uint32_t tx_rd;
 } hpft_q_t;
 
 static hpft_q_t g_q[HPFT_QSLOTS];
@@ -712,6 +717,8 @@ static inline void hpft_q_init(volatile hpft_q_t *q, uint32_t now)
 	q->n_nack = 0;
 	q->n_tx = 0;
 	q->avg_b32_x16 = 34 * 16;
+	q->tx_b32 = 0;
+	q->tx_rd = 0;
 }
 
 /* A slot outside the keyed window, for a record that cannot be placed by key:
@@ -1164,6 +1171,11 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			est = (pkts * avg) >> 4;
 			if (g_algo == HPFT_CC_DCQCN)
 				hpft_dq_bytes(&q->dq, est << 5, now);
+			/* the bytes the sender agent reports per flow set; ACK-only
+			 * events (the passive end of a reverse connection) are not
+			 * this set's traffic, by the same test as data_ts */
+			if (b32 >= 32768u || (b32 << 5) >= HPFT_DATA_MIN_B * pkts)
+				q->tx_b32 += b32 < 32768u ? b32 : est;
 		}
 		/* Probe cadence for the delay-based CCs, as the vendor template
 		 * does it: the request goes out with a data packet (TX flag
@@ -1383,7 +1395,6 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 						      void *response,
 						      uint32_t *response_size)
 {
-	(void)max_response_size;
 	*response_size = 0;
 	if (request_size < 2 * sizeof(uint32_t))
 		return DOCA_PCC_DEV_STATUS_FAIL;
@@ -1430,6 +1441,44 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 						bud > DOCA_PCC_DEV_MAX_RATE
 							? DOCA_PCC_DEV_MAX_RATE : bud;
 				}
+			}
+			/* The response: per flow set, the data bytes its QPs sent
+			 * since the previous batch, in 32-byte units - word0 =
+			 * 0xB4C0|n, then n x {set id, bytes/32}. The sender agent
+			 * divides each VF's fresh vport total over the VF's flow
+			 * sets in these proportions, so a VF that sends to several
+			 * receivers reports each of them its own part (platform
+			 * notes, section 2). The event path only ever writes
+			 * tx_b32 and this only ever writes tx_rd, so the two need
+			 * no arbitration; a QP listed twice is read once, and a QP
+			 * still listed under a set it has left is skipped. */
+			if (max_response_size >= 3 * sizeof(uint32_t)) {
+				volatile uint32_t *rsp = (volatile uint32_t *)response;
+				uint32_t cap = (max_response_size / sizeof(uint32_t) - 1) / 2;
+				uint32_t m = 0;
+
+				for (uint32_t i = 0; i < HPFT_SETS && m < cap; i++) {
+					volatile hpft_set_t *s = &g_set[i];
+					uint32_t sum = 0, k;
+
+					if (!s->id)
+						continue;
+					for (k = 0; k < s->nq && k < HPFT_SET_QPS; k++) {
+						uint32_t qi = s->qslot[k];
+						uint32_t cur;
+
+						if (qi >= HPFT_QSLOTS || g_q[qi].set != i + 1)
+							continue;
+						cur = g_q[qi].tx_b32;
+						sum += cur - g_q[qi].tx_rd;
+						g_q[qi].tx_rd = cur;
+					}
+					rsp[1 + 2 * m] = s->id;
+					rsp[2 + 2 * m] = sum;
+					m++;
+				}
+				rsp[0] = 0xb4c00000u | m;
+				*response_size = (1 + 2 * m) * sizeof(uint32_t);
 			}
 			return DOCA_PCC_DEV_STATUS_OK;
 		}

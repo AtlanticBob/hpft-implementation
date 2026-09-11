@@ -331,8 +331,13 @@ class SenderLiveness:
     which dilutes the survivors' measured rate and makes them crawl into
     the freed share. No receiver-side counter can do better - but the
     sender's own vport TX counters are fresh at ~1 ms, so the sender
-    tells us. Used ONLY as a gate ("is this sender sending at all"), never
-    as the ratio: the ratio stays a receiver-side measurement.
+    tells us. It is both the gate ("is this sender sending at all") and the
+    ratio the pool is divided in (HybridRates._split); the pool itself stays
+    the receiver's own measurement. Each sender reports every flow set of
+    its own ("<src>><dst>|<class>": its VF's total times the flow set's part
+    of it, tx_agent_e.SenderLiveness) and every VF's total ("<vnic>|<class>");
+    a flow set is looked up under its own name first and under its VF's
+    total only when the sender has not named it yet.
 
     Advisory by construction: an absent or stale feed leaves attribution
     exactly as it was (baseline arms run no sender agent at all).
@@ -347,7 +352,8 @@ class SenderLiveness:
                          # oscillation with 40 ms queues. Jitter is the lesser evil.
 
     def __init__(self, port):
-        self.rate = {}                 # "host/vnic|class" -> bps
+        self.rate = {}                 # "host/vnic|class" or fsid -> bps
+        self.kt = {}                   # the same keys -> when last reported
         self.t = 0.0
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -382,22 +388,25 @@ class SenderLiveness:
                 for k, v in msg["r"].items():
                     old = self.rate.get(k)
                     self.rate[k] = float(v) if old is None else old + (float(v) - old) * a
+                    self.kt[k] = now
                 self.t = now
             except (ValueError, KeyError):
                 continue
 
+    def _reported(self, fsid, now):
+        """the flow set's own fresh report, else its VF's total, else None"""
+        if now - self.kt.get(fsid, -1e9) <= self.STALE_S:
+            return self.rate[fsid]
+        return self.rate.get("%s|%s" % (fsid.split(">")[0], fsid.rsplit("|", 1)[1]))
+
     def rates_for(self, fsids, now):
-        """{fsid: sender-reported bps} when EVERY fsid has a fresh report
-        (a sender's report covers all of that (src, class)'s flow-sets, so
-        two flow-sets from one src VF to different dsts share one number;
-        in the star lab each src VF talks to one dst so this is exact).
+        """{fsid: sender-reported bps} when EVERY fsid has a fresh report.
         None if any member is unknown or the feed is stale."""
         if self.sock is None or now - self.t > self.STALE_S:
             return None
         out = {}
         for f in fsids:
-            src, cls = f.split(">")[0], f.rsplit("|", 1)[1]
-            v = self.rate.get("%s|%s" % (src, cls))
+            v = self._reported(f, now)
             if v is None:
                 return None
             out[f] = float(v)
@@ -405,11 +414,10 @@ class SenderLiveness:
 
     def idle(self, fsid, now):
         """True only when the sender positively reports ~zero for this
-        (src, class). Unknown or stale => False (never gate on silence)."""
+        flow set. Unknown or stale => False (never gate on silence)."""
         if self.sock is None or now - self.t > self.STALE_S:
             return False
-        src, cls = fsid.split(">")[0], fsid.rsplit("|", 1)[1]
-        v = self.rate.get("%s|%s" % (src, cls))
+        v = self._reported(fsid, now)
         return v is not None and v < self.IDLE_BPS
 
 

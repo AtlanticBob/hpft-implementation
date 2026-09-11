@@ -110,7 +110,8 @@ struct hpft_pair_state {
     __u32 shots;        /* packets dropped at a connection's debt cap (diag) */
     __u32 nosock;       /* packets that carried no tcp_sock (diag) */
     __u32 pad0;
-    __u64 reserved;
+    __u64 tx_bytes;     /* wire bytes of the payload segments let through; read by the
+                         * pace shim for the sender's per-flow-set report (atomic add) */
 };
 
 /* per connection (5-tuple): its own clock, its own window, and the rate it
@@ -482,6 +483,10 @@ int hpft_tcp_edt(struct __sk_buff *skb)
      * the wire rate is min(the CC's own pacing, our share). */
     if (send_ns > now && send_ns > skb->tstamp)
         skb->tstamp = send_ns;
+    /* what this flow set puts on the wire, for the sender agent: it divides
+     * the VF's fresh vport total over the VF's flow sets in these proportions
+     * (platform notes, section 2) */
+    __sync_fetch_and_add(&state->tx_bytes, wire);
     return TC_ACT_OK;
 }
 

@@ -24,7 +24,9 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
-from distill import load_flows, expected_at, receivers, C_ROOT
+from distill import load_flows, expected_at, receivers, LINE, HEADROOM
+
+C_ROOT = LINE * (1 - HEADROOM)   # the receiver's root with no unscheduled load
 tags = [t for t in sys.argv[1].split(",") if t]
 base = sys.argv[2] if len(sys.argv) > 2 else tags[0].split("_")[0]
 D = os.path.join(BASE, "data")
@@ -112,7 +114,7 @@ for j, dh in enumerate(recv):
     colors = [("#d62728" if cols[i].endswith("rdma") else "#1f77b4") for i in idx]
     a = ax[1 + j]
     a.stackplot(vt, stack[idx], colors=colors, alpha=0.7, lw=0.2, edgecolor="white")
-    a.axhline(C_ROOT / 1e9, color="k", ls=":", lw=1); a.text(0.5, C_ROOT / 1e9 + 2, "C' = 184 G", fontsize=8)
+    a.axhline(C_ROOT / 1e9, color="k", ls=":", lw=1); a.text(0.5, C_ROOT / 1e9 + 2, "C' = %.0f G" % (C_ROOT / 1e9), fontsize=8)
     a.set_ylabel(f"wire at {dh} per VM per class (Gb/s)" if len(recv) > 1 else "wire per VM per class, stacked (Gb/s)")
     a.grid(alpha=0.3); a.set_ylim(0, 215)
 axq.set_ylabel("virtual queue (ms), 100 ms mean"); axq.set_xlabel("experiment time (s)"); axq.grid(alpha=0.3)

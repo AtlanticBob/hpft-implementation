@@ -37,6 +37,77 @@
 #include <doca_pcc.h>
 
 #include "pcc_core.h"
+#include <sys/mman.h>
+
+/* Per-flow-set data bytes sent, for the sender agent's per-flow-set report
+ * (tx_agent_e.py, SenderLiveness). The device answers every budget batch with
+ * each set's bytes since the previous batch (0xB4C0|n, n x {id, bytes/32});
+ * this keeps the running total per set id in HPFT_TXC_PATH under a seqlock
+ * (seq odd while writing), stamped with CLOCK_MONOTONIC like the vport
+ * meter's file. The agent only ever takes ratios of these totals. */
+#define HPFT_TXC_PATH "/dev/shm/hpft_rp_tx"
+#define HPFT_TXC_MAX (64)
+struct hpft_txc {
+	char magic[8];			/* "HPFTRPT1" */
+	volatile uint64_t seq;
+	uint64_t t_ns;
+	uint32_t n;
+	uint32_t pad;
+	struct {
+		uint32_t id;
+		uint32_t pad;
+		uint64_t b32;
+	} e[HPFT_TXC_MAX];
+};
+
+static struct hpft_txc *hpft_txc_open(void)
+{
+	struct hpft_txc *p;
+	int fd = open(HPFT_TXC_PATH, O_RDWR | O_CREAT, 0644);
+
+	if (fd < 0)
+		return NULL;
+	if (ftruncate(fd, sizeof(*p)) != 0) {
+		close(fd);
+		return NULL;
+	}
+	p = mmap(NULL, sizeof(*p), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (p == MAP_FAILED)
+		return NULL;
+	memset(p, 0, sizeof(*p));
+	memcpy(p->magic, "HPFTRPT1", 8);
+	return p;
+}
+
+static void hpft_txc_add(struct hpft_txc *p, const uint32_t *rsp, uint32_t words)
+{
+	uint32_t m = rsp[0] & 0xffffu;
+	struct timespec ts;
+
+	if (words < 1 + 2 * m)
+		m = (words - 1) / 2;
+	p->seq++;
+	__sync_synchronize();
+	for (uint32_t i = 0; i < m; i++) {
+		uint32_t id = rsp[1 + 2 * i], j;
+
+		for (j = 0; j < p->n && p->e[j].id != id; j++)
+			;
+		if (j == p->n) {
+			if (p->n >= HPFT_TXC_MAX)
+				continue;
+			p->e[j].id = id;
+			p->e[j].b32 = 0;
+			p->n++;
+		}
+		p->e[j].b32 += rsp[2 + 2 * i];
+	}
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	p->t_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+	__sync_synchronize();
+	p->seq++;
+}
 
 static const char *status_str[DOCA_PCC_PS_ERROR + 1] = {"Active", "Standby", "Deactivated", "Error"};
 static bool host_stop;
@@ -197,7 +268,12 @@ int main(int argc, char **argv)
 		 * the device, told each request was 8 bytes long, dropped every
 		 * batch as truncated (sgpu02, 2026-09-11). Printed so the log of
 		 * any executor shows what it was built with. */
-		printf("HPFT_MAILBOX request_bytes=%u\n", (unsigned)PCC_MAILBOX_REQUEST_SIZE);
+		printf("HPFT_MAILBOX request_bytes=%u response_bytes=%u\n",
+		       (unsigned)PCC_MAILBOX_REQUEST_SIZE, (unsigned)PCC_MAILBOX_RESPONSE_SIZE);
+		struct hpft_txc *txc = hpft_txc_open();
+
+		if (txc == NULL)
+			printf("HPFT_TXC unavailable: %s - per-flow-set bytes will not be published\n", HPFT_TXC_PATH);
 		fflush(stdout);
 		/* LATEST WINS (2026-08-25). One mailbox send costs 13 ms of wall
 		 * clock idle and ~22 ms under event load (measured), while the
@@ -277,7 +353,16 @@ int main(int argc, char **argv)
 							       &mb_response_size,
 							       &mb_cb_ret_val);
 				clock_gettime(CLOCK_REALTIME, &t1);
-				if (mb_response_size >= 8 * sizeof(uint32_t)) {
+				if ((ft & 0xffff0000u) == 0xb47f0000u) {
+					uint32_t *rsp = NULL;
+
+					/* a budget batch answers with the per-set bytes */
+					if (txc != NULL && result == DOCA_SUCCESS &&
+					    mb_response_size >= sizeof(uint32_t) &&
+					    doca_pcc_mailbox_get_response_buffer(resources.doca_pcc, (void **)&rsp) == DOCA_SUCCESS &&
+					    rsp != NULL && (rsp[0] & 0xffff0000u) == 0xb4c00000u)
+						hpft_txc_add(txc, rsp, mb_response_size / sizeof(uint32_t));
+				} else if (mb_response_size >= 8 * sizeof(uint32_t)) {
 					uint32_t *rsp = NULL;
 
 					if (doca_pcc_mailbox_get_response_buffer(resources.doca_pcc, (void **)&rsp) == DOCA_SUCCESS && rsp != NULL)

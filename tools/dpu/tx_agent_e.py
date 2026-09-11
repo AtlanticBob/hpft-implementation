@@ -414,6 +414,9 @@ class PaceShim:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
         self.sent = self.acked = self.errs = 0
+        # the TCP executor's wire bytes per pair, pushed by the shim every
+        # 10 ms ({"src>dst": bytes}), and when this agent received them
+        self.tx, self.tx_t = {}, 0.0
 
     def set_rate(self, src, dst, rate_bps):
         """The flow-set's rate R and nothing else: the executor splits it
@@ -433,43 +436,75 @@ class PaceShim:
             except (BlockingIOError, OSError):
                 return
             try:
-                self.acked += 1 if json.loads(data).get("ok") else 0
+                msg = json.loads(data)
             except ValueError:
-                pass
+                continue
+            if "tx" in msg:
+                self.tx, self.tx_t = msg["tx"], time.monotonic()
+            elif msg.get("ok"):
+                self.acked += 1
 
 
 class SenderLiveness:
-    """Fresh per-(src vnic, class) TX rates, published to every other node.
+    """Fresh per-flow-set TX rates, published to the flow set's receiver.
 
-    Why: the receiver splits a dst's exactly-measured pool among its
-    senders using megaflow byte ratios, and those counters are ~1 s
-    hardware-cached. When a sender STOPS, its stale bytes keep claiming a
-    share for up to the mix window (2 s), so the survivors' measured rate
-    stays diluted and they crawl into the freed share (D3 leave, ~2.9 s).
-    The sender does not have that problem: its own vport TX counters are
-    fresh at ~1 ms. Publishing them lets the receiver gate attribution on
-    "is this sender actually sending", which no receiver-side signal can
-    answer in under a second.
+    Why: the receiver's hardware counts arrivals per (destination VM,
+    class) only, so it divides that exact total over the senders in the
+    proportions the senders report (platform notes, section 2), and it
+    gates on the report to know at once when a sender stops - the ~1 s
+    hardware-cached megaflow counters cannot tell it that in under a
+    second. The sender's own vport TX counters are fresh at ~1 ms but count
+    per VF, and a VF that sends to several receivers would report its
+    total to each of them: in a full mesh every receiver then divides
+    every pool evenly and cannot see which sender is over (2-7b mesh96,
+    2026-09-11: RDMA flow sets got 0.59-1.26 of their entitlement while the
+    ledger read 0.94-0.98 for all of them). So each VF's fresh total is
+    divided over the VF's flow sets in the proportions the executors
+    count: the RDMA executor answers every mailbox round with each set's
+    bytes (pcc_host keeps the running totals in /dev/shm/hpft_rp_tx, about
+    every 16 ms), the TCP executor counts per pair and the pace shim pushes
+    the totals every 10 ms. A VF with one flow set of a class - every VF
+    in a star - reports its whole total, exactly as before; so does one
+    whose executor has no fresh counts.
 
-    Payload is tiny and advisory: {"h": host, "t": mono_ns,
-    "r": {"<vnic>|<class>": bps}}. The receiver falls back to its old
-    chain whenever this feed is absent or stale, so a sender without the
-    helper (baseline arms) behaves exactly as before.
+    Payload is tiny and advisory: {"h": host, "t": mono_ns, "r":
+    {"<vnic>|<class>": bps, "<src>><dst>|<class>": bps}}, the per-VF totals
+    to every other node (the receiver's fallback) plus, to each receiver,
+    its own flow sets. The receiver falls back to its old chain whenever
+    this feed is absent or stale, so a sender without the helper (baseline
+    arms) behaves exactly as before.
     """
 
     HDR = struct.Struct("<8sII8H")
     STALE_S = 0.1
+    TXC = struct.Struct("<8sQQII")   # pcc_host's hpft_txc header, 32 bytes
+    TXC_PATH = "/dev/shm/hpft_rp_tx"
+    PART_WIN_S = 0.010   # shortest interval a proportion is taken over
+    PART_STALE_S = 0.2   # counts older than this: back to the whole total
 
-    def __init__(self, path, vport_of_vnic, dst_ips, port, host):
+    def __init__(self, path, vport_of_vnic, addr_of_host, port, host):
         self.path, self.vport_of_vnic = path, vport_of_vnic
-        # every other node may be a receiver (2026-09-04), so the feed goes
-        # to all of them; a node that is not receiving just ignores it
-        self.addrs, self.host = [(ip, port) for ip in dst_ips], host
+        # every other node may be a receiver (2026-09-04), so the per-VF
+        # totals go to all of them; a node that is not receiving ignores it
+        self.addr_of_host = {h: (ip, port) for h, ip in addr_of_host.items()}
+        self.host = host
         self.mm = None
         self.slot = {}
         self.prev = {}          # vnic -> (t_s, tx_ib, tx_eth)
         self.rate = {}          # "vnic|class" -> bps
+        self.fs_rate = {}       # fsid -> bps: its VF's total x its part
         self._next_open = 0.0
+        # set by main once they exist: the local flow sets (fsid -> state),
+        # the RDMA set id of a pair, and the shim that carries TCP's counts
+        self.flows = {}
+        self.flowtag_of = None
+        self.shim = None
+        self._fs = {}           # fsid -> (src, dst host, class, counter key)
+        self.txc = None
+        self._txc_next_open = 0.0
+        self.win = {"rdma": None, "tcp": None}   # (t, {key: bytes}) a part starts from
+        self.part = {}          # fsid -> its part of its VF's class total
+        self.part_t = {"rdma": 0.0, "tcp": 0.0}
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
 
@@ -521,16 +556,123 @@ class SenderLiveness:
                 self.rate["%s|rdma" % vnic] = (tx_ib - prev[1]) * 8 / dt
             if tx_eth >= prev[2]:
                 self.rate["%s|tcp" % vnic] = (tx_eth - prev[2]) * 8 / dt
-        if self.rate:
-            msg = {"h": self.host, "t": time.monotonic_ns(),
-                   "r": {k: int(v) for k, v in self.rate.items()}}
-            data = json.dumps(msg).encode()
-            for addr in self.addrs:
-                try:
-                    self.sock.sendto(data, addr)
-                except OSError:
-                    pass
+        if not self.rate:
+            return
+        self._parts(now)
+        fr = {}
+        for f in self.flows:
+            if f not in self._fs:
+                self._fs[f] = self._describe(f)
+            d = self._fs[f]
+            if d is None:
+                continue
+            tot = self.rate.get("%s|%s" % (d[0], d[2]))
+            if tot is None:
+                continue
+            fresh = now - self.part_t[d[2]] <= self.PART_STALE_S
+            fr[f] = tot * (self.part.get(f, 1.0) if fresh else 1.0)
+        self.fs_rate = fr
+        base = {k: int(v) for k, v in self.rate.items()}
+        t = time.monotonic_ns()
+        for h, addr in self.addr_of_host.items():
+            r = dict(base)
+            for f, v in fr.items():
+                if self._fs[f][1] == h:
+                    r[f] = int(v)
+            try:
+                self.sock.sendto(json.dumps({"h": self.host, "t": t, "r": r}).encode(), addr)
+            except OSError:
+                pass
 
+    def own_rate(self, fsid):
+        """the flow set's own send rate, bps, or None before the first sample"""
+        v = self.fs_rate.get(fsid)
+        if v is not None:
+            return v
+        return self.rate.get("%s|%s" % (fsid.split(">")[0], fsid.rsplit("|", 1)[1]))
+
+    def _describe(self, fsid):
+        """(src vnic, dst host, class, counter key) of a local flow set"""
+        try:
+            src_dst, cls = fsid.rsplit("|", 1)
+            src, dst = src_dst.split(">")
+        except ValueError:
+            return None
+        if src not in self.vport_of_vnic or cls not in ("rdma", "tcp"):
+            return None
+        if cls == "rdma":
+            key = self.flowtag_of(src_dst, src) if self.flowtag_of else None
+        else:
+            key = src_dst
+        return (src, dst.split("/")[0], cls, key)
+
+    def _read_txc(self, now):
+        """(t, {set id: bytes/32}) from pcc_host's running totals, or None"""
+        if self.txc is None:
+            if now < self._txc_next_open:
+                return None
+            self._txc_next_open = now + 1.0
+            try:
+                f = open(self.TXC_PATH, "rb")
+                self.txc = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+                f.close()
+            except (OSError, ValueError):
+                self.txc = None
+                return None
+        try:
+            for _ in range(3):
+                magic, s1, t_ns, n, _pad = self.TXC.unpack_from(self.txc, 0)
+                if magic != b"HPFTRPT1":
+                    break
+                if s1 & 1:
+                    continue
+                ents = {}
+                for k in range(min(n, 64)):
+                    sid, _p, b = struct.unpack_from("<IIQ", self.txc, 32 + 16 * k)
+                    ents[sid] = b
+                if struct.unpack_from("<Q", self.txc, 8)[0] == s1:
+                    if now - t_ns / 1e9 > self.PART_STALE_S:
+                        # an executor that has stopped, or a file that has
+                        # been replaced under this map: open it afresh
+                        break
+                    return t_ns / 1e9, ents
+        except (ValueError, struct.error):
+            pass
+        self.txc = None
+        return None
+
+    def _parts(self, now):
+        """Each local flow set's part of its VF's class total, from the
+        bytes its executor counted since the window began. A VF with one
+        flow set of the class, or with no counts in the window, gets no
+        entry and so reports its whole total."""
+        snaps = {"rdma": self._read_txc(now)}
+        tx_t = self.shim.tx_t if self.shim is not None else 0.0
+        snaps["tcp"] = (tx_t, self.shim.tx) if tx_t and now - tx_t <= self.PART_STALE_S else None
+        for cls, snap in snaps.items():
+            if snap is None:
+                continue
+            w = self.win[cls]
+            if w is None or any(snap[1].get(k, 0) < v for k, v in w[1].items()):
+                self.win[cls] = snap          # first sample, or the counts restarted
+                continue
+            if snap[0] - w[0] < self.PART_WIN_S:
+                continue
+            by_src = {}
+            for f in self.flows:
+                d = self._fs.get(f)
+                if d is None or d[2] != cls:
+                    continue
+                by_src.setdefault(d[0], []).append((f, snap[1].get(d[3], 0) - w[1].get(d[3], 0)))
+            for members in by_src.values():
+                tot = sum(b for _, b in members)
+                for f, b in members:
+                    if len(members) > 1 and tot > 0:
+                        self.part[f] = b / tot
+                    else:
+                        self.part.pop(f, None)
+            self.win[cls] = snap
+            self.part_t[cls] = now
 
 def main():
     ap = argparse.ArgumentParser()
@@ -655,8 +797,7 @@ def main():
         """Design v4 §5, one feedback: q (periods) and the flow-set's own
         send rate (for the probe cap) in, a new R out."""
         q = rec.get("d", 0.0) / period          # seconds -> periods
-        src, cls = fsid.split(">")[0], fsid.rsplit("|", 1)[1]
-        a_s = live.rate.get("%s|%s" % (src, cls)) if live is not None else None
+        a_s = live.own_rate(fsid) if live is not None else None
         if a_s is not None:
             st.as_avg += (float(a_s) - st.as_avg) * min(1.0, (now - st.last_step) / as_avg_s) if st.as_avg > 0 else float(a_s) - st.as_avg
         # 5.3: the probe may not climb into rates the flow-set could
@@ -714,8 +855,8 @@ def main():
     # attribution does not have to wait out the ~1 s megaflow cache when a
     # sender stops. Absent/stale feed => receiver keeps its old chain.
     live = None
-    _live_ips = [ip for h, ip in ctl.get("telemetry_ip", {}).items()
-                 if h != local_host]
+    _live_ips = {h: ip for h, ip in ctl.get("telemetry_ip", {}).items()
+                 if h != local_host}
     if _live_ips:
         _vport_of_vnic = {}
         for v in reg["vnics"]:
@@ -998,6 +1139,8 @@ def main():
     sock.settimeout(period)
 
     flows = {}   # fsid -> FlowState
+    if live is not None:
+        live.flows, live.flowtag_of, live.shim = flows, flowtag_of, shim
     last_any_rx = time.monotonic()   # last telemetry from ANY flow-set
     logf = open(args.log, "a", buffering=1)
     print("tx_agent_e: local=%s T=%.0fms kappa=%.3f D=%.0f alpha=%.1e m_max=%.0f "
@@ -1166,7 +1309,7 @@ def main():
                          "seq": st.last_seq, "r": r,
                          "d": round(rec.get("d", 0.0) * 1e3, 3),
                          "q": round(st.q_prev, 3), "dq": round(st.dq, 4),
-                         "As": int(live.rate.get("%s|%s" % (fsid.split(">")[0], fsid.rsplit("|", 1)[1]), 0)) if live is not None else -1,
+                         "As": int(live.own_rate(fsid) or 0) if live is not None else -1,
                          "R": int(st.R), "pace": int(st.pace),
                          "tree": int(tree_of(fsid)), "tus": tree_us,
                          "mode": st.mode}) + "\n")
