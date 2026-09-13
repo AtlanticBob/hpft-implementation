@@ -189,7 +189,8 @@ def track_step(R, target, dt, k, floor):
 class FlowState:
     __slots__ = ("R", "last_rx", "last_step", "last_seq", "mode", "pace", "r",
                  "log_R", "log_age", "log_mode", "esc_since", "esc_log",
-                 "shim_last", "q_prev", "dq", "below", "as_avg", "enforced")
+                 "shim_last", "q_prev", "dq", "below", "as_avg", "enforced",
+                 "held_avg")
 
     def __init__(self, now):
         self.R = 0.0           # set by the first feedback (§5.4 start)
@@ -210,6 +211,7 @@ class FlowState:
         self.below = 0         # consecutive feedbacks with an empty queue
         self.enforced = False  # has the fence ever actually held this flow-set
         self.as_avg = 0.0      # own send rate, ~100 ms average (for the probe cap)
+        self.held_avg = 0.0    # part of its bytes sent at the pace, ~100 ms average
 
 
 class SenderTree:
@@ -504,6 +506,7 @@ class SenderLiveness:
         self._txc_next_open = 0.0
         self.win = {"rdma": None, "tcp": None}   # (t, {key: bytes}) a part starts from
         self.part = {}          # fsid -> its part of its VF's class total
+        self.held = {}          # fsid -> part of its bytes sent at the pace (RDMA)
         self.part_t = {"rdma": 0.0, "tcp": 0.0}
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
@@ -584,6 +587,12 @@ class SenderLiveness:
             except OSError:
                 pass
 
+    def held_fraction(self, fsid):
+        """part of the flow set's bytes its executor sent at the pace, over
+        the last window in which it sent anything; None where the executor
+        does not count it (TCP) or before the first such window"""
+        return self.held.get(fsid)
+
     def own_rate(self, fsid):
         """the flow set's own send rate, bps, or None before the first sample"""
         v = self.fs_rate.get(fsid)
@@ -626,16 +635,17 @@ class SenderLiveness:
                     break
                 if s1 & 1:
                     continue
-                ents = {}
+                ents, held = {}, {}
                 for k in range(min(n, 64)):
-                    sid, _p, b = struct.unpack_from("<IIQ", self.txc, 32 + 16 * k)
+                    sid, h32, b = struct.unpack_from("<IIQ", self.txc, 32 + 16 * k)
                     ents[sid] = b
+                    held[sid] = h32
                 if struct.unpack_from("<Q", self.txc, 8)[0] == s1:
                     if now - t_ns / 1e9 > self.PART_STALE_S:
                         # an executor that has stopped, or a file that has
                         # been replaced under this map: open it afresh
                         break
-                    return t_ns / 1e9, ents
+                    return t_ns / 1e9, ents, held
         except (ValueError, struct.error):
             pass
         self.txc = None
@@ -671,6 +681,18 @@ class SenderLiveness:
                         self.part[f] = b / tot
                     else:
                         self.part.pop(f, None)
+            if len(snap) > 2 and len(w) > 2:
+                # the executor's held bytes over the same window: only a
+                # window in which the flow set sent anything says anything
+                # about whether it was held, so an idle one leaves it be
+                for f in self.flows:
+                    d = self._fs.get(f)
+                    if d is None or d[2] != cls:
+                        continue
+                    db = snap[1].get(d[3], 0) - w[1].get(d[3], 0)
+                    if db > 0:
+                        dh = (snap[2].get(d[3], 0) - w[2].get(d[3], 0)) & 0xffffffff
+                        self.held[f] = min(1.0, dh / db)
             self.win[cls] = snap
             self.part_t[cls] = now
 
@@ -779,6 +801,14 @@ def main():
     # observation window the receiver's decisions use.
     v4_cap_mult = 2.0
     as_avg_s = float(ep.get("decision_avg_s", 0.1))
+    # 5.3's cap is there for a flow set its application keeps below the
+    # fence: its queue never appears, so the probe would never stop. A flow
+    # set whose executor sends most of its bytes AT the pace is not that
+    # flow set - it has more to send than it is let out - and capping it at
+    # twice its own average pins a bursty one (request-response, 2-6b) at
+    # the start value. held_min is the part of its bytes that must have
+    # gone out at the pace for the cap to be lifted.
+    held_min = float(ep.get("held_min", 0.5))
     # §5.4: a flow-set starts at the port's headroom h*C - the capacity the
     # receiver keeps free for transients - so a newcomer can never push the
     # port past line rate even when everyone else is at their share, and it
@@ -800,6 +830,9 @@ def main():
         a_s = live.own_rate(fsid) if live is not None else None
         if a_s is not None:
             st.as_avg += (float(a_s) - st.as_avg) * min(1.0, (now - st.last_step) / as_avg_s) if st.as_avg > 0 else float(a_s) - st.as_avg
+        hf = live.held_fraction(fsid) if live is not None else None
+        if hf is not None:
+            st.held_avg += (hf - st.held_avg) * min(1.0, (now - st.last_step) / as_avg_s)
         # 5.3: the probe may not climb into rates the flow-set could
         # never use. pace = min(R, Tree), so a fence above the local
         # tree buys nothing and only lengthens the fall when the share
@@ -812,6 +845,8 @@ def main():
         # the tree could never grow again. One delta of headroom keeps
         # the demand above the tree and the growth path open.
         cap = line if a_s is None else max(v4_cap_mult * st.as_avg, v4_start)
+        if st.held_avg >= held_min:
+            cap = line      # backlogged at its pace: not application-limited
         cap = min(cap, tree_of(fsid) * (1.0 + ep["delta_demand"]))
         if st.mode == "fresh":
             # §5.4: start at the port's headroom (bounded by the local
@@ -1310,6 +1345,7 @@ def main():
                          "d": round(rec.get("d", 0.0) * 1e3, 3),
                          "q": round(st.q_prev, 3), "dq": round(st.dq, 4),
                          "As": int(live.own_rate(fsid) or 0) if live is not None else -1,
+                         "Hd": round(st.held_avg, 3),
                          "R": int(st.R), "pace": int(st.pace),
                          "tree": int(tree_of(fsid)), "tus": tree_us,
                          "mode": st.mode}) + "\n")

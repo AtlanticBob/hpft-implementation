@@ -41,7 +41,9 @@
 
 /* Per-flow-set data bytes sent, for the sender agent's per-flow-set report
  * (tx_agent_e.py, SenderLiveness). The device answers every budget batch with
- * each set's bytes since the previous batch (0xB4C0|n, n x {id, bytes/32});
+ * each set's bytes since the previous batch (0xB4C0|n, n x {id, bytes/32}, or
+ * 0xB4C1|n, n x {id, bytes/32, held/32} where held is the part sent at the
+ * pace);
  * this keeps the running total per set id in HPFT_TXC_PATH under a seqlock
  * (seq odd while writing), stamped with CLOCK_MONOTONIC like the vport
  * meter's file. The agent only ever takes ratios of these totals. */
@@ -55,7 +57,8 @@ struct hpft_txc {
 	uint32_t pad;
 	struct {
 		uint32_t id;
-		uint32_t pad;
+		uint32_t held32;	/* running total of held bytes/32, wraps at 2^32:
+					 * the agent only ever takes differences */
 		uint64_t b32;
 	} e[HPFT_TXC_MAX];
 };
@@ -83,14 +86,15 @@ static struct hpft_txc *hpft_txc_open(void)
 static void hpft_txc_add(struct hpft_txc *p, const uint32_t *rsp, uint32_t words)
 {
 	uint32_t m = rsp[0] & 0xffffu;
+	uint32_t per = (rsp[0] & 0xffff0000u) == 0xb4c10000u ? 3u : 2u;
 	struct timespec ts;
 
-	if (words < 1 + 2 * m)
-		m = (words - 1) / 2;
+	if (words < 1 + per * m)
+		m = (words - 1) / per;
 	p->seq++;
 	__sync_synchronize();
 	for (uint32_t i = 0; i < m; i++) {
-		uint32_t id = rsp[1 + 2 * i], j;
+		uint32_t id = rsp[1 + per * i], j;
 
 		for (j = 0; j < p->n && p->e[j].id != id; j++)
 			;
@@ -99,9 +103,12 @@ static void hpft_txc_add(struct hpft_txc *p, const uint32_t *rsp, uint32_t words
 				continue;
 			p->e[j].id = id;
 			p->e[j].b32 = 0;
+			p->e[j].held32 = 0;
 			p->n++;
 		}
-		p->e[j].b32 += rsp[2 + 2 * i];
+		p->e[j].b32 += rsp[2 + per * i];
+		if (per == 3u)
+			p->e[j].held32 += rsp[3 + per * i];
 	}
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	p->t_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -360,7 +367,7 @@ int main(int argc, char **argv)
 					if (txc != NULL && result == DOCA_SUCCESS &&
 					    mb_response_size >= sizeof(uint32_t) &&
 					    doca_pcc_mailbox_get_response_buffer(resources.doca_pcc, (void **)&rsp) == DOCA_SUCCESS &&
-					    rsp != NULL && (rsp[0] & 0xffff0000u) == 0xb4c00000u)
+					    rsp != NULL && (rsp[0] & 0xfffe0000u) == 0xb4c00000u)
 						hpft_txc_add(txc, rsp, mb_response_size / sizeof(uint32_t));
 				} else if (mb_response_size >= 8 * sizeof(uint32_t)) {
 					uint32_t *rsp = NULL;

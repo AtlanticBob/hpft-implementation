@@ -489,6 +489,13 @@ typedef struct {
 	 * it, written only by the mailbox (see the 0xb47f response). */
 	volatile uint32_t tx_b32;
 	volatile uint32_t tx_rd;
+	/* the part of tx_b32 sent at the pace: data events whose bytes came
+	 * to at least 7/8 of what the pace allowed over the gap since the QP's
+	 * previous data event. A QP that has more to send than it is let out
+	 * shows up here; one that the application keeps below its pace does
+	 * not. Same single-writer/single-reader split as tx_b32/tx_rd. */
+	volatile uint32_t tx_held_b32;
+	volatile uint32_t tx_held_rd;
 } hpft_q_t;
 
 static hpft_q_t g_q[HPFT_QSLOTS];
@@ -719,6 +726,8 @@ static inline void hpft_q_init(volatile hpft_q_t *q, uint32_t now)
 	q->avg_b32_x16 = 34 * 16;
 	q->tx_b32 = 0;
 	q->tx_rd = 0;
+	q->tx_held_b32 = 0;
+	q->tx_held_rd = 0;
 }
 
 /* A slot outside the keyed window, for a record that cannot be placed by key:
@@ -1144,6 +1153,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 		doca_pcc_dev_roce_tx_cntrs_t tc = doca_pcc_dev_get_roce_tx_cntrs(event);
 		uint32_t b32 = (uint32_t)tc.sent_32bytes;
 		uint32_t pkts = (uint32_t)tc.sent_pkts;
+		uint32_t prev_data = q->data_ts;   /* before this event moves it */
 
 		g_ev_tx++;
 		q->n_tx++;
@@ -1174,8 +1184,24 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 			/* the bytes the sender agent reports per flow set; ACK-only
 			 * events (the passive end of a reverse connection) are not
 			 * this set's traffic, by the same test as data_ts */
-			if (b32 >= 32768u || (b32 << 5) >= HPFT_DATA_MIN_B * pkts)
-				q->tx_b32 += b32 < 32768u ? b32 : est;
+			if (b32 >= 32768u || (b32 << 5) >= HPFT_DATA_MIN_B * pkts) {
+				uint32_t nb = b32 < 32768u ? b32 : est;
+				uint32_t gap = (uint32_t)(now - prev_data);
+
+				q->tx_b32 += nb;
+				/* sent at the pace over the gap since the previous
+				 * data event? The first event after an idle stretch
+				 * has the idle time in its gap and so never counts;
+				 * a gap past a second is idle by any measure (and
+				 * would overflow the product). */
+				if (q->paced && gap && gap <= 1000000u) {
+					uint64_t allowed = ((uint64_t)q->paced *
+							    HPFT_LINE_B_PER_US * gap) >> 20;
+
+					if (((uint64_t)nb << 5) * 8u >= allowed * 7u)
+						q->tx_held_b32 += nb;
+				}
+			}
 		}
 		/* Probe cadence for the delay-based CCs, as the vendor template
 		 * does it: the request goes out with a data packet (TX flag
@@ -1443,8 +1469,10 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 				}
 			}
 			/* The response: per flow set, the data bytes its QPs sent
-			 * since the previous batch, in 32-byte units - word0 =
-			 * 0xB4C0|n, then n x {set id, bytes/32}. The sender agent
+			 * since the previous batch, in 32-byte units, and the part
+			 * of them sent at the pace (tx_held_b32) - word0 =
+			 * 0xB4C1|n, then n x {set id, bytes/32, held/32}; at the
+			 * 512-byte response that is 42 sets per host. The sender agent
 			 * divides each VF's fresh vport total over the VF's flow
 			 * sets in these proportions, so a VF that sends to several
 			 * receivers reports each of them its own part (platform
@@ -1452,14 +1480,14 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 			 * tx_b32 and this only ever writes tx_rd, so the two need
 			 * no arbitration; a QP listed twice is read once, and a QP
 			 * still listed under a set it has left is skipped. */
-			if (max_response_size >= 3 * sizeof(uint32_t)) {
+			if (max_response_size >= 4 * sizeof(uint32_t)) {
 				volatile uint32_t *rsp = (volatile uint32_t *)response;
-				uint32_t cap = (max_response_size / sizeof(uint32_t) - 1) / 2;
+				uint32_t cap = (max_response_size / sizeof(uint32_t) - 1) / 3;
 				uint32_t m = 0;
 
 				for (uint32_t i = 0; i < HPFT_SETS && m < cap; i++) {
 					volatile hpft_set_t *s = &g_set[i];
-					uint32_t sum = 0, k;
+					uint32_t sum = 0, held = 0, k;
 
 					if (!s->id)
 						continue;
@@ -1472,13 +1500,17 @@ doca_pcc_dev_error_t doca_pcc_dev_user_mailbox_handle(void *request,
 						cur = g_q[qi].tx_b32;
 						sum += cur - g_q[qi].tx_rd;
 						g_q[qi].tx_rd = cur;
+						cur = g_q[qi].tx_held_b32;
+						held += cur - g_q[qi].tx_held_rd;
+						g_q[qi].tx_held_rd = cur;
 					}
-					rsp[1 + 2 * m] = s->id;
-					rsp[2 + 2 * m] = sum;
+					rsp[1 + 3 * m] = s->id;
+					rsp[2 + 3 * m] = sum;
+					rsp[3 + 3 * m] = held;
 					m++;
 				}
-				rsp[0] = 0xb4c00000u | m;
-				*response_size = (1 + 2 * m) * sizeof(uint32_t);
+				rsp[0] = 0xb4c10000u | m;
+				*response_size = (1 + 3 * m) * sizeof(uint32_t);
 			}
 			return DOCA_PCC_DEV_STATUS_OK;
 		}
