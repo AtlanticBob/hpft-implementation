@@ -22,6 +22,7 @@
 #   RDMA_MTU=4096   perftest -m (4096 is the lab default and needs VF and
 #                   representor MTU >= 4200, set by lab-infra/set_mtu.sh)
 #   RP_BIN=<path>   run another PCC binary on the sender DPUs (diagnostics only; knobs are ignored)
+#   EXTRA_KNOBS="0xcce 1 26;..."  further executor mailbox lines after the standard ones
 set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd); cd "$REPO"
 NAME=${1:?name}; DUR=${2:?secs}; SPEC=${3:?spec file}
@@ -63,6 +64,14 @@ for h in $SENDERS; do
   for m in "0xccd $ALGO" "0xcce $CC_ONLY 12" "0xcce $LAW 22" "0xcd1 ${SW_TARGET:-6000} 0" "0xcd1 $SW_FS 1" "0xcd1 $SW_BETA 5" "0xcd1 $SW_MDF 6" "0xcd1 ${SW_AI:-256} 4" "0xcd1 ${SW_ALPHA:-50000} 2" "0xcd1 ${SW_BETA_NS:-5000} 3" "0xcd1 $SW_RATE_SRTT 8"; do
     ssh -n -o BatchMode=yes "$d" "timeout 5 bash -c 'echo \"$m\" > /tmp/rp_fifo'" >/dev/null 2>&1
   done
+  # EXTRA_KNOBS: further mailbox lines, semicolon-separated (e.g. "0xcce 1 26"),
+  # written after the standard ones; the next roles.sh / rp_service restart clears them
+  if [ -n "${EXTRA_KNOBS:-}" ]; then
+    IFS=';' read -r -a XK <<<"$EXTRA_KNOBS"
+    for m in "${XK[@]}"; do
+      ssh -n -o BatchMode=yes "$d" "timeout 5 bash -c 'echo \"$m\" > /tmp/rp_fifo'" >/dev/null 2>&1
+    done
+  fi
 done
 if [ "$AGENTS" != 0 ]; then
   for h in $SENDERS; do
