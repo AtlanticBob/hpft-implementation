@@ -180,6 +180,17 @@ snap_cnp() {
   for h in $RECVS; do
     on_host "$h" 'for c in np_cnp_sent np_ecn_marked_roce_packets; do printf "%s.mlx5_3.%s=%s\n" '"$h"' $c "$(cat /sys/class/infiniband/mlx5_3/ports/1/hw_counters/$c 2>/dev/null)"; done'
   done
+  # Per-VF RoCE port counters, keyed by the VF's netdev name (the mlx5_N index
+  # differs between hosts): the RDMA drop rate of a row is its sender VF's
+  # port_xmit_data against its receiver VF's port_rcv_data (both in units of
+  # 4 octets, RoCE only), and the transport counters say how the loss was
+  # recovered. Senders also give their TCP segment and retransmission totals.
+  for h in $HOSTS; do
+    on_host "$h" 'for d in /sys/class/infiniband/mlx5_*; do nd=$(ls $d/device/net 2>/dev/null | head -1); case "$nd" in dpu1vf*) ;; *) continue ;; esac
+      for c in port_xmit_data port_rcv_data port_xmit_packets port_rcv_packets; do printf "%s.%s.%s=%s\n" '"$h"' $nd $c "$(cat $d/ports/1/counters/$c 2>/dev/null)"; done
+      for c in packet_seq_err out_of_sequence local_ack_timeout_err duplicate_request; do printf "%s.%s.%s=%s\n" '"$h"' $nd $c "$(cat $d/ports/1/hw_counters/$c 2>/dev/null)"; done; done
+      nstat -az 2>/dev/null | awk -v h='"$h"' "\$1==\"TcpOutSegs\"||\$1==\"TcpRetransSegs\"{printf \"%s.nstat.%s=%s\n\", h, \$1, \$2}"'
+  done
 }
 # swp37s0 / swp4s1 are the two side-B host ports (sgpu02 / sgpu04, the
 # receivers of V8); swp21/swp25 are the two ends of the loopback cable that
