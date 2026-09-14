@@ -21,7 +21,7 @@
 # gate is an exact match per peer and traffic from a peer with no entry
 # bypasses the DHTB entirely.
 #
-# Scenario values (evaluation_plan.md): 2-2b and 2-3 -> 50 500 (a 50 G VM
+# Scenario values (evaluation_plan.md): 2-1 and 2-3 -> 50 500 (a 50 G VM
 # quota, the two classes equally weighted); 2-8b also runs 50 750.
 # lab_env.sh jakiro (re)starts the DHTB with whatever this wrote; the DHTB_CFG
 # lines in its log (one per vNIC) are the readback.
