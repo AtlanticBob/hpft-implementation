@@ -330,9 +330,17 @@ if [ -n "$RPKNOBS" ]; then
   IFS=';' read -r -a KN <<<"$RPKNOBS"
   for h in $SENDERS; do mbox "$h" "${KN[@]}"; done
 fi
-if [ "$CCONLY" = 1 ]; then
+# The TCP rate table outlives HyperFront. Switching to the plain environment
+# stops the shim but a firmware reset re-attaches the pinned EDT program, which
+# keeps reading the pinned pair table with whatever rates the last HyperFront
+# run left in it; a baseline or CC-only arm that does not empty it has those
+# pairs paced by a policy that is no longer running (2-1 Jakiro arm,
+# 2026-09-14: sgpu01/vf0 -> sgpu02/vf0 held at 24.4 Gb/s with 4.9 k
+# retransmissions against 48.4 Gb/s and 26 k on the policer arm). With the
+# table empty the EDT program lets every pair through unshaped.
+if [ "$CCONLY" = 1 ] || [ "$ARM" = baseline ]; then
   for h in $SENDERS; do
-    ssh -n -o BatchMode=yes "$(dpu_of $h)" "sudo systemctl stop hpft-txagent-e 2>/dev/null; sudo systemctl reset-failed hpft-txagent-e 2>/dev/null; true" </dev/null >/dev/null 2>&1
+    [ "$CCONLY" = 1 ] && ssh -n -o BatchMode=yes "$(dpu_of $h)" "sudo systemctl stop hpft-txagent-e 2>/dev/null; sudo systemctl reset-failed hpft-txagent-e 2>/dev/null; true" </dev/null >/dev/null 2>&1
     on_host "$h" 'B=$(ls -1 /usr/lib/linux-tools-*/bpftool 2>/dev/null | sort -V | tail -1); B=${B:-bpftool}; M=/sys/fs/bpf/hpft_tcp_edt/maps/hpft_pair_cfg; sudo $B map dump pinned $M -j 2>/dev/null | python3 -c "
 import json,sys,subprocess
 B=sys.argv[1]; M=sys.argv[2]
@@ -345,7 +353,7 @@ for e in d:
     else: continue
     subprocess.run([\"sudo\",B,\"map\",\"delete\",\"pinned\",M,\"key\",\"hex\"]+kh,capture_output=True); n+=1
 print(\"tcp rate table cleared: %d entries\"%n)
-" "$B" "$M"' 2>/dev/null | sed "s/^/  $h /"
+" "$B" "$M"' 2>/dev/null | sed "s/^/  $h /" | tee -a "$OUT/tcp_rate_table.txt"
   done
   sleep 2
 fi
