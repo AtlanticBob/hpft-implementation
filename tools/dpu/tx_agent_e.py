@@ -805,7 +805,7 @@ def main():
     # fence: its queue never appears, so the probe would never stop. A flow
     # set whose executor sends most of its bytes AT the pace is not that
     # flow set - it has more to send than it is let out - and capping it at
-    # twice its own average pins a bursty one (request-response, 2-6b) at
+    # twice its own average pins a bursty one (request-response, 2-6) at
     # the start value. held_min is the part of its bytes that must have
     # gone out at the pace for the cap to be lifted.
     held_min = float(ep.get("held_min", 0.5))
