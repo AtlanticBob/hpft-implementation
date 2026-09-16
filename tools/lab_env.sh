@@ -242,12 +242,19 @@ plain)
   jakiro_stop
   bash "$CC" dcqcn                     # stop HPFT, UPCC=0 (+fw reset if needed) + post_recover
   ensure_overlay                       # after any fw reset / vf_setup: re-assert overlay volatile state
+  # the sold 50 G is enforced at both ends. A fw reset clears the senders'
+  # devlink caps and nothing in this environment syncs them back (under HPFT
+  # the sender agent does): without this line every baseline VF sends
+  # uncapped, and on 2026-09-16 a 64-QP tenant overran the receiver's meter
+  # until its QPs exceeded their retry count.
+  bash "$REPO/tools/lab-infra/vf_caps.sh" devlink-on
   echo "== PLAIN ready =="; status ;;
 
 jakiro)
   echo "== -> JAKIRO (firmware DCQCN + DHTB at decap) =="
   bash "$CC" dcqcn                     # stop HPFT, UPCC=0
   ensure_overlay
+  bash "$REPO/tools/lab-infra/vf_caps.sh" devlink-on   # the senders' 50 G caps, as for plain
   jakiro_start
   echo "== JAKIRO ready ==  (multi-sender -> 10.1.0.2 flows need cross_pair_net.sh apply)"; status ;;
 
