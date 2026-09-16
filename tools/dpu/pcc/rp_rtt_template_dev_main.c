@@ -76,7 +76,7 @@
  * round-robin fallback hands out, and 0xdf3 reports how far it has gone. */
 #define HPFT_QHOME       (128)
 #define HPFT_SETS        (32)        /* flow sets this sender serves */
-#define HPFT_SET_QPS     (128)       /* QPs listed per flow set */
+#define HPFT_SET_QPS     (1024)      /* QPs listed per flow set */
 #define HPFT_CTX_MAGIC   (0x48505131u)  /* "HP11" in the QP's own context */
 #define HPFT_QP_STALE_US (2000000u)  /* a QP silent this long leaves its set */
 #define HPFT_QP_GONE_US  (8000000u)  /* and this long: its record may be reused */
@@ -496,6 +496,12 @@ typedef struct {
 	 * not. Same single-writer/single-reader split as tx_b32/tx_rd. */
 	volatile uint32_t tx_held_b32;
 	volatile uint32_t tx_held_rd;
+	/* where this QP last found itself in its set's member list. Only a
+	 * hint: the once-a-millisecond membership check looks there first and
+	 * scans the list only when the entry is no longer this QP, so a set of
+	 * N QPs costs N words a millisecond instead of N x N. Written only by
+	 * this QP's own event path. */
+	volatile uint32_t kidx;
 } hpft_q_t;
 
 static hpft_q_t g_q[HPFT_QSLOTS];
@@ -997,7 +1003,9 @@ static inline uint32_t hpft_pool_ceiling(volatile hpft_set_t *s)
 	return (uint32_t)c;
 }
 
-static inline void hpft_set_add(volatile hpft_set_t *s, uint32_t slot)
+/* Make slot a member of s; returns its position in the list, or HPFT_SET_QPS
+ * when the list is full. */
+static inline uint32_t hpft_set_add(volatile hpft_set_t *s, uint32_t slot)
 {
 	uint32_t n = s->nq, free_k = HPFT_SET_QPS;
 
@@ -1005,22 +1013,25 @@ static inline void hpft_set_add(volatile hpft_set_t *s, uint32_t slot)
 		n = HPFT_SET_QPS;
 	for (uint32_t k = 0; k < n; k++) {
 		if (s->qslot[k] == slot)
-			return;                /* already a member */
+			return k;              /* already a member */
 		if (free_k == HPFT_SET_QPS && s->qslot[k] == HPFT_SET_EMPTY)
 			free_k = k;
 	}
 	if (free_k < HPFT_SET_QPS) {
 		s->qslot[free_k] = slot;
-		return;
+		return free_k;
 	}
 	if (n < HPFT_SET_QPS) {
 		s->qslot[n] = slot;
 		s->nq = n + 1;             /* a lost race is repaired next epoch */
+		return n;
 	}
+	return HPFT_SET_QPS;
 }
-/* Re-assert this QP's membership of its flow set. Cheap (a scan of at most
- * HPFT_SET_QPS words once per millisecond) and it is what makes a lost
- * append harmless. */
+/* Re-assert this QP's membership of its flow set, once per millisecond; it is
+ * what makes a lost append harmless. The QP first looks at the position it
+ * last had (q->kidx) and scans the list only if that entry is no longer it,
+ * so the check stays one word per QP however large the set grows. */
 static inline void hpft_q_reassert(volatile hpft_q_t *q, uint32_t slot)
 {
 	int si = (int)q->set - 1;
@@ -1045,7 +1056,13 @@ static inline void hpft_q_reassert(volatile hpft_q_t *q, uint32_t slot)
 			g_unbind_map++;
 			return;
 		}
-		hpft_set_add(&g_set[si], slot);
+		/* still listed where it was last time: nothing to do. The bound
+		 * against nq matters - a set whose list was reset keeps stale
+		 * words past its new end. */
+		if (q->kidx < g_set[si].nq && q->kidx < HPFT_SET_QPS &&
+		    g_set[si].qslot[q->kidx] == slot)
+			return;
+		q->kidx = hpft_set_add(&g_set[si], slot);
 	}
 }
 
@@ -1247,7 +1264,7 @@ void doca_pcc_dev_user_algo(doca_pcc_dev_algo_ctxt_t *algo_ctxt,
 
 			if (si >= 0) {
 				q->set = (uint32_t)si + 1u;
-				hpft_set_add(&g_set[si], slot);
+				q->kidx = hpft_set_add(&g_set[si], slot);
 				g_q_bound++;
 			}
 		}
