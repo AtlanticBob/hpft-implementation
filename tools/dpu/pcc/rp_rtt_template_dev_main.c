@@ -69,12 +69,16 @@
 /* a QP silent longer than this contributes nothing to its own rate account */
 #define HPFT_PACC_MAX_US   (100000u)
 #define HPFT_EPOCH_US    (1000u)     /* per-QP and per-set housekeeping tick */
-#define HPFT_QSLOTS      (1024)      /* per-QP records */
-/* Keyed records are placed in the first HPFT_QHOME of them. A sender holds
- * tens of QPs against 128 slots, so the table stays sparse and the whole
- * live set can be read back one slot at a time; the rest of g_q is what the
- * round-robin fallback hands out, and 0xdf3 reports how far it has gone. */
-#define HPFT_QHOME       (128)
+#define HPFT_QSLOTS      (8192)      /* per-QP records */
+/* Keyed records are placed in the first HPFT_QHOME of them. The largest
+ * scenario puts 1536 QPs on one sender (evaluation 2-7b, 4096 QPs over
+ * three senders) against 4096 keyed slots, so the table stays under 40 %
+ * full and eight probes find a place; the rest of g_q is what the
+ * round-robin fallback hands out, and 0xdf3 reports how far it has gone.
+ * The receiver's DPU also sees the passive ends of every connection, which
+ * can overflow into the fallback - those records carry ACKs only. */
+#define HPFT_QHOME_BITS  (12)
+#define HPFT_QHOME       (1u << HPFT_QHOME_BITS)
 #define HPFT_SETS        (32)        /* flow sets this sender serves */
 #define HPFT_SET_QPS     (1024)      /* QPs listed per flow set */
 #define HPFT_CTX_MAGIC   (0x48505131u)  /* "HP11" in the QP's own context */
@@ -528,9 +532,9 @@ static inline uint32_t hpft_q_home(uint32_t key)
 	/* the TOP bits of the multiplication, not the low ones: HPFT_QHOME is
 	 * a power of two, so a modulo would keep the low bits, and those
 	 * depend only on the low bits of the key. Keys differing above the
-	 * seventh bit would then all share one home slot - (vhca 26, qpn
+	 * table's width would then all share one home slot - (vhca 26, qpn
 	 * 0x162), (27, 0x262) and (25, 0x1e2) all landed on slot 5. */
-	return ((key + 1u) * 2246822519u) >> 25;
+	return ((key + 1u) * 2246822519u) >> (32 - HPFT_QHOME_BITS);
 }
 
 /* ========================= per-flow-set ========================= */
@@ -559,14 +563,18 @@ static hpft_set_t g_set[HPFT_SETS];
  * the agent learns each VF's vhca_id from the DPU with vhca_of. An agent
  * that has no such table sends the bare qpn as the key, and the lookup
  * falls back to that. */
-#define HPFT_MAP_SIZE (2048)
+/* Sized for the largest sender (1536 QPs) with room for the bindings of
+ * earlier runs, which are never removed: a binding lives until the executor
+ * restarts, and a put that finds eight probes taken is dropped. */
+#define HPFT_MAP_BITS (14)
+#define HPFT_MAP_SIZE (1u << HPFT_MAP_BITS)
 static volatile uint32_t g_map_qpn[HPFT_MAP_SIZE];
 static volatile uint32_t g_map_set[HPFT_MAP_SIZE];
 
 static inline uint32_t hpft_map_hash(uint32_t key)
 {
 	/* top bits, for the reason in hpft_q_home */
-	return ((key + 1u) * 2654435761u) >> 21;
+	return ((key + 1u) * 2654435761u) >> (32 - HPFT_MAP_BITS);
 }
 
 static inline uint32_t hpft_bind_key(uint32_t vhca, uint32_t qpn)

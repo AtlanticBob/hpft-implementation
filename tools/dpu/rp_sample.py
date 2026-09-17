@@ -37,7 +37,7 @@ line = float(sys.argv[4]) if len(sys.argv) > 4 else 200.0
 # so a dump after the load would show everything unbound and say nothing.
 load_end = float(sys.argv[5]) if len(sys.argv) > 5 else dur
 NSLOT = 32
-QHOME = 128            # the executor's keyed window of the record table
+QHOME = 4096           # the executor's keyed window of the record table
 DUMP_PER_PASS = 8      # record slots read per sampling pass (about 0.13 s)
 RSP = re.compile(r"HPFT_RSP ft=0x([0-9a-f]+) bud=(\d+) lvl=(\d+) avg16=(\d+) r=(\d+) s16=(\d+) ep=(\d+)")
 
