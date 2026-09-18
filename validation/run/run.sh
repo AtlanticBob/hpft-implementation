@@ -60,7 +60,7 @@ on_host() { if [ "$1" = "$(hostname)" ]; then shift; bash -c "$*"; else h=$1; sh
 # to fill a permitted rate sitting at its 2 G floor, so the cap (twice the flow's own
 # use) never lifted and the permitted rate stayed on the floor for a whole phase -
 # measured r23, 0.26 G delivered of a 10 G demand.
-rl_size() { case "$1" in rate_limit=*) echo "-s 8192" ;; esac; }
+rl_size() { case "$1" in rate_limit=*|rate_limit_sw=*) echo "-s 8192" ;; esac; }
 
 # ---- the flow table -------------------------------------------------------
 ROWS=$(grep -vE '^\s*(#|$)' "$FLOWS")
@@ -525,6 +525,14 @@ while read -r sh sv dh dv cls n st en opt; do
     # the flow's OWN use) and the permitted rate stayed there for the whole phase -
     # measured r23, the phase delivered 0.26 G of a 10 G demand.
     rate_limit=*) extra="--rate_limit=${opt#rate_limit=}" ;;
+    # rate_limit_sw=<Gbps>: the same, but through perftest's SOFTWARE limiter.
+    # Two reasons to ask for it by name. The hardware limiter only takes the
+    # rates the NIC has steps for - 2.5, 5, 10, 14, 20 ... - and refuses to
+    # start at anything else, which is how E1.6's 2 Gb/s flow first failed. And
+    # a hardware limit is a rate written on the QP, which is the thing the PCC
+    # executor owns; an application that simply does not offer more is what
+    # these scenarios mean, and that is what the software limiter does.
+    rate_limit_sw=*) extra="--rate_limit=${opt#rate_limit_sw=} --rate_limit_type=SW" ;;
     tcp_cc=*)     extra="-C ${opt#tcp_cc=}" ;;
     # bitrate=<rate>: an application-limited TCP flow (E1.6), the TCP twin of
     # rate_limit= above. iperf3's -b is PER STREAM, so a row that carries it
