@@ -80,7 +80,9 @@ meter_on() { # $1 host $2 dpu
       sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"udp,nw_dst=\$ip,tp_dst=4791\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"tcp,nw_dst=\$ip\" 2>/dev/null
       sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"ip,nw_dst=\$ip\" 2>/dev/null
-      sudo ovs-ofctl -O OpenFlow13 del-meter $BR \"meter=\$((11+i))\" 2>/dev/null
+      # 21+i and 31+i exist only while a VF is policed per class (class-split);
+      # putting the single-meter form back removes them
+      for m in \$((11+i)) \$((21+i)) \$((31+i)); do sudo ovs-ofctl -O OpenFlow13 del-meter $BR \"meter=\$m\" 2>/dev/null; done
       sudo ovs-ofctl -O OpenFlow13 add-meter $BR \"meter=\$((11+i)),kbps,band=type=drop,rate=\$kbps\"
       sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=122,udp,nw_dst=\$ip,tp_dst=4791,actions=meter:\$((11+i)),output:\$rep\"
       sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=121,tcp,nw_dst=\$ip,actions=meter:\$((11+i)),output:\$rep\"
