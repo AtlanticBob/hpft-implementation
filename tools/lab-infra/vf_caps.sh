@@ -44,6 +44,9 @@
 #   vf_caps.sh meter-off   meters only (REMOVES FORWARDING TOO - see meter_bypass)
 #   BYPASS_HOST=<host> BYPASS_VF="<n> [<n> ...]" vf_caps.sh meter-bypass
 #                          that one VF keeps its forwarding and loses its policer
+#   CLASS_HOST=<host> CLASS_VF=<n> CLASS_RDMA_KBPS=<r> CLASS_TCP_KBPS=<t>
+#     vf_caps.sh class-split   that one VF policed per class instead of as a
+#                          whole (E4.2's Static split arm); meter-on undoes it
 #   vf_caps.sh devlink-on  devlink only
 #   vf_caps.sh devlink-off devlink only
 #   vf_caps.sh status      what every DPU is enforcing right now
@@ -118,13 +121,41 @@ $rows
 EOF
 "
 }
+# One VF policed PER CLASS instead of as a whole: RoCE through its own drop
+# meter, TCP through a second one, and anything else still through the VF's own.
+# This is the Static split arm of evaluation E4.2 - the operator who divides a
+# VM's bandwidth between its two kinds of traffic ahead of time and lets neither
+# borrow from the other. The rules stay the same three, so the receiver agent
+# still sees the class in the megaflow key (see the note above); only the meter
+# each one points at changes. `meter-on` puts the single-meter form back.
+# Meter ids: 21+i for RoCE, 31+i for TCP, the VF's own 11+i for the rest.
+meter_class() { # $1 host  $2 dpu  $3 vf index  $4 RoCE kbps  $5 TCP kbps
+  local rows; rows=$(vf_rows "$1")
+  ssh -o BatchMode=yes "$2" "while read -r i ip kbps rep; do
+      [ \"\$i\" = \"$3\" ] || continue
+      sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"udp,nw_dst=\$ip,tp_dst=4791\" 2>/dev/null
+      sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"tcp,nw_dst=\$ip\" 2>/dev/null
+      sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"ip,nw_dst=\$ip\" 2>/dev/null
+      for m in \$((11+i)) \$((21+i)) \$((31+i)); do sudo ovs-ofctl -O OpenFlow13 del-meter $BR \"meter=\$m\" 2>/dev/null; done
+      sudo ovs-ofctl -O OpenFlow13 add-meter $BR \"meter=\$((11+i)),kbps,band=type=drop,rate=\$kbps\"
+      sudo ovs-ofctl -O OpenFlow13 add-meter $BR \"meter=\$((21+i)),kbps,band=type=drop,rate=$4\"
+      sudo ovs-ofctl -O OpenFlow13 add-meter $BR \"meter=\$((31+i)),kbps,band=type=drop,rate=$5\"
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=122,udp,nw_dst=\$ip,tp_dst=4791,actions=meter:\$((21+i)),output:\$rep\"
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=121,tcp,nw_dst=\$ip,actions=meter:\$((31+i)),output:\$rep\"
+      sudo ovs-ofctl -O OpenFlow13 add-flow $BR \"priority=120,ip,nw_dst=\$ip,actions=meter:\$((11+i)),output:\$rep\"
+      echo \"  $1 ($2): vf\$i RoCE $4 kbps, TCP $5 kbps, other \$kbps kbps\"
+    done <<'EOF'
+$rows
+EOF
+"
+}
 meter_off() {
   ssh -o BatchMode=yes "$2" "for i in 0 1 2 3 4 5 6 7; do
       sudo ovs-ofctl -O OpenFlow13 dump-flows $BR 2>/dev/null | grep -o 'nw_dst=[0-9.]* actions=meter:'\$((11+i)) | cut -d' ' -f1 | sort -u | while read -r m; do
         sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"udp,\$m,tp_dst=4791\" 2>/dev/null
         sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"tcp,\$m\" 2>/dev/null
         sudo ovs-ofctl -O OpenFlow13 del-flows $BR \"ip,\$m\"; done
-      sudo ovs-ofctl -O OpenFlow13 del-meter $BR \"meter=\$((11+i))\" 2>/dev/null
+      for m in \$((11+i)) \$((21+i)) \$((31+i)); do sudo ovs-ofctl -O OpenFlow13 del-meter $BR \"meter=\$m\" 2>/dev/null; done
     done; echo '  $1 ($2): meters removed'"
 }
 devlink_on()  { ssh -o BatchMode=yes "$2" "sudo python3 /opt/hpft/hw_maxrate.py --sync --local-host $1"  | sed "s/^/  $1: /"; }
@@ -132,9 +163,9 @@ devlink_off() { ssh -o BatchMode=yes "$2" "sudo python3 /opt/hpft/hw_maxrate.py 
 status() {
   ssh -o BatchMode=yes "$2" "echo '== $1 ($2)'
     sudo python3 /opt/hpft/hw_maxrate.py --show --local-host $1
-    sudo ovs-ofctl -O OpenFlow13 dump-meters $BR 2>/dev/null | grep -oE 'meter=1[1-8] kbps .*rate=[0-9]+' | sed 's/^/  /'
+    sudo ovs-ofctl -O OpenFlow13 dump-meters $BR 2>/dev/null | grep -oE 'meter=[123][1-8] kbps .*rate=[0-9]+' | sed 's/^/  /'
     sudo ovs-ofctl -O OpenFlow13 dump-flows $BR 2>/dev/null | grep -oE 'n_packets=[0-9]+, n_bytes=[0-9]+.*nw_dst=[0-9.]+ actions=meter:[0-9]+' | sed 's/^/  /'
-    sudo ovs-ofctl -O OpenFlow13 meter-stats $BR 2>/dev/null | grep -E 'meter:1[1-8]|byte_band_count' | paste - - | sed 's/^/  /'"
+    sudo ovs-ofctl -O OpenFlow13 meter-stats $BR 2>/dev/null | grep -E 'meter:[123][1-8]|byte_band_count' | paste - - | sed 's/^/  /'"
 }
 
 cmd=${1:-status}
@@ -146,10 +177,13 @@ for n in "${NODES[@]}"; do
     meter-on)    meter_on "$1" "$2" ;;
     meter-off)   meter_off "$1" "$2" ;;
     meter-bypass) [ "$1" = "${BYPASS_HOST:-}" ] && meter_bypass "$1" "$2" "${BYPASS_VF:-0}" ;;
+    class-split) [ "$1" = "${CLASS_HOST:-}" ] && meter_class "$1" "$2" "${CLASS_VF:?CLASS_VF}" \
+                   "${CLASS_RDMA_KBPS:?CLASS_RDMA_KBPS}" "${CLASS_TCP_KBPS:?CLASS_TCP_KBPS}" ;;
     devlink-on)  devlink_on "$1" "$2" ;;
     devlink-off) devlink_off "$1" "$2" ;;
     status)      status "$1" "$2" ;;
     *) echo "usage: vf_caps.sh sync|clear|meter-on|meter-off|devlink-on|devlink-off|status"
-       echo "       BYPASS_HOST=<host> BYPASS_VF=\"<n> ...\" vf_caps.sh meter-bypass   (those VFs forward with no policer)"; exit 2 ;;
+       echo "       BYPASS_HOST=<host> BYPASS_VF=\"<n> ...\" vf_caps.sh meter-bypass   (those VFs forward with no policer)"
+       echo "       CLASS_HOST=<host> CLASS_VF=<n> CLASS_RDMA_KBPS=<r> CLASS_TCP_KBPS=<t> vf_caps.sh class-split"; exit 2 ;;
   esac
 done

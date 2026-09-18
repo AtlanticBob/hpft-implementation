@@ -229,6 +229,19 @@ if echo "$ROWS" | awk '{print $5}' | grep -q '^kv$'; then
     on_host "$h" "[ /tmp/kvfetch -nt $REPO/tools/host/kvfetch.c ] || gcc -O2 -pthread -o /tmp/kvfetch $REPO/tools/host/kvfetch.c -libverbs" || { echo "ABORT: kvfetch does not build on $h"; exit 1; }
   done
 fi
+# http rows (evaluation E4.1): nginx serves a large object out of tmpfs on the
+# SOURCE host and wrk asks for it from the DESTINATION host, so the bytes still
+# travel source -> destination like every other class. The server therefore sits
+# on the sender and the load generator on the receiver, the opposite way round
+# from iperf3 and perftest.
+if echo "$ROWS" | awk '{print $5}' | grep -q '^http$'; then
+  for h in $(echo "$ROWS" | awk '$5=="http"{print $1}' | sort -u); do
+    on_host "$h" "command -v nginx >/dev/null" || { echo "ABORT: $h has no nginx (http rows)"; exit 1; }
+  done
+  for h in $(echo "$ROWS" | awk '$5=="http"{print $3}' | sort -u); do
+    on_host "$h" "command -v wrk >/dev/null" || { echo "ABORT: $h has no wrk (http rows)"; exit 1; }
+  done
+fi
 if echo "$ROWS" | awk '{print $5}' | grep -q '^udp$'; then
   for h in $RECVS $(echo "$ROWS" | awk '$5=="udp"{print $1}' | sort -u); do
     on_host "$h" "[ -x /tmp/udp_blast ] || gcc -O2 -pthread -o /tmp/udp_blast $REPO/tools/host/udp_blast.c" || { echo "ABORT: udp_blast missing on $h"; exit 1; }
@@ -414,8 +427,9 @@ if [ -z "${HPFT_NO_RP_SAMPLE:-}" ] && [ "$ARM" = hpft ]; then
     ssh -n -o BatchMode=yes "$d" "sudo rm -f /tmp/rp_sample.jsonl /tmp/rp_sample.err; setsid nohup python3 /tmp/rp_sample.py $SAMP /tmp/rp_sample.jsonl 1 200 $((END+WARM)) >/tmp/rp_sample.err 2>&1 </dev/null &" </dev/null
   done
 fi
-# listeners, on each row's destination host
-declare -A SRV
+# listeners, on each row's destination host - except an http row, whose server
+# belongs on its source host (SRVS)
+declare -A SRV SRVS
 k=0
 while read -r sh sv dh dv cls n st en opt; do
   case "$cls" in meter|core) k=$((k+1)); continue ;; esac
@@ -426,13 +440,30 @@ while read -r sh sv dh dv cls n st en opt; do
     SRV[$dh]+="setsid nohup /tmp/udp_blast -r -p $((5900+k)) -B $(ip_of $dh $dv) >/tmp/val_s$k.log 2>&1 </dev/null & "
   elif [ "$cls" = kv ]; then
     SRV[$dh]+="setsid nohup /tmp/kvfetch -s -d $(dev_of $dh $dv) -p $((29000+k)) -b 2 >/tmp/val_s$k.log 2>&1 </dev/null & "
+  elif [ "$cls" = http ]; then
+    # options, comma separated: obj=<MB> (the object wrk asks for, default 16),
+    # workers=<n> (nginx worker processes, default 4)
+    hmb=16; hw=4
+    for hv in ${opt//,/ }; do case "$hv" in obj=*) hmb=${hv#obj=} ;; workers=*) hw=${hv#workers=} ;; esac; done
+    SRVS[$sh]+="bash $REPO/tools/host/http_server.sh start $(ip_of $sh $sv) $((8000+k)) $hmb $hw >/tmp/val_s$k.log 2>&1; "
   else
     SRV[$dh]+="setsid nohup iperf3 -s -p $((5600+k)) >/tmp/val_s$k.log 2>&1 </dev/null & "
   fi
   k=$((k+1))
 done <<<"$ROWS"
-for h in $RECVS; do on_host "$h" "${SRV[$h]} true"; done
+for h in $RECVS; do on_host "$h" "${SRV[$h]:-} true"; done
+for h in $SENDERS; do if [ -n "${SRVS[$h]:-}" ]; then on_host "$h" "${SRVS[$h]} true"; fi; done
 sleep 2
+# an http row whose nginx did not come up would otherwise look like a tenant
+# that simply asked for nothing
+k=0
+while read -r sh sv dh dv cls n st en opt; do
+  if [ "$cls" = http ]; then
+    on_host "$sh" "ss -ltn 'sport = :$((8000+k))' | grep -q ':$((8000+k))'" \
+      || { echo "ABORT: $sh is not serving http on port $((8000+k))"; on_host "$sh" "cat /tmp/val_s$k.log" 2>/dev/null; exit 1; }
+  fi
+  k=$((k+1))
+done <<<"$ROWS"
 # Every listener must really be listening. A sink that failed to bind is
 # invisible otherwise: the run completes, the flow reports a rate, and only
 # the arithmetic of the expected values gives it away.
@@ -448,7 +479,7 @@ for h in $RECVS; do
   scp -q "$REPO/tools/dpu/vpm_sample.py" "$d:/tmp/vpm_sample.py"
   timeout 15 ssh -n -o BatchMode=yes "$d" "rm -f /tmp/vpm_series.csv; nohup python3 /tmp/vpm_sample.py $((END+WARM+40)) /tmp/vpm_series.csv 100 </dev/null >/dev/null 2>&1 & true" || echo "WARN: vpm sampler did not start on $d"
 done
-declare -A CLI
+declare -A CLI CLID
 # kv groups (option group=<name>): members wait for each other at the end of
 # every iteration; the group's first row leads, on its sender's management name
 declare -A KV_GLEAD KV_GHOST KV_GN
@@ -495,6 +526,11 @@ while read -r sh sv dh dv cls n st en opt; do
     # measured r23, the phase delivered 0.26 G of a 10 G demand.
     rate_limit=*) extra="--rate_limit=${opt#rate_limit=}" ;;
     tcp_cc=*)     extra="-C ${opt#tcp_cc=}" ;;
+    # bitrate=<rate>: an application-limited TCP flow (E1.6), the TCP twin of
+    # rate_limit= above. iperf3's -b is PER STREAM, so a row that carries it
+    # should be a single stream (-P 1); a row of ten streams with -b 2G would
+    # offer 20 G, not 2 G.
+    bitrate=*)    extra="-b ${opt#bitrate=}" ;;
     # bytes=<n>: a transfer that ends when its bytes are through (a 140 GiB
     # weight download, evaluation 2-8a/b), not when the row's end comes; the
     # row's end is then only the latest it may run
@@ -522,6 +558,19 @@ while read -r sh sv dh dv cls n st en opt; do
     fi
   elif [ "$cls" = udp ]; then
     cmd="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-time.time()))\"; /tmp/udp_blast -c $dip -p $((5900+k)) -B $sip -G $extra -t $dur' >/tmp/val_c$k.log 2>&1 </dev/null & "
+  elif [ "$cls" = http ]; then
+    # wrk runs on the DESTINATION host and pulls the object, so this row's
+    # client log comes back from there. wrk has no scheduled start of its own,
+    # so it sleeps to the row's start time and opens its connections then;
+    # unlike iperf3 there is no control connection to keep alive beforehand, and
+    # therefore no idle connection for the receiver to count as a live flow-set.
+    # Options, comma separated: obj=<MB> (default 16, the same object the server
+    # was told to create), threads=<n> (default min(connections, 8)).
+    hmb=16; hth=""
+    for hv in ${opt//,/ }; do case "$hv" in obj=*) hmb=${hv#obj=} ;; threads=*) hth=${hv#threads=} ;; esac; done
+    [ -n "$hth" ] || hth=$(( n < 8 ? n : 8 ))
+    CLID[$dh]+="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-time.time()))\"; wrk -t$hth -c$n -d${dur}s --latency --timeout 60s http://$sip:$((8000+k))/obj${hmb}m.bin' >/tmp/val_c$k.log 2>&1 </dev/null & "
+    k=$((k+1)); continue
   elif [ "$cls" = kv ]; then
     # A kv row is an application, not a bulk load: it starts on the
     # experiment clock (T0 + warm-up + start), never during the warm-up, and
@@ -565,7 +614,8 @@ while read -r sh sv dh dv cls n st en opt; do
   CLI[$sh]+="$cmd"
   k=$((k+1))
 done <<<"$ROWS"
-for h in $SENDERS; do on_host "$h" "${CLI[$h]} true"; done
+for h in $SENDERS; do on_host "$h" "${CLI[$h]:-} true"; done
+for h in $RECVS; do if [ -n "${CLID[$h]:-}" ]; then on_host "$h" "${CLID[$h]} true"; fi; done
 LAUNCHED=$(date +%s); echo "$LAUNCHED" > "$OUT/launched.txt"
 [ "$LAUNCHED" -lt "$T0" ] || echo "WARNING: launched $((LAUNCHED-T0)) s AFTER T0 - the t=0 rows started late"
 sleep $((T0 - LAUNCHED + WARM + END + 6))
@@ -586,7 +636,9 @@ for h in $SENDERS; do scp -q "$(dpu_of $h):/tmp/hpft_txagent_e.jsonl" "$OUT/tx_$
 k=0
 while read -r sh sv dh dv cls n st en opt; do
   case "$cls" in meter|core) k=$((k+1)); continue ;; esac
-  if [ "$sh" = "$(hostname)" ]; then cp /tmp/val_c$k.log "$OUT/flow${k}_${sh}vf${sv}_to_${dh}vf${dv}_${cls}.log"; else scp -q "$sh:/tmp/val_c$k.log" "$OUT/flow${k}_${sh}vf${sv}_to_${dh}vf${dv}_${cls}.log"; fi
+  clih=$sh; [ "$cls" = http ] && clih=$dh     # wrk ran on the destination
+  if [ "$clih" = "$(hostname)" ]; then cp /tmp/val_c$k.log "$OUT/flow${k}_${sh}vf${sv}_to_${dh}vf${dv}_${cls}.log"; else scp -q "$clih:/tmp/val_c$k.log" "$OUT/flow${k}_${sh}vf${sv}_to_${dh}vf${dv}_${cls}.log"; fi
+  if [ "$cls" = http ]; then on_host "$sh" "bash $REPO/tools/host/http_server.sh stop $((8000+k))" >/dev/null 2>&1 || true; fi
   if [ "$cls" = kv ]; then
     if [ "$sh" = "$(hostname)" ]; then cp /tmp/val_kv$k.csv "$OUT/kv_flow${k}_${sh}vf${sv}_to_${dh}vf${dv}.csv" 2>/dev/null; else scp -q "$sh:/tmp/val_kv$k.csv" "$OUT/kv_flow${k}_${sh}vf${sv}_to_${dh}vf${dv}.csv" 2>/dev/null; fi || echo "WARN: no per-request log for kv flow $k"
   fi
@@ -597,7 +649,7 @@ while read -r sh sv dh dv cls n st en opt; do
 done <<<"$ROWS"
 sleep 8
 for h in $RECVS; do scp -q "$(dpu_of $h):/tmp/vpm_series.csv" "$OUT/vpm_series_$h.csv"; done
-for h in $HOSTS; do on_host "$h" 'pkill -f "ib_write_b[w]" 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x udp_blast 2>/dev/null; pkill -x kvfetch 2>/dev/null; true'; done
+for h in $HOSTS; do on_host "$h" 'pkill -f "ib_write_b[w]" 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x udp_blast 2>/dev/null; pkill -x kvfetch 2>/dev/null; pkill -x wrk 2>/dev/null; pkill -f "hpft_ng[x]" 2>/dev/null; true'; done
 # 9>&-: this child must NOT inherit the run lock. Without it the lock
 # stays held for 40 s after run.sh exits and the next run aborts.
 ( sleep 40; snap_switch > "$OUT/switch_post.txt" ) 9>&- &
