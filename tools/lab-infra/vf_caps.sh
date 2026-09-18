@@ -178,9 +178,12 @@ for n in "${NODES[@]}"; do
     clear)       devlink_off "$1" "$2"; meter_off "$1" "$2" ;;
     meter-on)    meter_on "$1" "$2" ;;
     meter-off)   meter_off "$1" "$2" ;;
-    meter-bypass) [ "$1" = "${BYPASS_HOST:-}" ] && meter_bypass "$1" "$2" "${BYPASS_VF:-0}" ;;
-    class-split) [ "$1" = "${CLASS_HOST:-}" ] && meter_class "$1" "$2" "${CLASS_VF:?CLASS_VF}" \
-                   "${CLASS_RDMA_KBPS:?CLASS_RDMA_KBPS}" "${CLASS_TCP_KBPS:?CLASS_TCP_KBPS}" ;;
+    # if/then, not `[ ... ] && ...`: the node loop runs over all four nodes and
+    # the test fails for three of them, which would make this script exit 1 and
+    # abort whatever runner called it under set -e.
+    meter-bypass) if [ "$1" = "${BYPASS_HOST:-}" ]; then meter_bypass "$1" "$2" "${BYPASS_VF:-0}"; fi ;;
+    class-split)  if [ "$1" = "${CLASS_HOST:-}" ]; then meter_class "$1" "$2" "${CLASS_VF:?CLASS_VF}" \
+                    "${CLASS_RDMA_KBPS:?CLASS_RDMA_KBPS}" "${CLASS_TCP_KBPS:?CLASS_TCP_KBPS}"; fi ;;
     devlink-on)  devlink_on "$1" "$2" ;;
     devlink-off) devlink_off "$1" "$2" ;;
     status)      status "$1" "$2" ;;
