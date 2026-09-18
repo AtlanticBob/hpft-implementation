@@ -25,6 +25,15 @@ for d in $(ls /sys/class/net | grep -E '^dpu1vf[0-9]+$'); do
     tc qdisc show dev "$d" | grep -q "^qdisc fq [0-9a-f]*: root" \
         || sudo tc qdisc replace dev "$d" root fq
     sudo tc qdisc add dev "$d" clsact 2>/dev/null
+    # Every flow set is paced here, so a connection's window is what the pacing
+    # made it, not what the path can carry. With the kernel's default, a
+    # connection idle for longer than one RTO also has its window reset, and the
+    # windows of a set's connections then come back unequal - the pool splits by
+    # window, so the inequality sticks and the set sits below its share for
+    # seconds (measured 2026-09-18 on evaluation E2.2, where the load generator
+    # connects three seconds before it starts sending: 8.0-10.8 Gb/s against a
+    # share of 11.75 in one run of three, and never again with this off).
+    sudo sysctl -qw net.ipv4.tcp_slow_start_after_idle=0
     # Compare the attached program's ID against the CURRENTLY PINNED one,
     # not just "is something called hpft_tcp_edt attached". A reload leaves
     # the previous program alive as long as a filter still references it,
