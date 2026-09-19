@@ -178,11 +178,14 @@ def pack_rate_cfg(rate_bps: int, generation: int, burst_bytes: int, flags: int =
 def pack_pair_state(next_ns: int = 0, generation: int = 0) -> bytes:
     """struct hpft_pair_state (lock-free proportional pool, 2026-09-10):
     epoch_ns, tok_ns, sum_cur, sum_prev, tok (signed), generation, epoch,
-    n_cur, n_prev, shots, nosock, pad0, tx_bytes - 80 bytes. Every field
-    means "nothing seen yet" at zero; the clocks live per connection, so
-    next_ns is accepted for the old callers and ignored."""
+    n_cur, n_prev, shots, nosock, pad0, tx_bytes, then the live-window count
+    (live_cur, live_prev, live_win, pad1) - 96 bytes. The live fields are
+    appended AFTER tx_bytes so that the shim's offset to it does not move.
+    Every field means "nothing seen yet" at zero; the clocks live per
+    connection, so next_ns is accepted for the old callers and ignored."""
     del next_ns
-    return struct.pack("<QQQQqQIIIIIIQ", 0, 0, 0, 0, 0, generation, 0, 0, 0, 0, 0, 0, 0)
+    return struct.pack("<QQQQqQIIIIIIQIIII",
+                       0, 0, 0, 0, 0, generation, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 
 def normalize_positive_int(value: Any, field: str) -> int:

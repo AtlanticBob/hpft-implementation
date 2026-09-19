@@ -73,6 +73,23 @@
  * bound: a refill that arrives once per epoch against a pool a quarter of
  * an epoch deep would pin the pool at its floor for most of every epoch. */
 #define HPFT_EPOCH_NS 1000000ULL
+/* How far from an equal share one connection's share may be taken by the
+ * proportional law, either way. All connections of a flow set share one path,
+ * so a bulk connection has no reason to differ from its neighbours by more
+ * than this; what is wider than the band comes from a window our own shaping
+ * froze. See the long note where it is applied. */
+#define HPFT_SHARE_BAND 2ULL
+/* How long a connection counts as live for the purpose of that band. The
+ * epoch's own count is of the connections that sent in the last millisecond,
+ * which is far fewer than the connections a flow set has when they are
+ * request/response: one that is waiting for its next request sends nothing for
+ * a round trip. Dividing by that count makes an equal share look bigger than
+ * it is and the floor built from it too high - measured 2026-09-18, four HTTP
+ * flow sets of 256 connections each overran their permitted rate by 35%. This
+ * window is long enough to see every connection that is doing anything at all,
+ * and counting one that has just stopped only makes the share look smaller and
+ * the floor lower, which is the harmless direction. */
+#define HPFT_LIVE_EPOCHS 128U
 /* A connection with no readable socket (no tcp_sock on the skb) has no
  * window to speak of: it is shaped at an equal share of R over the
  * connections seen last epoch, never at R itself. */
@@ -112,6 +129,10 @@ struct hpft_pair_state {
     __u32 pad0;
     __u64 tx_bytes;     /* wire bytes of the payload segments let through; read by the
                          * pace shim for the sender's per-flow-set report (atomic add) */
+    __u32 live_cur;     /* distinct connections that sent in this live window (atomic add) */
+    __u32 live_prev;    /* the previous window's count: how many connections the set has */
+    __u32 live_win;     /* epoch at which the current live window opened */
+    __u32 pad1;
 };
 
 /* per connection (5-tuple): its own clock, its own window, and the rate it
@@ -123,7 +144,7 @@ struct hpft_flow_state {
     __u64 win_ep;       /* the window this connection reported this epoch */
     __u64 paced;        /* r_i last written, bit/s */
     __u32 epoch_seen;   /* pair epoch this connection last reported in */
-    __u32 pad0;
+    __u32 live_seen;    /* live window this connection last counted itself in */
 };
 
 struct {
@@ -319,7 +340,9 @@ int hpft_tcp_edt(struct __sk_buff *skb)
         fs_new.win_ep = win;
         fs_new.paced = 0;
         fs_new.epoch_seen = 0xffffffffU;
-        fs_new.pad0 = 0;
+        /* not the current window, so this connection counts itself the first
+         * time it is seen */
+        fs_new.live_seen = 0xffffffffU;
         bpf_map_update_elem(&hpft_flow_state_map, &flow_key, &fs_new, BPF_ANY);
         fs = bpf_map_lookup_elem(&hpft_flow_state_map, &flow_key);
         if (!fs)
@@ -361,6 +384,13 @@ int hpft_tcp_edt(struct __sk_buff *skb)
                 state->sum_cur = 0;
                 state->n_cur = 0;
                 state->epoch++;
+                /* the live window is much longer than the epoch, so it rolls
+                 * on its own schedule */
+                if (state->epoch - state->live_win >= HPFT_LIVE_EPOCHS) {
+                    state->live_prev = state->live_cur;
+                    state->live_cur = 0;
+                    state->live_win = state->epoch;
+                }
                 t = state->tok;
                 if (t > depth)
                     state->tok = depth;
@@ -381,6 +411,13 @@ int hpft_tcp_edt(struct __sk_buff *skb)
                 fs->epoch_seen = state->epoch;
                 __sync_fetch_and_add(&state->sum_cur, t);
                 __sync_fetch_and_add(&state->n_cur, 1);
+            }
+            /* and once per live window, whatever else it did: this is the
+             * count of connections the set HAS, not of the ones that happened
+             * to be on the wire in the last millisecond */
+            if (fs->live_seen != state->live_win) {
+                fs->live_seen = state->live_win;
+                __sync_fetch_and_add(&state->live_cur, 1);
             }
 
             /* 2c. The pool. Refill at R for the stretch since the last
@@ -443,10 +480,63 @@ int hpft_tcp_edt(struct __sk_buff *skb)
                      * past the whole previous sum still gets at most the
                      * whole allowance */
                     __u64 ratio = (num << 20) / sum;
+                    __u32 nlive;
+                    __u64 equal;
 
                     if (ratio > (1ULL << 20))
                         ratio = 1ULL << 20;
                     r_i = (allow >> 10) * ratio >> 10;
+
+                    /* Hold the share within a band around an equal one.
+                     *
+                     * The law divides the allowance in proportion to each
+                     * connection's congestion-control quota, which assumes the
+                     * quota says something about the PATH. Once this shaper
+                     * holds a connection below what it would send, that stops
+                     * being true: Linux only grows a window while the
+                     * connection is cwnd-limited, and a paced connection is
+                     * pacing-limited, so the window we read stops moving and
+                     * stays where it stood when the shaping began. Nothing
+                     * else in the stack is any better, because the shaper
+                     * removes nearly all the loss the quota is built from (11
+                     * retransmissions per connection against 2000 or more
+                     * without it, measured 2026-09-18).
+                     *
+                     * Left alone that traps a connection: a window frozen
+                     * small earns a small rate, a small rate sends little, and
+                     * little sending cannot grow the window back. In a
+                     * 400-connection flow set, 7 of them ended a run at a
+                     * quarter of the others' window and rate with exactly the
+                     * same retransmission count - not slower, stuck.
+                     *
+                     * All connections of a flow set share one path (see the
+                     * header), so a real difference between their quotas can
+                     * only come from an application that is not offering data,
+                     * and such a connection does not need a large share: it
+                     * will not use it, and the pool hands the remainder to the
+                     * others. Everything wider than the band is an artefact of
+                     * our own shaping.
+                     *
+                     * The equal share is over the connections the set HAS
+                     * (live_prev), never over the few that happened to be on
+                     * the wire in the last millisecond - see HPFT_LIVE_EPOCHS.
+                     * Taking the larger of the two keeps the count on the safe
+                     * side: too many connections makes the floor lower and the
+                     * band wider, which does nothing; too few makes the floor
+                     * higher than a share, and then the floors add up to more
+                     * than the allowance and the flow set overruns its
+                     * permitted rate.
+                     */
+                    nlive = state->live_prev;
+                    if (nlive < state->n_prev)
+                        nlive = state->n_prev;
+                    if (!nlive)
+                        nlive = 1;
+                    equal = allow / nlive;
+                    if (r_i < equal / HPFT_SHARE_BAND)
+                        r_i = equal / HPFT_SHARE_BAND;
+                    else if (r_i > equal * HPFT_SHARE_BAND)
+                        r_i = equal * HPFT_SHARE_BAND;
                 }
             }
         }
