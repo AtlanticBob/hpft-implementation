@@ -811,7 +811,8 @@ def main():
     # lab's standing state.
     #   full      probe x brake x repay, the design (§5.2)
     #   explicit  R <- E_s: the receiver's entitlement obeyed as a rate
-    #   eyeq      R <- R (1 - kappa (A_s - E_s)/E_s), symmetric error law
+    #   eyeq      R <- the rate an EyeQ-style allocator at the RECEIVER
+    #             assigned (rx_agent runs it; the sender only obeys)
     #   nobrake   full without the kappa*dq damping term
     v4_law = str(ep.get("law", "full")).lower()
     if v4_law not in ("full", "explicit", "eyeq", "nobrake"):
@@ -918,27 +919,21 @@ def main():
                                             not st.enforced, v4_linear,
                                             v4_law != "nobrake")
         else:
-            # The rate-obeying laws (E2.5). Both need the receiver's
-            # entitlement, which rides on the wire as `e`; a record without
-            # one says nothing, so the fence stays where it is rather than
-            # being driven by a zero.
-            e_s = float(rec.get("e", 0.0))
-            if e_s > 0.0:
-                if v4_law == "explicit":
-                    # Q-a: the entitlement obeyed as a rate. No probe, no
-                    # queue, no memory - the sender does what it is told, and
-                    # nothing in the loop can correct an executor or a
-                    # measurement that is off.
-                    st.R = min(max(e_s, v4_floor), line)
-                else:
-                    # Q-b: EyeQ-style, the arrival's relative error against
-                    # the entitlement, symmetric in both directions. Closed
-                    # loop, but on the instantaneous error rather than on its
-                    # integral, so it has no memory of excess already sent.
-                    a_e = float(rec.get("r", 0.0))
-                    x = v4_kappa * (a_e - e_s) / e_s
-                    st.R = min(max(st.R * (1.0 - max(-0.5, min(0.5, x))),
-                                   v4_floor), line)
+            # The rate-obeying laws (E2.5). Both are handed a rate by the
+            # receiver and both simply obey it; the fence keeps no state of
+            # its own, which is the point of the comparison. What differs is
+            # what the receiver put in the field:
+            #   explicit  the water-filled entitlement itself
+            #   eyeq      the output of an EyeQ-style allocator the RECEIVER
+            #             runs (rx_agent), iterating on the relative error
+            # Neither can correct an executor or a measurement that is off,
+            # because neither is told that anything is off - that is what
+            # feeding back a rate costs and what feeding back a queue buys.
+            # A record without a rate says nothing, so the fence stays where
+            # it is rather than being driven by a zero.
+            r_assigned = float(rec.get("e", 0.0))
+            if r_assigned > 0.0:
+                st.R = min(max(r_assigned, v4_floor), line)
             st.dq = 0.0
             st.below = 0
         st.q_prev = q

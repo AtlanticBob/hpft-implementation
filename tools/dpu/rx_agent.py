@@ -882,6 +882,20 @@ def main():
     period = (args.period_ms or ep["period_ms"]) / 1e3
     local_host = args.local_host or reg["receiver_host"]
     line = reg["line_rate_bps"]
+    # Control-law ablation (evaluation E2.5). The receiver only cares which
+    # laws want a RATE from it rather than a queue:
+    #   eyeq      the receiver runs the allocator and ships the rate it
+    #             computed - that is what EyeQ and RCP do, and keeping the
+    #             state here rather than at the sender is the whole point of
+    #             the comparison: one scheme feeds back a rate, the other
+    #             feeds back the queue that rate produced
+    #   explicit  ships the entitlement itself, which is already a receiver
+    #             quantity, so nothing extra is needed
+    # Every other law is handed the entitlement and ignores it.
+    e_law = str(reg["e_params"].get("law", "full")).lower()
+    eyeq_R = {}                 # fsid -> the rate this receiver has assigned
+    eyeq_kappa = float(reg["e_params"].get("kappa", 0.1))
+    eyeq_floor = float(reg["e_params"].get("r_floor_bps", 1e9))
     mac2vnic = {v["mac"]: v["vnic_id"] for v in reg["vnics"] if "mac" in v}
     local_macs = {v["mac"] for v in reg["vnics"]
                   if v.get("mac") and v["host"] == local_host}
@@ -1147,6 +1161,19 @@ def main():
             else:
                 conf_q.pop(f, None)
             delays[f] = Qn / E            # q in seconds = periods * period
+            if e_law == "eyeq":
+                # EyeQ-style allocator, run HERE and not at the sender: the
+                # sender is handed the result and obeys it. Symmetric in both
+                # directions, on the instantaneous relative error, with no
+                # memory of excess already delivered - which is exactly what
+                # the virtual queue in the line above is and this is not.
+                r_prev = eyeq_R.get(f) or E
+                x = eyeq_kappa * (A - E) / E
+                eyeq_R[f] = min(max(r_prev * (1.0 - min(max(x, -0.5), 0.5)),
+                                    eyeq_floor), line)
+        if e_law == "eyeq":
+            for f in [f for f in eyeq_R if f not in active]:
+                del eyeq_R[f]
         for f in [f for f in conf_q if f not in active]:
             del conf_q[f]
         # Report membership is decided by the FLOW TABLE, never by
@@ -1155,7 +1182,11 @@ def main():
         # the absent record as a dead control channel and fails
         # open - positive feedback. So every member of `active` (the
         # flow table plus the membership grace) gets a record.
-        telem.send(active, sched_rates, delays, ents)
+        # The wire field is "the rate this receiver assigns", for the laws
+        # that want one; for every other law it is the entitlement, which
+        # they do not read.
+        telem.send(active, sched_rates, delays,
+                   eyeq_R if e_law == "eyeq" else ents)
 
         # throttled logging (default ~50 Hz), never every 1ms tick
         if nticks_total % log_every == 0 and nticks_total:
