@@ -91,28 +91,79 @@ if bad or r["policy"].get("per_sender_weights"):
     print("non-standard policy:", bad, r["policy"].get("per_sender_weights")); sys.exit(1)
 EOF
 cp config/lab-registry.json "$OUT/registry.json"
-# HPFT_CLASS_WEIGHTS="sgpu02/vf0=3:1[,<vm>=<rdma>:<tcp>...]": the class weights
-# this run gives some VMs (evaluation 2-8b). The standing registry stays the
-# standard one - the check above holds - and a copy with these weights goes to
-# the receiving DPUs, whose agents reload their policy when the file changes
-# (0.05 s after it lands, P8); cleanup puts the standing file back. The copy
-# travels with the run as registry.json.
-if [ -n "${HPFT_CLASS_WEIGHTS:-}" ]; then
+# Per-run registry overrides. The standing registry stays the standard one -
+# the check above holds - and a copy carrying the overrides goes to the DPUs;
+# cleanup puts the standing file back. The copy travels with the run as
+# registry.json, so what a run actually used is in its own output.
+#
+#   HPFT_CLASS_WEIGHTS="sgpu02/vf0=3:1[,...]"   class weights of some VMs
+#       (evaluation 2-8b). policy only, so the receivers reload it in place
+#       (0.05 s after it lands, P8) with no restart.
+#   HPFT_FENCE_LAW=full|explicit|eyeq|nobrake   the SENDER's fence law.
+#       Not HPFT_LAW, which is the EXECUTOR's split law and a different
+#       knob in a different place: one decides how a flow-set's budget is
+#       computed, the other how that budget is split over the flow-set's
+#       own QPs. Both exist, and a run may set either.
+#   HPFT_EXEC_BIAS=1.05                         executor shaping error
+#   HPFT_PERIOD_MS=50                           the feedback interval
+#   HPFT_GAIN=fixed|rescaled                    with HPFT_PERIOD_MS: whether
+#       kappa and alpha are left alone (`fixed`, the operator's question:
+#       what if the feedback is simply slowed down) or scaled with the period
+#       so the loop gain per unit time is unchanged (`rescaled`, the
+#       mechanism's question: what does the added information delay alone
+#       cost). kappa scales linearly with the period and alpha as its square,
+#       which is what their units say (see tx_agent_e.v4_step).
+#       Default `fixed`.
+# The last four are e_params, which BOTH agents read once at startup, so a run
+# that sets any of them pushes to every DPU and the agents are restarted below.
+REGOVR=""
+[ -n "${HPFT_FENCE_LAW:-}" ] && REGOVR="$REGOVR law"
+[ -n "${HPFT_EXEC_BIAS:-}" ] && REGOVR="$REGOVR exec_bias"
+[ -n "${HPFT_PERIOD_MS:-}" ] && REGOVR="$REGOVR period_ms"
+if [ -n "${HPFT_CLASS_WEIGHTS:-}" ] || [ -n "$REGOVR" ]; then
   python3 -c '
-import json, sys
+import json, os, sys
 r = json.load(open("config/lab-registry.json"))
-for item in sys.argv[1].split(","):
-    vm, w = item.split("=")
-    a, b = (float(x) for x in w.split(":"))
-    r["policy"]["vms"][vm]["class_weights"] = {"tcp": b, "rdma": a}
+cw = os.environ.get("HPFT_CLASS_WEIGHTS", "")
+if cw:
+    for item in cw.split(","):
+        vm, w = item.split("=")
+        a, b = (float(x) for x in w.split(":"))
+        r["policy"]["vms"][vm]["class_weights"] = {"tcp": b, "rdma": a}
+ep = r["e_params"]
+law = os.environ.get("HPFT_FENCE_LAW", "")
+if law:
+    if law not in ("full", "explicit", "eyeq", "nobrake"):
+        sys.exit("bad HPFT_FENCE_LAW %r" % law)
+    ep["law"] = law
+bias = os.environ.get("HPFT_EXEC_BIAS", "")
+if bias:
+    ep["exec_bias"] = float(bias)
+pms = os.environ.get("HPFT_PERIOD_MS", "")
+if pms:
+    new_T, old_T = float(pms), float(ep["period_ms"])
+    gain = os.environ.get("HPFT_GAIN", "fixed")
+    if gain not in ("fixed", "rescaled"):
+        sys.exit("bad HPFT_GAIN %r (fixed|rescaled)" % gain)
+    if gain == "rescaled":
+        f = new_T / old_T
+        ep["kappa"] = float(ep.get("kappa", 0.1)) * f
+        ep["alpha"] = float(ep.get("alpha", 3e-4)) * f * f
+    ep["period_ms"] = new_T
 print(json.dumps(r, indent=2))
-' "$HPFT_CLASS_WEIGHTS" > "$OUT/registry.json" || { echo "ABORT: bad HPFT_CLASS_WEIGHTS"; exit 1; }
-  for h in $RECVS; do
+' > "$OUT/registry.json" || { echo "ABORT: bad per-run registry override"; exit 1; }
+  # class weights alone are policy and reload in place on the receivers; an
+  # e_params override has to reach every DPU, because the sender agents read
+  # it too and only at startup.
+  PUSH_TO="$RECVS"; [ -n "$REGOVR" ] && PUSH_TO="$HOSTS"
+  for h in $PUSH_TO; do
     scp -q "$OUT/registry.json" "$(dpu_of $h):/opt/hpft/lab-registry.json.new" \
       && ssh -n -o BatchMode=yes "$(dpu_of $h)" "mv /opt/hpft/lab-registry.json.new /opt/hpft/lab-registry.json" \
-      || { echo "ABORT: could not push the run's class weights to $h"; exit 1; }
+      || { echo "ABORT: could not push the run's registry to $h"; exit 1; }
   done
-  echo "class weights (rdma:tcp) for this run: $HPFT_CLASS_WEIGHTS" | tee "$OUT/policy.txt"
+  { [ -n "${HPFT_CLASS_WEIGHTS:-}" ] && echo "class weights (rdma:tcp) for this run: $HPFT_CLASS_WEIGHTS"
+    [ -n "$REGOVR" ] && echo "e_params overridden for this run:$REGOVR (fence law=${HPFT_FENCE_LAW:-default} exec_bias=${HPFT_EXEC_BIAS:-default} period_ms=${HPFT_PERIOD_MS:-default} gain=${HPFT_GAIN:-fixed})"
+    true; } | tee "$OUT/policy.txt"
   sleep 1
 fi
 for h in $HOSTS; do
@@ -336,9 +387,13 @@ mbox() { # $1 host: write the remaining args, one line each, to its DPU's RP FIF
 }
 cleanup() {
   [ -n "$METER_ROWS" ] && echo "$METER_ROWS" | while read -r _ _ dh dv _; do meter_set "$dh" "$dv" 50000000 >/dev/null 2>&1; done
-  if [ -n "${HPFT_CLASS_WEIGHTS:-}" ]; then
-    for h in $RECVS; do scp -q config/lab-registry.json "$(dpu_of $h):/opt/hpft/lab-registry.json.new" \
+  if [ -n "${HPFT_CLASS_WEIGHTS:-}" ] || [ -n "${REGOVR:-}" ]; then
+    for h in ${PUSH_TO:-$RECVS}; do scp -q config/lab-registry.json "$(dpu_of $h):/opt/hpft/lab-registry.json.new" \
       && ssh -n -o BatchMode=yes "$(dpu_of $h)" "mv /opt/hpft/lab-registry.json.new /opt/hpft/lab-registry.json"; done
+    # e_params only takes effect at agent startup, so the standing file being
+    # back is not enough: the next run would still be running this run's law
+    # until something restarts them. Restart here, where the override is known.
+    [ -z "${REGOVR:-}" ] || bash tools/lab-infra/roles.sh all >/dev/null 2>&1
   fi
   if [ "$ARM" = hpft ]; then
     for h in $SENDERS; do mbox "$h" "0xccd 2" "0xcce 0 22" "0xcce 0 12"; done

@@ -53,13 +53,22 @@ FIFO = "/tmp/rp_fifo"   # RDMA executor mailbox: 0xb47f|n {set id, rate}, 0xb48e
 
 # binary telemetry - MUST match rx_agent.Telemetry.REC exactly; the two
 # agents are deployed and restarted together or the loop parses garbage.
-# header (seq16, n) then n x (fsid[64], r_bps u64, d_us u64)
+# header (seq16, n) then n x (fsid[64], r_bps u64, d_us u64, e_bps u64)
+#
+# e is the receiver's entitlement for the flow-set. The design's own law does
+# not read it and must not: the whole point of the virtual queue is that the
+# sender never receives a rate to obey. It rides along because the control-law
+# ablation (evaluation E2.5) needs the variants that DO obey a rate - an
+# explicit-rate law and an EyeQ-style error law - to exist side by side with
+# the real one under one wire format, and a second format would be a second
+# way for the two agents to disagree. Every law other than `explicit` and
+# `eyeq` ignores the field.
 _THDR = struct.Struct("<HH")
-_TREC = struct.Struct("<64sQQ")   # (fsid, r bps, d us)
+_TREC = struct.Struct("<64sQQQ")   # (fsid, r bps, d us, e bps)
 
 
 def parse_telemetry(data):
-    """bytes -> (seq, {fsid: {'r','d'}}); tolerant of short buffers."""
+    """bytes -> (seq, {fsid: {'r','d','e'}}); tolerant of short buffers."""
     if len(data) < _THDR.size:
         return None, {}
     seq, n = _THDR.unpack_from(data, 0)
@@ -68,15 +77,15 @@ def parse_telemetry(data):
     for _ in range(n):
         if off + _TREC.size > len(data):
             break
-        fb, r, d_us = _TREC.unpack_from(data, off)
+        fb, r, d_us, e = _TREC.unpack_from(data, off)
         off += _TREC.size
         recs[fb.rstrip(b"\x00").decode("ascii", "ignore")] = {
-            "r": r, "d": d_us / 1e6}
+            "r": r, "d": d_us / 1e6, "e": e}
     return seq, recs
 
 
 def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
-            keep_silence=False, linear=False):
+            keep_silence=False, linear=False, brake=True):
     """Design v4 (§5.2), one feedback: three multiplicative factors, written
     as 1 + x (linear=True, the default) or e^x (linear=False).
     probe   x (1 + alpha*m_hat) m = consecutive feedbacks with an empty
@@ -144,7 +153,12 @@ def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
     # follow also shows a send rate above the fence, and THAT queue is ours
     # and must reset the silence. The brake and the repayment act on the
     # queue either way - it is real and must be paid.
-    x = kappa * dq + (kappa / D) * min(q, D)
+    # brake=False is the `nobrake` law of the control-law ablation (E2.5,
+    # question Q-c): the repayment term alone, with the damping that reacts
+    # to the queue's DIRECTION removed. Everything else about the step is
+    # identical, so the difference between the two is the damping and
+    # nothing else.
+    x = (kappa * dq if brake else 0.0) + (kappa / D) * min(q, D)
     if linear:
         # 1 - x instead of e^-x, bounded to a half either way so the factor
         # stays positive and one feedback can never do more than halve or add
@@ -792,6 +806,25 @@ def main():
     # in 99% of feedbacks, and three-run A/Bs on V1, V2 and V7 were
     # indistinguishable) and is kept selectable for reference.
     v4_linear = str(ep.get("step_form", "linear")).lower() != "exp"
+    # Control-law ablation (evaluation E2.5). `full` is the design and the
+    # default; the others exist to be measured against it and are never the
+    # lab's standing state.
+    #   full      probe x brake x repay, the design (§5.2)
+    #   explicit  R <- E_s: the receiver's entitlement obeyed as a rate
+    #   eyeq      R <- R (1 - kappa (A_s - E_s)/E_s), symmetric error law
+    #   nobrake   full without the kappa*dq damping term
+    v4_law = str(ep.get("law", "full")).lower()
+    if v4_law not in ("full", "explicit", "eyeq", "nobrake"):
+        sys.exit("tx_agent_e: unknown e_params.law %r "
+                 "(full|explicit|eyeq|nobrake)" % v4_law)
+    # Executor shaping error, as a multiplier on what is handed to the
+    # executors (E2.5 experiment 1b). 1.0 is the lab's standing state. An
+    # executor that delivers 5% more than it was asked for is the same thing
+    # to the loop as asking it for 5% more, and doing it here costs neither
+    # of the two executors a change.
+    v4_exec_bias = float(ep.get("exec_bias", 1.0))
+    if not 0.5 <= v4_exec_bias <= 2.0:
+        sys.exit("tx_agent_e: e_params.exec_bias %r outside [0.5, 2.0]" % v4_exec_bias)
     print("tx_agent_e: v4 step form = %s" % ("linear (1+am, 1-x with |x|<=1/2)" if v4_linear else "exp"), flush=True)
     tree_theta = float(ep.get("tree_backlog_theta", 0.85))
     tree_period_s = float(ep.get("tree_period_ms", 100)) / 1e3
@@ -878,10 +911,36 @@ def main():
         # spend climbing from the floor at the maximum step.
         if q <= 0.0 and not st.enforced and a_s is not None:
             st.R = max(st.R, min(float(a_s), cap, line))
-        st.R, st.dq, st.below = v4_step(st.R, q, st.q_prev, st.below,
-                                        v4_alpha, v4_mmax, v4_kappa, v4_D,
-                                        v4_floor, min(cap, line),
-                                        not st.enforced, v4_linear)
+        if v4_law in ("full", "nobrake"):
+            st.R, st.dq, st.below = v4_step(st.R, q, st.q_prev, st.below,
+                                            v4_alpha, v4_mmax, v4_kappa, v4_D,
+                                            v4_floor, min(cap, line),
+                                            not st.enforced, v4_linear,
+                                            v4_law != "nobrake")
+        else:
+            # The rate-obeying laws (E2.5). Both need the receiver's
+            # entitlement, which rides on the wire as `e`; a record without
+            # one says nothing, so the fence stays where it is rather than
+            # being driven by a zero.
+            e_s = float(rec.get("e", 0.0))
+            if e_s > 0.0:
+                if v4_law == "explicit":
+                    # Q-a: the entitlement obeyed as a rate. No probe, no
+                    # queue, no memory - the sender does what it is told, and
+                    # nothing in the loop can correct an executor or a
+                    # measurement that is off.
+                    st.R = min(max(e_s, v4_floor), line)
+                else:
+                    # Q-b: EyeQ-style, the arrival's relative error against
+                    # the entitlement, symmetric in both directions. Closed
+                    # loop, but on the instantaneous error rather than on its
+                    # integral, so it has no memory of excess already sent.
+                    a_e = float(rec.get("r", 0.0))
+                    x = v4_kappa * (a_e - e_s) / e_s
+                    st.R = min(max(st.R * (1.0 - max(-0.5, min(0.5, x))),
+                                   v4_floor), line)
+            st.dq = 0.0
+            st.below = 0
         st.q_prev = q
         st.last_step = now
     shim = PaceShim(ctl["pace_shim"][local_host])
@@ -1178,6 +1237,7 @@ def main():
         live.flows, live.flowtag_of, live.shim = flows, flowtag_of, shim
     last_any_rx = time.monotonic()   # last telemetry from ANY flow-set
     logf = open(args.log, "a", buffering=1)
+    print("tx_agent_e: law=%s exec_bias=%.3f" % (v4_law, v4_exec_bias), flush=True)
     print("tx_agent_e: local=%s T=%.0fms kappa=%.3f D=%.0f alpha=%.1e m_max=%.0f "
           "failopen=%.2f/%.1fs (k=%.1f/s) evict=%.0fs shim=%s log=%s"
           % (local_host, period * 1e3, v4_kappa, v4_D, v4_alpha, v4_mmax,
@@ -1187,6 +1247,12 @@ def main():
     def actuate(fsid, st, r_bps, rdma_batch):
         # design v4 §5.5: min(R, U), never below the platform minimum rate
         pace = max(min(st.R, tree_of(fsid)), v4_floor)
+        if v4_exec_bias != 1.0:
+            # E2.5 experiment 1b only: stand in for an executor that shapes
+            # to a fixed fraction of what it was asked for. st.pace follows
+            # the biased value because it is what the wire will carry, and
+            # the escape tripwire below compares the wire against it.
+            pace = max(min(pace * v4_exec_bias, line), v4_floor)
         src_dst, cls = fsid.rsplit("|", 1)
         src, dst = src_dst.split(">")
         tnow = time.monotonic()

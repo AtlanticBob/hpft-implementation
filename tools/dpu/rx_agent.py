@@ -795,18 +795,24 @@ class Scheduler:
 class Telemetry:
     """One binary datagram per sender DPU per tick. Wire format:
       header  '<HH'       = (seq_lo16, n_records)
-      record  '<64s Q Q'  = (fsid[64], r_bps, d_us)
+      record  '<64s Q Q Q'  = (fsid[64], r_bps, d_us, e_bps)
     r is the attributed arrival (the sender's tree reads it as demand; the
-    law does not use it), d the virtual queue in microseconds. fsid strings
-    are short ('sgpu01/vf0>sgpu02/vf0|tcp' ~ 26 B); uint64 because bps at
-    200G line rate overflows uint32.
+    law does not use it), d the virtual queue in microseconds, e the
+    entitlement. fsid strings are short ('sgpu01/vf0>sgpu02/vf0|tcp' ~ 26 B);
+    uint64 because bps at 200G line rate overflows uint32.
+
+    e is NOT read by the design's own law, and that is the design: the sender
+    is never handed a rate to obey, only the queue its own excess produced.
+    It is on the wire so that the control-law ablation (evaluation E2.5) can
+    run the variants that do obey a rate - explicit-rate and EyeQ-style -
+    against the real law under one wire format instead of two.
 
     THIS FORMAT IS A SYNCHRONIZED BOTH-ENDS CHANGE: tx_agent_e._TREC must
     match exactly, and both agents must be deployed and restarted together
     or the control loop parses garbage."""
 
     HDR = struct.Struct("<HH")
-    REC = struct.Struct("<64sQQ")
+    REC = struct.Struct("<64sQQQ")
 
     def __init__(self, vnic_host, telemetry_ip, port):
         self.vnic_host = vnic_host        # vnic_id -> host
@@ -823,23 +829,24 @@ class Telemetry:
         out = [self.HDR.pack(self.seq & 0xffff, len(recs))]
         fsb = self._fsb
         pack = self.REC.pack
-        for fsid, r, d_us in recs:
+        for fsid, r, d_us, e in recs:
             b = fsb.get(fsid)
             if b is None:
                 b = fsb[fsid] = fsid.encode()[:64]
-            out.append(pack(b, int(r), int(d_us)))
+            out.append(pack(b, int(r), int(d_us), int(e)))
         return b"".join(out)
 
-    def send(self, fsids, rates, delays):
+    def send(self, fsids, rates, delays, ents=None):
         """One record per flow-set in `fsids`, grouped by the sender's DPU."""
         self.seq += 1
+        ents = ents or {}
         per_dpu = {}     # dpu ip -> [records]
         for f in fsids:
             src = f.split(">")[0]
             ip = self.telemetry_ip.get(self.vnic_host.get(src))
             if ip is not None:
                 per_dpu.setdefault(ip, []).append(
-                    (f, rates.get(f, 0), delays.get(f, 0.0) * 1e6))
+                    (f, rates.get(f, 0), delays.get(f, 0.0) * 1e6, ents.get(f, 0)))
         for ip, recs in per_dpu.items():
             try:
                 self.sock.sendto(self._pack(recs), (ip, self.port))
@@ -1148,7 +1155,7 @@ def main():
         # the absent record as a dead control channel and fails
         # open - positive feedback. So every member of `active` (the
         # flow table plus the membership grace) gets a record.
-        telem.send(active, sched_rates, delays)
+        telem.send(active, sched_rates, delays, ents)
 
         # throttled logging (default ~50 Hz), never every 1ms tick
         if nticks_total % log_every == 0 and nticks_total:
