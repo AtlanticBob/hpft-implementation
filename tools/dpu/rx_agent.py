@@ -892,10 +892,28 @@ def main():
     #   explicit  ships the entitlement itself, which is already a receiver
     #             quantity, so nothing extra is needed
     # Every other law is handed the entitlement and ignores it.
+    # EyeQ (NSDI'13 3.2-3.4) has two levels, and they treat a flow-set
+    # that sends less than it is given in opposite ways:
+    #   between endpoints  capacity is split by weight among the ACTIVE
+    #                      ones (receiving at a non-zero rate), whatever
+    #                      they use: C_i = B_i * C / sum_{j in A} B_j. That
+    #                      is `share` below, the fill with every present
+    #                      flow-set asking for everything - no lending.
+    #   inside an endpoint one rate R_i for every sender to it, iterated on
+    #                      the endpoint's aggregate arrival y_i against C_i:
+    #                      R_i <- R_i (1 - alpha (y_i - C_i) / C_i). A
+    #                      sender below R_i lets y_i fall short, R_i rises
+    #                      and its siblings take the rest.
+    # The endpoint here is a class node (dst VM, class), the finest node of
+    # the policy tree above the flow-sets. alpha is EyeQ's 0.5 by default;
+    # the paper chose it for a 200 us step applied at once, and the E2.5
+    # runner sets the value this platform's 10 ms period and 2-3 period
+    # actuation delay can carry (e_params.eyeq_alpha).
     e_law = str(reg["e_params"].get("law", "full")).lower()
-    eyeq_R = {}                 # fsid -> the rate this receiver has assigned
-    eyeq_kappa = float(reg["e_params"].get("kappa", 0.1))
+    eyeq_R = {}                 # (dst vm, class) -> the rate R_i of that endpoint
+    eyeq_alpha = float(reg["e_params"].get("eyeq_alpha", 0.5))
     eyeq_floor = float(reg["e_params"].get("r_floor_bps", 1e9))
+    eyeq_ship = {}              # fsid -> R_i of its endpoint, what goes on the wire
     mac2vnic = {v["mac"]: v["vnic_id"] for v in reg["vnics"] if "mac" in v}
     local_macs = {v["mac"] for v in reg["vnics"]
                   if v.get("mac") and v["host"] == local_host}
@@ -1161,19 +1179,33 @@ def main():
             else:
                 conf_q.pop(f, None)
             delays[f] = Qn / E            # q in seconds = periods * period
-            if e_law == "eyeq":
-                # EyeQ-style allocator, run HERE and not at the sender: the
-                # sender is handed the result and obeys it. Symmetric in both
-                # directions, on the instantaneous relative error, with no
-                # memory of excess already delivered - which is exactly what
-                # the virtual queue in the line above is and this is not.
-                r_prev = eyeq_R.get(f) or E
-                x = eyeq_kappa * (A - E) / E
-                eyeq_R[f] = min(max(r_prev * (1.0 - min(max(x, -0.5), 0.5)),
-                                    eyeq_floor), line)
         if e_law == "eyeq":
-            for f in [f for f in eyeq_R if f not in active]:
-                del eyeq_R[f]
+            # EyeQ's allocator, run HERE; the sender is handed R_i and obeys.
+            # C_i and y_i are sums over the endpoint's present flow-sets of
+            # the no-lending fill and of the same raw arrival the virtual
+            # queue integrates, so both laws see the same measurement noise.
+            node_C, node_y, node_of = {}, {}, {}
+            for f in active:
+                n_ = (f.split(">")[1].rsplit("|", 1)[0], f.rsplit("|", 1)[1])
+                node_of[f] = n_
+                node_C[n_] = node_C.get(n_, 0.0) + share.get(f, 0.0)
+                node_y[n_] = node_y.get(n_, 0.0) + max(sched_rates.get(f, 0.0), 0.0)
+            n_count = {}
+            for n_ in node_of.values():
+                n_count[n_] = n_count.get(n_, 0) + 1
+            for n_, C_ in node_C.items():
+                if C_ <= 0:
+                    eyeq_R.pop(n_, None)
+                    continue
+                # a new endpoint starts at C_i / N, the answer when every
+                # sender wants everything
+                r_prev = eyeq_R.get(n_) or C_ / n_count[n_]
+                # R_i kept positive (EyeQ: "taking care to keep R_i positive")
+                eyeq_R[n_] = min(max(r_prev * (1.0 - eyeq_alpha * (node_y[n_] - C_) / C_),
+                                     eyeq_floor), line)
+            for n_ in [n_ for n_ in eyeq_R if n_ not in node_C]:
+                del eyeq_R[n_]
+            eyeq_ship = {f: eyeq_R[n_] for f, n_ in node_of.items() if n_ in eyeq_R}
         for f in [f for f in conf_q if f not in active]:
             del conf_q[f]
         # Report membership is decided by the FLOW TABLE, never by
@@ -1186,7 +1218,7 @@ def main():
         # that want one; for every other law it is the entitlement, which
         # they do not read.
         telem.send(active, sched_rates, delays,
-                   eyeq_R if e_law == "eyeq" else ents)
+                   eyeq_ship if e_law == "eyeq" else ents)
 
         # throttled logging (default ~50 Hz), never every 1ms tick
         if nticks_total % log_every == 0 and nticks_total:

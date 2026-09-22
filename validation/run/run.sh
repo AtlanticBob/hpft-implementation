@@ -114,12 +114,15 @@ cp config/lab-registry.json "$OUT/registry.json"
 #       cost). kappa scales linearly with the period and alpha as its square,
 #       which is what their units say (see tx_agent_e.v4_step).
 #       Default `fixed`.
-# The last four are e_params, which BOTH agents read once at startup, so a run
+#   HPFT_EYEQ_ALPHA=0.2                         the EyeQ arm's alpha (with
+#       HPFT_FENCE_LAW=eyeq); EyeQ's own 0.5 when unset.
+# The last five are e_params, which BOTH agents read once at startup, so a run
 # that sets any of them pushes to every DPU and the agents are restarted below.
 REGOVR=""
 [ -n "${HPFT_FENCE_LAW:-}" ] && REGOVR="$REGOVR law"
 [ -n "${HPFT_EXEC_BIAS:-}" ] && REGOVR="$REGOVR exec_bias"
 [ -n "${HPFT_PERIOD_MS:-}" ] && REGOVR="$REGOVR period_ms"
+[ -n "${HPFT_EYEQ_ALPHA:-}" ] && REGOVR="$REGOVR eyeq_alpha"
 if [ -n "${HPFT_CLASS_WEIGHTS:-}" ] || [ -n "$REGOVR" ]; then
   python3 -c '
 import json, os, sys
@@ -136,6 +139,11 @@ if law:
     if law not in ("full", "explicit", "eyeq", "nobrake"):
         sys.exit("bad HPFT_FENCE_LAW %r" % law)
     ep["law"] = law
+ea = os.environ.get("HPFT_EYEQ_ALPHA", "")
+if ea:
+    if not 0.0 < float(ea) < 2.0:
+        sys.exit("bad HPFT_EYEQ_ALPHA %r (0 < alpha < 2)" % ea)
+    ep["eyeq_alpha"] = float(ea)
 bias = os.environ.get("HPFT_EXEC_BIAS", "")
 if bias:
     ep["exec_bias"] = float(bias)
@@ -162,7 +170,7 @@ print(json.dumps(r, indent=2))
       || { echo "ABORT: could not push the run's registry to $h"; exit 1; }
   done
   { [ -n "${HPFT_CLASS_WEIGHTS:-}" ] && echo "class weights (rdma:tcp) for this run: $HPFT_CLASS_WEIGHTS"
-    [ -n "$REGOVR" ] && echo "e_params overridden for this run:$REGOVR (fence law=${HPFT_FENCE_LAW:-default} exec_bias=${HPFT_EXEC_BIAS:-default} period_ms=${HPFT_PERIOD_MS:-default} gain=${HPFT_GAIN:-fixed})"
+    [ -n "$REGOVR" ] && echo "e_params overridden for this run:$REGOVR (fence law=${HPFT_FENCE_LAW:-default} exec_bias=${HPFT_EXEC_BIAS:-default} period_ms=${HPFT_PERIOD_MS:-default} gain=${HPFT_GAIN:-fixed} eyeq_alpha=${HPFT_EYEQ_ALPHA:-default})"
     true; } | tee "$OUT/policy.txt"
   sleep 1
 fi
