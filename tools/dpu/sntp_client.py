@@ -58,8 +58,31 @@ while True:
         t1 = time.time()
         pkt = bytearray(48); pkt[0] = (4 << 3) | 3
         pkt[40:48] = struct.pack("!II", int(t1) + NTP_EPOCH, int((t1 - int(t1)) * (1 << 32)))
+        # A reply that arrives after its exchange timed out is still queued on
+        # the socket, and without this check the NEXT exchange reads it as its
+        # own: its server timestamps are one exchange older, the RTT formula
+        # cancels that age out (so lowest-RTT selection cannot reject it), and
+        # the clock is stepped back by the age - about 2 s - then forward again
+        # one round later. hpft-dpu3 did that 92 times on 2026-09-22. So drain
+        # whatever is queued before sending, and accept only the reply whose
+        # originate field echoes this request's transmit timestamp (the
+        # responder copies it there, as SNTP specifies).
+        sock.setblocking(False)
         try:
-            sock.sendto(bytes(pkt), (srv, 123)); data, _ = sock.recvfrom(1024)
+            while True:
+                sock.recvfrom(1024)
+        except (BlockingIOError, OSError):
+            pass
+        sock.settimeout(1.0)
+        data = None
+        try:
+            sock.sendto(bytes(pkt), (srv, 123))
+            deadline = time.time() + 1.0
+            while data is None:
+                sock.settimeout(max(deadline - time.time(), 0.001))
+                d_, _ = sock.recvfrom(1024)
+                if len(d_) >= 48 and d_[24:32] == bytes(pkt[40:48]):
+                    data = d_
         except (socket.timeout, OSError) as e:
             print("sntp: no reply from %s (%s)" % (srv, e), flush=True); continue
         t4 = time.time(); t2, t3 = to_ts(data[32:40]), to_ts(data[40:48])
