@@ -220,6 +220,16 @@ fi
 if [ "${HPFT_ARM:-hpft}" = hpft ]; then
   bash tools/lab-infra/roles.sh all >/dev/null
   sleep 4
+else
+  # A baseline arm has to STOP the agents, not merely refrain from starting
+  # them: they are the lab's standing shape, so whether one was running is a
+  # property of what the lab did last and not of this run. Left alone they
+  # shape the baseline arm and it reports HyperFront's numbers under another
+  # name - measured 2026-09-24 on E1.1's with-TC arm, where every tenant in
+  # every phase came out at exactly the port over the tenant count, which is
+  # the ledger's answer and not anything a class weight can produce.
+  bash tools/lab-infra/roles.sh stop >/dev/null
+  sleep 3
 fi
 # A sink left from an earlier run keeps its port, the new sink's bind then
 # fails and the client sees "Connection refused" - 7.6 of the 40 G background
