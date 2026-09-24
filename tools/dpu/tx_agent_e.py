@@ -85,7 +85,7 @@ def parse_telemetry(data):
 
 
 def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
-            keep_silence=False, linear=False, brake=True):
+            keep_silence=False, linear=False, brake=True, probe=True):
     """Design v4 (§5.2), one feedback: three multiplicative factors, written
     as 1 + x (linear=True, the default) or e^x (linear=False).
     probe   x (1 + alpha*m_hat) m = consecutive feedbacks with an empty
@@ -135,8 +135,14 @@ def v4_step(R, q, q_prev, below, alpha, m_max, kappa, D, floor, cap,
         # is already bounded by m_max, so all a long block does is let an
         # app-limited flow resume at the maximum step, which is right - a
         # flow that has been using a fraction of its share IS far from it.
+        # probe=False: the flow-set is not using the fence it already has,
+        # so the empty queue is its application's silence and not the
+        # receiver's permission (see step_law). The silence keeps counting,
+        # as it does under the cap, so a flow-set that starts pressing again
+        # resumes at the step its idleness has earned.
         step = alpha * min(below, m_max)
-        R1 = max(R1, min(R1 * ((1.0 + step) if linear else math.exp(step)), cap))
+        if probe:
+            R1 = max(R1, min(R1 * ((1.0 + step) if linear else math.exp(step)), cap))
     elif not keep_silence:
         below = 0
     # keep_silence: this flow-set has never yet been held by its fence, so a
@@ -843,6 +849,13 @@ def main():
     # the start value. held_min is the part of its bytes that must have
     # gone out at the pace for the cap to be lifted.
     held_min = float(ep.get("held_min", 0.5))
+    # ...and the part that must have gone out at the pace for a flow-set
+    # whose measured rate is below the pace to still count as pressing on
+    # its fence. It is higher than held_min: lifting the cap only widens
+    # where the probe MAY go, while this decides whether it moves at all,
+    # and a flow-set at half its pace with half its bytes held is exactly
+    # the application-limited one the probe must not walk up.
+    probe_press_held = float(ep.get("probe_press_held", 0.9))
     # §5.4: a flow-set starts at the port's headroom h*C - the capacity the
     # receiver keeps free for transients - so a newcomer can never push the
     # port past line rate even when everyone else is at their share, and it
@@ -912,12 +925,34 @@ def main():
         # spend climbing from the floor at the maximum step.
         if q <= 0.0 and not st.enforced and a_s is not None:
             st.R = max(st.R, min(float(a_s), cap, line))
+        # 5.3: probe only while the flow-set is actually pressing on the
+        # fence it already has. An empty ledger means the receiver saw no
+        # excess, which is permission to ask for more ONLY from a flow-set
+        # that is using what it was given; from one whose application is
+        # sending less than its pace it is a statement about the
+        # application. Probing through that silence walks the fence up to
+        # its ceiling while the wire stays where the application left it,
+        # and the whole excess is spent at once when the application comes
+        # back: measured on E2.2 (2026-09-22), an incumbent taking its share
+        # back reached 23.5 G in 1.1 s and then kept climbing to 30.8 G with
+        # the wire at 19 G, pushed the sender tree past the receiver's
+        # entitlement, and the queue that followed cost a 32% undershoot and
+        # 2.5 s of oscillation - 3.25 s to settle against 0.9 s in the runs
+        # where the fence stopped at the share.
+        # The test is the tree's: the receiver's own measurement of this
+        # flow-set against the pace it was given (not a sender-side rate,
+        # which a shaped burst reads high). held_avg covers the bursty
+        # application the rate test would misread - one that empties its
+        # allowance in bursts and idles is pressing, and pinning it was
+        # what the held-fraction exemption was added for (2-6b).
+        pressing = (st.pace <= 0.0 or float(st.r) >= tree_theta * st.pace
+                    or st.held_avg >= probe_press_held)
         if v4_law in ("full", "nobrake"):
             st.R, st.dq, st.below = v4_step(st.R, q, st.q_prev, st.below,
                                             v4_alpha, v4_mmax, v4_kappa, v4_D,
                                             v4_floor, min(cap, line),
                                             not st.enforced, v4_linear,
-                                            v4_law != "nobrake")
+                                            v4_law != "nobrake", pressing)
         else:
             # The rate-obeying laws (E2.5). Both are handed a rate by the
             # receiver and both simply obey it; the fence keeps no state of

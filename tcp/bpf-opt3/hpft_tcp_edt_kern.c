@@ -74,11 +74,24 @@
  * an epoch deep would pin the pool at its floor for most of every epoch. */
 #define HPFT_EPOCH_NS 1000000ULL
 /* How far from an equal share one connection's share may be taken by the
- * proportional law, either way. All connections of a flow set share one path,
- * so a bulk connection has no reason to differ from its neighbours by more
- * than this; what is wider than the band comes from a window our own shaping
- * froze. See the long note where it is applied. */
-#define HPFT_SHARE_BAND 2ULL
+ * proportional law, either way, as a fraction NUM/DEN. All connections of a
+ * flow set share one path, so a bulk connection has no reason to differ from
+ * its neighbours by more than this; what is wider than the band comes from a
+ * window our own shaping froze. See the long note where it is applied.
+ *
+ * The band has to be narrow enough to BREAK the trap it is there for, not
+ * merely to bound it. At a factor of two a connection whose window froze
+ * settles at the floor - exactly half of its neighbours - and stays there for
+ * the rest of the run, because half of an equal share is still too little to
+ * grow the window back: measured on E2.2 (2026-09-24), five of ten new-tenant
+ * connections sat at 0.64 G against 1.29 G with the same retransmission
+ * count, and the flow set delivered 61% of its share. The share is a CEILING
+ * (r_i is met by min(the CC's own pacing, it)), so a connection that cannot
+ * use what this hands it simply does not, and the pool passes the remainder
+ * to its neighbours - which is why erring narrow costs nothing and erring
+ * wide costs a stuck connection. */
+#define HPFT_SHARE_BAND_NUM 5ULL
+#define HPFT_SHARE_BAND_DEN 4ULL
 /* How long a connection counts as live for the purpose of that band. The
  * epoch's own count is of the connections that sent in the last millisecond,
  * which is far fewer than the connections a flow set has when they are
@@ -533,10 +546,10 @@ int hpft_tcp_edt(struct __sk_buff *skb)
                     if (!nlive)
                         nlive = 1;
                     equal = allow / nlive;
-                    if (r_i < equal / HPFT_SHARE_BAND)
-                        r_i = equal / HPFT_SHARE_BAND;
-                    else if (r_i > equal * HPFT_SHARE_BAND)
-                        r_i = equal * HPFT_SHARE_BAND;
+                    if (r_i < equal * HPFT_SHARE_BAND_DEN / HPFT_SHARE_BAND_NUM)
+                        r_i = equal * HPFT_SHARE_BAND_DEN / HPFT_SHARE_BAND_NUM;
+                    else if (r_i > equal * HPFT_SHARE_BAND_NUM / HPFT_SHARE_BAND_DEN)
+                        r_i = equal * HPFT_SHARE_BAND_NUM / HPFT_SHARE_BAND_DEN;
                 }
             }
         }
