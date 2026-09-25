@@ -43,6 +43,7 @@ cd "$REPO"
 
 reg() { python3 -c "import json,sys;r=json.load(open('config/lab-registry.json'));print($1)"; }
 dev_of() { reg "next(v['rdma_dev'] for v in r['vnics'] if v['host']=='$1' and v['netdev']=='dpu1vf$2')"; }
+nfs_nconnect() { local v=16 hv; for hv in ${1//,/ }; do case "$hv" in nconnect=*) v=${hv#nconnect=} ;; esac; done; echo $v; }
 ip_of()  { reg "next(v['ip'] for v in r['vnics'] if v['host']=='$1' and v['netdev']=='dpu1vf$2')"; }
 rep_of() { reg "next(v['representor'] for v in r['vnics'] if v['host']=='$1' and v['netdev']=='dpu1vf$2')"; }
 dpu_of() { reg "{n['host']:n['dpu'] for n in r['nodes']}['$1']"; }
@@ -311,6 +312,19 @@ if echo "$ROWS" | awk '{print $5}' | grep -q '^http$'; then
     on_host "$h" "command -v wrk >/dev/null" || { echo "ABORT: $h has no wrk (http rows)"; exit 1; }
   done
 fi
+# nfs rows (evaluation E4.2): the SOURCE host exports large files out of tmpfs
+# over the kernel NFS server and the DESTINATION host mounts them from the
+# source VF's address and reads them O_DIRECT with fio over nconnect TCP
+# connections, so the bytes travel source -> destination like every other
+# class, and none of them is cached on the reader.
+if echo "$ROWS" | awk '{print $5}' | grep -q '^nfs$'; then
+  for h in $(echo "$ROWS" | awk '$5=="nfs"{print $1}' | sort -u); do
+    on_host "$h" "command -v exportfs >/dev/null" || { echo "ABORT: $h has no NFS server (nfs rows)"; exit 1; }
+  done
+  for h in $(echo "$ROWS" | awk '$5=="nfs"{print $3}' | sort -u); do
+    on_host "$h" "command -v fio >/dev/null && command -v mount.nfs >/dev/null" || { echo "ABORT: $h has no fio or NFS client (nfs rows)"; exit 1; }
+  done
+fi
 if echo "$ROWS" | awk '{print $5}' | grep -q '^udp$'; then
   for h in $RECVS $(echo "$ROWS" | awk '$5=="udp"{print $1}' | sort -u); do
     on_host "$h" "[ -x /tmp/udp_blast ] || gcc -O2 -pthread -o /tmp/udp_blast $REPO/tools/host/udp_blast.c" || { echo "ABORT: udp_blast missing on $h"; exit 1; }
@@ -519,6 +533,12 @@ while read -r sh sv dh dv cls n st en opt; do
     hmb=16; hw=4
     for hv in ${opt//,/ }; do case "$hv" in obj=*) hmb=${hv#obj=} ;; workers=*) hw=${hv#workers=} ;; esac; done
     SRVS[$sh]+="bash $REPO/tools/host/http_server.sh start $(ip_of $sh $sv) $((8000+k)) $hmb $hw >/tmp/val_s$k.log 2>&1; "
+  elif [ "$cls" = nfs ]; then
+    # options, comma separated: files=<n> (default 32), mb=<MB per file>
+    # (default 256), threads=<nfsd threads> (default 64)
+    nf=32; nmb=256; nth=64
+    for hv in ${opt//,/ }; do case "$hv" in files=*) nf=${hv#files=} ;; mb=*) nmb=${hv#mb=} ;; threads=*) nth=${hv#threads=} ;; esac; done
+    SRVS[$sh]+="bash $REPO/tools/host/nfs_server.sh start $nf $nmb $nth >/tmp/val_s$k.log 2>&1; "
   else
     SRV[$dh]+="setsid nohup iperf3 -s -p $((5600+k)) >/tmp/val_s$k.log 2>&1 </dev/null & "
   fi
@@ -534,6 +554,14 @@ while read -r sh sv dh dv cls n st en opt; do
   if [ "$cls" = http ]; then
     on_host "$sh" "ss -ltn 'sport = :$((8000+k))' | grep -q ':$((8000+k))'" \
       || { echo "ABORT: $sh is not serving http on port $((8000+k))"; on_host "$sh" "cat /tmp/val_s$k.log" 2>/dev/null; exit 1; }
+  fi
+  if [ "$cls" = nfs ]; then
+    on_host "$sh" "grep -q '^nfs_server: exporting' /tmp/val_s$k.log" \
+      || { echo "ABORT: $sh is not exporting NFS"; on_host "$sh" "cat /tmp/val_s$k.log" 2>/dev/null; exit 1; }
+    # mount now, before T0: the mount handshake is not part of the load, and a
+    # mount that fails must abort the run rather than read as an idle tenant
+    on_host "$dh" "sudo mkdir -p /mnt/val_nfs$k; mountpoint -q /mnt/val_nfs$k && sudo umount -l /mnt/val_nfs$k; sudo mount -t nfs -o vers=4.1,tcp,nconnect=$(nfs_nconnect "$opt"),rsize=1048576,ro,noatime $(ip_of $sh $sv):/dev/shm/nfsexport /mnt/val_nfs$k" \
+      || { echo "ABORT: $dh could not mount $(ip_of $sh $sv):/dev/shm/nfsexport"; exit 1; }
   fi
   k=$((k+1))
 done <<<"$ROWS"
@@ -652,6 +680,18 @@ while read -r sh sv dh dv cls n st en opt; do
     [ -n "$hth" ] || hth=$(( n < 8 ? n : 8 ))
     CLID[$dh]+="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-time.time()))\"; wrk -t$hth -c$n -d${dur}s --latency --timeout 60s http://$sip:$((8000+k))/obj${hmb}m.bin' >/tmp/val_c$k.log 2>&1 </dev/null & "
     k=$((k+1)); continue
+  elif [ "$cls" = nfs ]; then
+    # fio runs on the DESTINATION host and reads the exported files O_DIRECT,
+    # 1 MB requests, n parallel readers (the row's count) each on its own file,
+    # over the nconnect TCP connections of the mount. Terse output, one line,
+    # for the goodput parser. Options: files=<n> (default 32; readers cycle
+    # over them), nconnect=<n> (default 16), depth=<io depth> (default 8).
+    nf=32; ndep=8
+    for hv in ${opt//,/ }; do case "$hv" in files=*) nf=${hv#files=} ;; depth=*) ndep=${hv#depth=} ;; esac; done
+    [ "$n" -le "$nf" ] || { echo "ABORT: nfs row $k asks for $n readers over $nf files; readers must not exceed files (reader j reads file f<j>)"; exit 1; }
+    # fio expands $jobnum itself; the backslash keeps the remote shell's hands off it
+    CLID[$dh]+="setsid nohup bash -c 'python3 -c \"import time;time.sleep(max(0,$T0+$off-time.time()))\"; cd /mnt/val_nfs$k && sudo fio --name=read --rw=read --bs=1M --direct=1 --ioengine=libaio --iodepth=$ndep --numjobs=$n --filename_format=f\\\$jobnum --time_based --runtime=$dur --group_reporting --output-format=terse' >/tmp/val_c$k.log 2>&1 </dev/null & "
+    k=$((k+1)); continue
   elif [ "$cls" = kv ]; then
     # A kv row is an application, not a bulk load: it starts on the
     # experiment clock (T0 + warm-up + start), never during the warm-up, and
@@ -717,9 +757,10 @@ for h in $SENDERS; do scp -q "$(dpu_of $h):/tmp/hpft_txagent_e.jsonl" "$OUT/tx_$
 k=0
 while read -r sh sv dh dv cls n st en opt; do
   case "$cls" in meter|core) k=$((k+1)); continue ;; esac
-  clih=$sh; [ "$cls" = http ] && clih=$dh     # wrk ran on the destination
+  clih=$sh; case "$cls" in http|nfs) clih=$dh ;; esac     # wrk / fio ran on the destination
   if [ "$clih" = "$(hostname)" ]; then cp /tmp/val_c$k.log "$OUT/flow${k}_${sh}vf${sv}_to_${dh}vf${dv}_${cls}.log"; else scp -q "$clih:/tmp/val_c$k.log" "$OUT/flow${k}_${sh}vf${sv}_to_${dh}vf${dv}_${cls}.log"; fi
   if [ "$cls" = http ]; then on_host "$sh" "bash $REPO/tools/host/http_server.sh stop $((8000+k))" >/dev/null 2>&1 || true; fi
+  if [ "$cls" = nfs ]; then on_host "$dh" "sudo umount -l /mnt/val_nfs$k" >/dev/null 2>&1 || true; on_host "$sh" "bash $REPO/tools/host/nfs_server.sh stop" >/dev/null 2>&1 || true; fi
   if [ "$cls" = kv ]; then
     if [ "$sh" = "$(hostname)" ]; then cp /tmp/val_kv$k.csv "$OUT/kv_flow${k}_${sh}vf${sv}_to_${dh}vf${dv}.csv" 2>/dev/null; else scp -q "$sh:/tmp/val_kv$k.csv" "$OUT/kv_flow${k}_${sh}vf${sv}_to_${dh}vf${dv}.csv" 2>/dev/null; fi || echo "WARN: no per-request log for kv flow $k"
   fi
